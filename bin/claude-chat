@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# claude-chat — stateful wrapper around `claude -p` (headless).
+# Persists a session ID between invocations so follow-up prompts keep context.
+# Use `/clear` (or `/reset`, `/new`) to start a fresh session.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+SID_FILE="${CLAUDE_SID_FILE:-$HOME/.cache/claude-chat/session}"
+mkdir -p "$(dirname "$SID_FILE")"
+
+input="$*"
+
+case "$input" in
+  "")
+    echo "usage: claude-chat <prompt> | /help | /clear | /session | /version" >&2
+    exit 2
+    ;;
+  /help|/?)
+    cat <<'EOF'
+claude-chat — stateful wrapper around `claude -p`
+
+Commands:
+  <prompt>   Send prompt; resume prior session if one exists
+  /help      Show this message (alias: /?)
+  /clear     Delete the stored session ID (aliases: /reset, /new)
+  /session   Print the current session ID
+  /version   Print the wrapper version
+EOF
+    exit 0
+    ;;
+  /clear|/reset|/new)
+    rm -f "$SID_FILE"
+    echo "session cleared"
+    exit 0
+    ;;
+  /session)
+    if [[ -s "$SID_FILE" ]]; then cat "$SID_FILE"; else echo "(no active session)"; fi
+    exit 0
+    ;;
+  /version)
+    echo "claude-chat $VERSION"
+    exit 0
+    ;;
+esac
+
+extra_args=()
+if [[ -n "${CLAUDE_CHAT_EXTRA_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  extra_args=( $CLAUDE_CHAT_EXTRA_ARGS )
+fi
+
+# Resolve the `claude` binary.  Priority:
+#   1. CLAUDE_BIN env var (explicit override — best for systemd hosts
+#      where the caller doesn't want to touch PATH).
+#   2. On PATH.
+#   3. Known user-local install locations.
+# Fail loud if none work — a "command not found" error otherwise gets
+# swallowed by the caller and shows up as "Claude returned an empty
+# response" in the chat, which is confusing.
+if [[ -n "${CLAUDE_BIN:-}" ]] && command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+  claude_bin="$CLAUDE_BIN"
+elif command -v claude >/dev/null 2>&1; then
+  claude_bin="claude"
+elif [[ -x "$HOME/.local/bin/claude" ]]; then
+  claude_bin="$HOME/.local/bin/claude"
+elif [[ -x "/usr/local/bin/claude" ]]; then
+  claude_bin="/usr/local/bin/claude"
+else
+  echo "claude-chat: could not find the 'claude' binary. Set CLAUDE_BIN or put it on PATH." >&2
+  exit 127
+fi
+
+if [[ -s "$SID_FILE" ]]; then
+  sid=$(cat "$SID_FILE")
+  out=$("$claude_bin" -p "$input" --resume "$sid" --output-format json "${extra_args[@]}")
+else
+  out=$("$claude_bin" -p "$input" --output-format json "${extra_args[@]}")
+fi
+
+# Session IDs can rotate on resume, so always refresh from the latest response.
+new_sid=$(printf '%s' "$out" | jq -r '.session_id // empty')
+if [[ -n "$new_sid" ]]; then
+  printf '%s' "$new_sid" > "$SID_FILE"
+fi
+
+printf '%s\n' "$out" | jq -r '.result'
