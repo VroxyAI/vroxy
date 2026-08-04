@@ -214,8 +214,36 @@ def build_prompt(payload: dict) -> str:
         "height": fb.get("viewport_height"),
     }
     chat      = payload.get("chat") or {}
+    visitor   = payload.get("visitor") or {}
 
     lines = [SYSTEM_PROMPT, "", "── Feedback ──", "", f"**Note:** {note}", ""]
+
+    # Reporter block — comes from the ctovibe gem's identify()
+    # payload on the customer site (email + name + role) plus
+    # whatever else the host app pushed under `meta`.  Role is
+    # what tells Claude whether the reporter is a platform admin,
+    # a regular signed-in user, or an anonymous visitor.
+    role = visitor.get("role") or "anonymous"
+    reporter_label = visitor.get("name") or visitor.get("email") or (
+        "anonymous visitor" if role == "anonymous" else f"visitor {visitor.get('hashid', '?')}"
+    )
+    lines += [
+        "**Reporter:**",
+        f"- {reporter_label}",
+        f"- Role: `{role}`",
+    ]
+    if visitor.get("email") and visitor.get("email") != reporter_label:
+        lines.append(f"- Email: {visitor['email']}")
+    if visitor.get("external_id"):
+        lines.append(f"- External id: `{visitor['external_id']}`")
+    # Surface the remaining meta keys (plan, tenant_id, custom tags,
+    # etc.) so Claude can gate its response on them — but drop
+    # `role` because we already printed it above.
+    extras = {k: v for k, v in (visitor.get("meta") or {}).items()
+              if k not in ("role",) and v not in (None, "", [], {})}
+    if extras:
+        lines.append(f"- Meta: {json.dumps(extras, sort_keys=True)}")
+    lines.append("")
 
     lines += [
         "**Page context:**",
