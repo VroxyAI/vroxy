@@ -76,6 +76,73 @@ attached to a User instead of a Tenant.
 | `CLAUDE_STREAM`         | `1` (set `0` to skip streamed path) |
 | `LOG_LEVEL`             | `INFO`                              |
 
+## Run against local dev
+
+`ctovibe_web` runs under `docker compose`, and its compose file maps
+the web container to **host port 3002** (`docker-compose.yml`,
+`"3002:3000"`) so it can coexist with the sibling vroxy stack. So the
+local cable URL is `ws://localhost:3002/cable` — note plain `ws://`,
+not `wss://`. That's load-bearing: `main()` derives the WS `Origin`
+header from the cable URL's scheme, and Rails' development
+`allowed_request_origins` only matches `http://localhost:<port>`. A
+`wss://` URL against local dev synthesizes `https://…` and the
+handshake comes back 404.
+
+Bring the app up first (`docker compose up` in `ctovibe_web`), then:
+
+```bash
+cd ~/code/ctovibe/ctovibe_dispatch
+CTOVIBE_CABLE_URL=ws://localhost:3002/cable \
+CTOVIBE_SERVICE_TOKEN=4VK25VuTFzU830vhHG8AybL1v7Yfmjdgt5n5FcPMUInZxWkD \
+PYTHONUNBUFFERED=1 \
+python3 feedback_agent.py
+```
+
+`CODE_ROOT` / `PROJECT` need no override — they already default to
+the sibling `ctovibe_web` checkout. `python3` works without the venv
+if your system Python already satisfies `requirements.txt`
+(`websockets>=12,<14`); use `.venv/bin/python` otherwise.
+
+### The local dispatch token
+
+`db/seeds/ctovibe_tenant.rb` seeds the `ctovibe` tenant
+(`public_key: w8eYmQ8uPppj2BgEBywUSaoz`) with a `seed dashboard
+token`, but that one is scoped `tenant:read tenant:write` —
+`AdminFeedbackChannel#subscribed` rejects it. Dispatch needs `full`
+or `platform:dispatch`, so mint a second token:
+
+```bash
+docker compose exec web bin/rails runner '
+t = Tenant.find_by!(slug: "ctovibe")
+t.api_tokens.where(name: "ctovibe_dispatch dev").where(revoked_at: nil).find_each(&:revoke!)
+puts ApiToken.generate!(owner: t, name: "ctovibe_dispatch dev",
+                        scopes: ["platform:dispatch"]).raw_token'
+```
+
+The raw token is `SecureRandom.alphanumeric` — the value baked into
+the command above is this machine's, and a `db:reset` (or a fresh
+checkout) invalidates it. Re-run the minting command and paste the
+new value in. Revoke when you're done:
+
+```bash
+docker compose exec web bin/rails runner \
+  'ApiToken.find_by(name: "ctovibe_dispatch dev")&.revoke!'
+```
+
+The seeded tenant's `origin_allowlist` is empty, so
+`Connection#origin_ok?` short-circuits true and `http://localhost:3002`
+passes. If you populate the allowlist for widget testing, add that
+origin or dispatch starts getting rejected at connect.
+
+### Local dev doesn't sandbox the ship path
+
+Pointing `CTOVIBE_CABLE_URL` at localhost only redirects the cable.
+An approved proposal still runs a real `git commit` + `git push` in
+`CODE_ROOT/PROJECT` (`handle_approve`), and `mode: pull_request`
+still shells out to `gh pr create` against the real remote. Local
+dev is a safe place to exercise `feedback.created` → `reply`; it is
+not a safe place to click Ship-it unless you mean it.
+
 ## Run (systemd, recommended)
 
 `/etc/default/ctovibe-dispatch`:
