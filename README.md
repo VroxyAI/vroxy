@@ -96,8 +96,8 @@ Bring the app up first (`docker compose up` in `ctovibe_web`), then:
 
 ```bash
 cd ~/code/ctovibe/ctovibe_dispatch
-CTOVIBE_CABLE_URL=ws://localhost:3002/cable \
-CTOVIBE_SERVICE_TOKEN=4VK25VuTFzU830vhHG8AybL1v7Yfmjdgt5n5FcPMUInZxWkD \
+VROXY_CABLE_URL=ws://localhost:3002/cable \
+VROXY_SERVICE_TOKEN=4VK25VuTFzU830vhHG8AybL1v7Yfmjdgt5n5FcPMUInZxWkD \
 PYTHONUNBUFFERED=1 \
 python3 feedback_agent.py
 ```
@@ -109,7 +109,7 @@ if your system Python already satisfies `requirements.txt`
 
 ### The local dispatch token
 
-`db/seeds/ctovibe_tenant.rb` seeds the `ctovibe` tenant
+`db/seeds/vroxy_tenant.rb` seeds the `vroxy` tenant (slug renamed from ctovibe by migration)
 (`public_key: w8eYmQ8uPppj2BgEBywUSaoz`) with a `seed dashboard
 token`, but that one is scoped `tenant:read tenant:write` —
 `AdminFeedbackChannel#subscribed` rejects it. Dispatch needs `full`
@@ -117,9 +117,9 @@ or `platform:dispatch`, so mint a second token:
 
 ```bash
 docker compose exec web bin/rails runner '
-t = Tenant.find_by!(slug: "ctovibe")
-t.api_tokens.where(name: "ctovibe_dispatch dev").where(revoked_at: nil).find_each(&:revoke!)
-puts ApiToken.generate!(owner: t, name: "ctovibe_dispatch dev",
+t = Tenant.find_by!(slug: "vroxy")
+t.api_tokens.where(name: "vroxy_dispatch dev").where(revoked_at: nil).find_each(&:revoke!)
+puts ApiToken.generate!(owner: t, name: "vroxy_dispatch dev",
                         scopes: ["platform:dispatch"]).raw_token'
 ```
 
@@ -130,7 +130,7 @@ new value in. Revoke when you're done:
 
 ```bash
 docker compose exec web bin/rails runner \
-  'ApiToken.find_by(name: "ctovibe_dispatch dev")&.revoke!'
+  'ApiToken.find_by(name: "vroxy_dispatch dev")&.revoke!'
 ```
 
 The seeded tenant's `origin_allowlist` is empty, so
@@ -140,7 +140,7 @@ origin or dispatch starts getting rejected at connect.
 
 ### Local dev doesn't sandbox the ship path
 
-Pointing `CTOVIBE_CABLE_URL` at localhost only redirects the cable.
+Pointing `VROXY_CABLE_URL` at localhost only redirects the cable.
 An approved proposal still runs a real `git commit` + `git push` in
 `CODE_ROOT/PROJECT` (`handle_approve`), and `mode: pull_request`
 still shells out to `gh pr create` against the real remote. Local
