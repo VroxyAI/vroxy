@@ -1,17 +1,17 @@
-# ctovibe_dispatch
+# vroxy_dispatch
 
 An ActionCable client that lets an admin (or a widget visitor's
 `/note` slash command) pass messages to **Claude Code (headless)**
-and stream the response back into ctovibe's support chat.
+and stream the response back into vroxy's support chat.
 
 Ported from
 [`vroxy_dispatch/feedback_agent.py`](https://github.com/wartron/vroxy_web/tree/master/vroxy_dispatch)
-with adjustments for ctovibe's tenant-scoped channel + hashid
+with adjustments for vroxy's tenant-scoped channel + hashid
 message identifiers.
 
 ## Runtime shape
 
-1. Connects `wss://ctovibe.ai/cable?token=<CTOVIBE_SERVICE_TOKEN>`.
+1. Connects `wss://vroxy.ai/cable?token=<VROXY_SERVICE_TOKEN>`.
 2. Subscribes `{ channel: "AdminFeedbackChannel" }`. Rails resolves
    the token → `Tenant`-owned `ApiToken` → sets
    `current_tenant`, and the channel streams for exactly that
@@ -43,7 +43,7 @@ Once on the Rails side (per-tenant):
 
 ```ruby
 tenant = Tenant.find_by(public_key: "QY6F4nAPNBEpwBlfsMAL6tP2")
-token  = tenant.api_tokens.new(name: "ctovibe_dispatch",
+token  = tenant.api_tokens.new(name: "vroxy_dispatch",
                                 scopes: ["platform:dispatch"])
 token.generate!
 token.save!
@@ -51,13 +51,13 @@ puts token.raw_token  # ← ONLY chance to see it; store in env immediately
 ```
 
 The `raw_token` is 48 chars of `SecureRandom.alphanumeric`. Copy it
-into the dispatch host's environment as `CTOVIBE_SERVICE_TOKEN`.
+into the dispatch host's environment as `VROXY_SERVICE_TOKEN`.
 Rotate by `token.revoke!` and creating a new one.
 
 ## Run (foreground)
 
 ```bash
-CTOVIBE_SERVICE_TOKEN=<token>  .venv/bin/python feedback_agent.py
+VROXY_SERVICE_TOKEN=<token>  .venv/bin/python feedback_agent.py
 ```
 
 `Subscribed to AdminFeedbackChannel` in the log means dispatch is
@@ -68,10 +68,10 @@ attached to a User instead of a Tenant.
 
 | Var                     | Default                             |
 | ----------------------- | ----------------------------------- |
-| `CTOVIBE_CABLE_URL`     | `wss://ctovibe.ai/cable`            |
-| `CTOVIBE_SERVICE_TOKEN` | *(required)*                        |
+| `VROXY_CABLE_URL`     | `wss://vroxy.ai/cable`            |
+| `VROXY_SERVICE_TOKEN` | *(required)*                        |
 | `CODE_ROOT`             | parent of this checkout             |
-| `PROJECT`               | `ctovibe_web`                       |
+| `PROJECT`               | `vroxy_web`                       |
 | `CLAUDE_CHAT_BIN`       | `./bin/claude-chat`                 |
 | `CLAUDE_STREAM`         | `1` (set `0` to skip streamed path) |
 | `LOG_LEVEL`             | `INFO`                              |
@@ -145,24 +145,32 @@ not a safe place to click Ship-it unless you mean it.
 
 ## Run (systemd, recommended)
 
-`/etc/default/ctovibe-dispatch`:
+> **Rename migration note:** the dispatch host currently runs the
+> pre-rename units (`ctovibe-dispatch*.service` reading
+> `/etc/default/ctovibe-dispatch`, checkout under
+> `/home/ubuntu/code/ctovibe`). The live units get migrated to the
+> `vroxy-dispatch*` names below at deploy time (rename plan B6.3):
+> install the new unit + env file with values copied over, disable
+> the `ctovibe-dispatch*` units, verify heartbeats.
+
+`/etc/default/vroxy-dispatch`:
 
 ```ini
-CTOVIBE_CABLE_URL=wss://ctovibe.ai/cable
-CTOVIBE_SERVICE_TOKEN=REPLACE_ME
+VROXY_CABLE_URL=wss://vroxy.ai/cable
+VROXY_SERVICE_TOKEN=REPLACE_ME
 
-CODE_ROOT=/home/ubuntu/code/ctovibe
-PROJECT=ctovibe_web
+CODE_ROOT=/home/ubuntu/code/vroxy
+PROJECT=vroxy_web
 
 LOG_LEVEL=INFO
 PYTHONUNBUFFERED=1
 ```
 
-`/etc/systemd/system/ctovibe-dispatch.service`:
+`/etc/systemd/system/vroxy-dispatch.service`:
 
 ```ini
 [Unit]
-Description=ctovibe dispatch — AdminFeedbackChannel cable subscriber
+Description=vroxy dispatch — AdminFeedbackChannel cable subscriber
 After=network-online.target
 Wants=network-online.target
 
@@ -170,9 +178,9 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/home/ubuntu/code/ctovibe/ctovibe_dispatch
-EnvironmentFile=/etc/default/ctovibe-dispatch
-ExecStart=/home/ubuntu/code/ctovibe/ctovibe_dispatch/.venv/bin/python /home/ubuntu/code/ctovibe/ctovibe_dispatch/feedback_agent.py
+WorkingDirectory=/home/ubuntu/code/vroxy/vroxy_dispatch
+EnvironmentFile=/etc/default/vroxy-dispatch
+ExecStart=/home/ubuntu/code/vroxy/vroxy_dispatch/.venv/bin/python /home/ubuntu/code/vroxy/vroxy_dispatch/feedback_agent.py
 Restart=on-failure
 RestartSec=5
 
@@ -182,17 +190,17 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now ctovibe-dispatch
-sudo journalctl -u ctovibe-dispatch -f
+sudo systemctl enable --now vroxy-dispatch
+sudo journalctl -u vroxy-dispatch -f
 ```
 
 ## One tenant per process
 
-Ctovibe's `AdminFeedbackChannel` streams for exactly one tenant
+Vroxy's `AdminFeedbackChannel` streams for exactly one tenant
 (the one the auth token belongs to). Multi-tenant hosting means
 running one systemd unit per tenant (e.g.
-`ctovibe-dispatch-<tenant_slug>.service`) with a per-tenant
-`CTOVIBE_SERVICE_TOKEN` in the `EnvironmentFile`. See the vroxy
+`vroxy-dispatch-<tenant_slug>.service`) with a per-tenant
+`VROXY_SERVICE_TOKEN` in the `EnvironmentFile`. See the vroxy
 version if you need a global-scope alternative.
 
 ## Wire contract
@@ -216,19 +224,19 @@ Dispatch calls these `action`s on the channel:
 
 | Action    | Payload                                     | Server does                                                                          |
 | --------- | ------------------------------------------- | ------------------------------------------------------------------------------------ |
-| heartbeat | `version`, `meta`                           | `Rails.cache.write("ctovibe_dispatch:heartbeat:<tenant.id>", {...}, expires_in: 60)` |
+| heartbeat | `version`, `meta`                           | `Rails.cache.write("vroxy_dispatch:heartbeat:<tenant.id>", {...}, expires_in: 60)` |
 | progress  | `chat_id`, `name`, `input`                  | Persists a `tool_call` `SupportChatMessage` + broadcasts a `tool` chip on `SupportChatChannel` |
 | reply     | `chat_id`, `body`, `kind` (opt), `proposal` (opt) | Persists an assistant `SupportChatMessage` + broadcasts `done` on `SupportChatChannel`; bumps linked feedback `open → triaged` |
 
 ## Feedback source
 
 Feedback lands via `POST /widget/feedback`
-([`app/controllers/widget/feedbacks_controller.rb`](../ctovibe_web/app/controllers/widget/feedbacks_controller.rb))
+([`app/controllers/widget/feedbacks_controller.rb`](../vroxy_web/app/controllers/widget/feedbacks_controller.rb))
 which creates the `AdminUiFeedback` + a linked `SupportChat` and
 calls `AdminFeedbackChannel.broadcast_feedback_created`.
 
 The client-side picker that populates the payload lives in
-`ctovibe_web/app/javascript/admin_ui_inspector.js`.
+`vroxy_web/app/javascript/admin_ui_inspector.js`.
 
 ## Tests
 

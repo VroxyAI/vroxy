@@ -2,7 +2,7 @@
 Unit tests for the pure-Python bits of feedback_agent.py — prompt
 building and Claude-output parsing.  No websocket or subprocess
 here; those get exercised in integration when we point the agent
-at a real ctovibe_web instance.
+at a real vroxy_web instance.
 """
 
 import json
@@ -18,7 +18,7 @@ class BuildPromptTest(unittest.TestCase):
             "feedback": {
                 "hashid":            "abc12345",
                 "note":              "make this bigger",
-                "page_url":          "https://ctovibe.ai/dashboard",
+                "page_url":          "https://vroxy.ai/dashboard",
                 "page_path":         "/dashboard",
                 "controller_action": "workspace/dashboard#show",
                 "viewport_width":    1440,
@@ -47,7 +47,7 @@ class BuildPromptTest(unittest.TestCase):
     def test_page_level_note_flags_no_element(self):
         payload = {
             "feedback": {"note": "add a dark-mode toggle",
-                         "page_url": "https://ctovibe.ai/"},
+                         "page_url": "https://vroxy.ai/"},
             "chat":     {"hashid": "chatid1"},
         }
         self.assertIn("No element picked", fa.build_prompt(payload))
@@ -60,7 +60,7 @@ class BuildPromptTest(unittest.TestCase):
         self.assertIn("hi", prompt)
 
     def test_duplicate_partials_are_collapsed(self):
-        # ctovibe stores rendered_partials as an ordered list; the
+        # vroxy stores rendered_partials as an ordered list; the
         # same partial can appear twice (rendered from two collection
         # loops).  Prompt should de-dupe so Claude doesn't waste a
         # tool call re-reading it.  Uses `_widget_row` (not present

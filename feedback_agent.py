@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-ctovibe_dispatch — an ActionCable client that subscribes to a
-ctovibe tenant's AdminFeedbackChannel and drives Claude Code
+vroxy_dispatch — an ActionCable client that subscribes to a
+vroxy tenant's AdminFeedbackChannel and drives Claude Code
 (headless) to answer admin UI-feedback notes.
 
-Ported from vroxy_dispatch/feedback_agent.py with these ctovibe-
+Ported from vroxy_dispatch/feedback_agent.py with these vroxy-
 specific adjustments:
 
-  - **Tenant-scoped.** Ctovibe's AdminFeedbackChannel is
+  - **Tenant-scoped.** Vroxy's AdminFeedbackChannel is
     `stream_for(tenant)`, and connection auth is a Tenant-owned
     ApiToken with `platform:dispatch` or `full` scope.  So one
     dispatch process = one tenant.  (Vroxy is global.)
@@ -16,8 +16,8 @@ specific adjustments:
     on the wire are hashids, not integer PKs.  The Rails side
     resolves them via `tenant.support_chats.find_by(hashid:)`.
 
-  - **Cache-based heartbeat.**  Ctovibe writes heartbeats into
-    `Rails.cache` under `ctovibe_dispatch:heartbeat:<tenant.id>`
+  - **Cache-based heartbeat.**  Vroxy writes heartbeats into
+    `Rails.cache` under `vroxy_dispatch:heartbeat:<tenant.id>`
     with a 60 s TTL — matches the vroxy design.  Payload shape:
     `{ "version": "...", "meta": {...} }`.
 
@@ -28,7 +28,7 @@ specific adjustments:
 
 Runtime shape mirrors vroxy_dispatch:
 
-  1. Connect wss://ctovibe.ai/cable?token=<TOKEN>.
+  1. Connect wss://vroxy.ai/cable?token=<TOKEN>.
   2. Subscribe { channel: "AdminFeedbackChannel" }.
   3. On feedback.created → build prompt → run claude-chat →
      parse an optional fenced ` ```proposal ``` ` block → reply.
@@ -55,15 +55,15 @@ from typing import Any
 websockets = None  # populated in main()
 
 # ── Config ────────────────────────────────────────────────────────
-CABLE_URL       = os.environ.get("CTOVIBE_CABLE_URL", "wss://ctovibe.ai/cable")
-SERVICE_TOKEN   = os.environ.get("CTOVIBE_SERVICE_TOKEN", "")
+CABLE_URL       = os.environ.get("VROXY_CABLE_URL", "wss://vroxy.ai/cable")
+SERVICE_TOKEN   = os.environ.get("VROXY_SERVICE_TOKEN", "")
 # CODE_ROOT defaults to the directory that CONTAINS this dispatch
-# checkout, so sibling repos (ctovibe_web) resolve without env
+# checkout, so sibling repos (vroxy_web) resolve without env
 # overrides regardless of whether we're deployed under
-# `~/code/ctovibe_dispatch` or `~/code/ctovibe/ctovibe_dispatch`.
+# `~/code/vroxy_dispatch` or `~/code/vroxy/vroxy_dispatch`.
 CODE_ROOT       = Path(os.environ.get("CODE_ROOT",
                                        str(Path(__file__).resolve().parent.parent)))
-PROJECT         = os.environ.get("PROJECT", "ctovibe_web")
+PROJECT         = os.environ.get("PROJECT", "vroxy_web")
 CLAUDE_CHAT_BIN = os.environ.get(
     "CLAUDE_CHAT_BIN",
     str(Path(__file__).resolve().parent / "bin" / "claude-chat"),
@@ -71,7 +71,7 @@ CLAUDE_CHAT_BIN = os.environ.get(
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "ctovibe_dispatch 0.1.0"
+AGENT_VERSION      = "vroxy_dispatch 0.1.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 
 # Mutable status reported on each heartbeat.  Updated by the worker
@@ -83,7 +83,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     level=os.environ.get("LOG_LEVEL", "INFO"),
 )
-log = logging.getLogger("ctovibe_dispatch")
+log = logging.getLogger("vroxy_dispatch")
 
 
 # ── ActionCable helpers ───────────────────────────────────────────
@@ -201,7 +201,7 @@ Investigate first, then commit real content.
 
 def build_prompt(payload: dict) -> str:
     """Compose the user prompt for `claude-chat` from an
-    `AdminFeedbackChannel` `feedback.created` event.  Ctovibe's
+    `AdminFeedbackChannel` `feedback.created` event.  Vroxy's
     envelope has slightly flatter shape than vroxy's — feedback
     fields live under `payload["feedback"]` rather than at the top
     level, so accessors here match `broadcast_feedback_created`
@@ -218,7 +218,7 @@ def build_prompt(payload: dict) -> str:
 
     lines = [SYSTEM_PROMPT, "", "── Feedback ──", "", f"**Note:** {note}", ""]
 
-    # Reporter block — comes from the ctovibe gem's identify()
+    # Reporter block — comes from the vroxy gem's identify()
     # payload on the customer site (email + name + role) plus
     # whatever else the host app pushed under `meta`.  Role is
     # what tells Claude whether the reporter is a platform admin,
@@ -257,7 +257,7 @@ def build_prompt(payload: dict) -> str:
 
     if partials:
         lines += ["**Rendered partials (in order):**"]
-        # `rendered_partials` on ctovibe is JSONB of strings
+        # `rendered_partials` on vroxy is JSONB of strings
         # (`"app/views/foo/_bar.html.erb|1.2ms"`) — normalize to the
         # path only for the prompt so Claude doesn't parse timings.
         seen: list[str] = []
@@ -528,7 +528,7 @@ def parse_proposal(raw: str) -> tuple[str, dict | None]:
 # ── Main event loop ───────────────────────────────────────────────
 async def handle_approve(ws, payload: dict) -> None:
     """Operator clicked "Ship it" (or "Open PR") on a code-proposal
-    card.  Ctovibe's channel broadcasts `approve.requested` on the
+    card.  Vroxy's channel broadcasts `approve.requested` on the
     SAME AdminFeedbackChannel we're subscribed to, so dispatch
     picks it up here."""
     chat_id  = payload.get("chat_id")
@@ -586,7 +586,7 @@ def _run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
 
 def _git_inline_ship(project_dir: Path, summary: str, files: list[dict]) -> str:
     """Small-tweak path: commit the changed files, run
-    version_bump.sh if present (ctovibe_web has one), push straight
+    version_bump.sh if present (vroxy_web has one), push straight
     to origin/HEAD which auto-deploys."""
     paths = [ f["path"] for f in files if f.get("path") ]
     log.info("Inline ship: %s → %s", summary, paths)
@@ -637,7 +637,7 @@ def _git_open_pr(project_dir: Path, summary: str, files: list[dict]) -> str:
 
     rc, out, err = _run(
         ["gh", "pr", "create", "--title", f"UI feedback: {summary}",
-         "--body", "Filed via ctovibe_dispatch from an admin UI-feedback note."],
+         "--body", "Filed via vroxy_dispatch from an admin UI-feedback note."],
         project_dir,
     )
     if rc != 0:
@@ -691,7 +691,7 @@ STREAM_ENABLED = os.environ.get("CLAUDE_STREAM", "1") != "0"
 
 
 async def handle_feedback(ws, payload: dict) -> None:
-    """`feedback.created` handler.  Ctovibe's envelope has:
+    """`feedback.created` handler.  Vroxy's envelope has:
         payload["feedback"] — the AdminUiFeedback JSON
         payload["chat"]     — { id, hashid, title }
         payload["message"]  — { id, hashid, body }  (the original note)
@@ -796,14 +796,14 @@ async def process_stream(ws) -> None:
                 continue
             if frame_type in ("ping", "disconnect", "reject_subscription"):
                 if frame_type == "reject_subscription":
-                    log.error("Subscription rejected — is CTOVIBE_SERVICE_TOKEN a Tenant-owned "
+                    log.error("Subscription rejected — is VROXY_SERVICE_TOKEN a Tenant-owned "
                               "ApiToken with platform:dispatch or full scope?")
                 continue
 
             msg = frame.get("message")
             if not msg:
                 continue
-            # Ctovibe channel keys on `type` in the message payload,
+            # Vroxy channel keys on `type` in the message payload,
             # matching vroxy's convention.
             if msg.get("type") == "feedback.created":
                 await queue.put(("feedback", msg))
@@ -827,12 +827,12 @@ async def main() -> None:
     websockets = _ws
 
     if not SERVICE_TOKEN:
-        raise SystemExit("CTOVIBE_SERVICE_TOKEN is required")
+        raise SystemExit("VROXY_SERVICE_TOKEN is required")
     uri = f"{CABLE_URL}?token={SERVICE_TOKEN}"
     # Rails' ActionCable enforces `allowed_request_origins` on prod;
     # a WS handshake without an `Origin` header comes back as 404.
     # We synthesize one from the cable URL's scheme + host so this
-    # works against local dev + wss://ctovibe.ai without a config knob.
+    # works against local dev + wss://vroxy.ai without a config knob.
     parsed = urllib.parse.urlparse(CABLE_URL)
     origin_scheme = "https" if parsed.scheme == "wss" else "http"
     origin = f"{origin_scheme}://{parsed.hostname}" + (f":{parsed.port}" if parsed.port else "")
