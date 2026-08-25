@@ -4,10 +4,14 @@ An ActionCable client that lets an admin (or a widget visitor's
 `/note` slash command) pass messages to **Claude Code (headless)**
 and stream the response back into vroxy's support chat.
 
-Ported from
-[`vroxy_dispatch/feedback_agent.py`](https://github.com/wartron/vroxy_web/tree/master/vroxy_dispatch)
-with adjustments for vroxy's tenant-scoped channel + hashid
-message identifiers.
+Ported from the walkie-talkie app's dispatch agent (that product has
+since been renamed cuh; its web repo is `wartron/cuh_web`) with
+adjustments for vroxy's tenant-scoped channel + hashid message
+identifiers. Deployment note: this same host previously ran the
+walkie-talkie's dispatch under the `vroxy-dispatch-*` unit names —
+those stale units must be stopped/disabled before installing the
+units below (they run deleted code and hold the old product's
+service token).
 
 ## Runtime shape
 
