@@ -51,6 +51,7 @@ import re
 import subprocess
 import sys
 import urllib.parse
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -76,7 +77,7 @@ CLAUDE_CHAT_BIN = os.environ.get(
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.2.0"
+AGENT_VERSION      = "vroxy_dispatch 0.2.1"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -90,11 +91,44 @@ ROOM_BODY_MAX = 4_000
 # can show "processing feedback abc123" in real time.
 _current_status: str = "idle"
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-)
-log = logging.getLogger("vroxy_dispatch")
+# Logs go to the terminal AND to a file, so a run started in a
+# shell is still readable (`tail -f`) after that shell is gone.
+# LOG_FILE overrides the path; LOG_FILE="" disables file logging.
+LOG_FILE = os.environ.get("LOG_FILE",
+                          str(Path(__file__).resolve().parent / "log" / "dispatch.log"))
+LOG_MAX_BYTES    = int(os.environ.get("LOG_MAX_BYTES", 10 * 1024 * 1024))
+LOG_BACKUP_COUNT = int(os.environ.get("LOG_BACKUP_COUNT", 5))
+
+
+def _setup_logging() -> logging.Logger:
+    fmt   = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    level = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    root.addHandler(stream)
+
+    if LOG_FILE:
+        try:
+            path = Path(LOG_FILE)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            rotating = RotatingFileHandler(
+                path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8")
+            rotating.setFormatter(fmt)
+            root.addHandler(rotating)
+        except OSError as e:
+            # An unwritable log path must never stop dispatch from
+            # running — the terminal handler is already attached.
+            root.warning("file logging disabled (%s): %s", LOG_FILE, e)
+
+    return logging.getLogger("vroxy_dispatch")
+
+
+log = _setup_logging()
 
 
 # ── ActionCable helpers ───────────────────────────────────────────

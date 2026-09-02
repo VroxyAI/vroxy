@@ -143,6 +143,27 @@ attached to a User instead of a Tenant.
 | `CLAUDE_CHAT_BIN`       | `./bin/claude-chat`                 |
 | `CLAUDE_STREAM`         | `1` (set `0` to skip streamed path) |
 | `LOG_LEVEL`             | `INFO`                              |
+| `LOG_FILE`              | `./log/dispatch.log` (`""` disables)|
+| `LOG_MAX_BYTES`         | `10485760` (10 MB before rotating)  |
+| `LOG_BACKUP_COUNT`      | `5`                                 |
+
+## Watching what it's doing
+
+Every run logs to the terminal **and** to a rotating file, so a
+dispatch started in a shell stays readable after that shell is gone:
+
+```bash
+tail -f log/dispatch.log            # follow live
+grep -E "Handling|tool_use|Reply|Room reply" log/dispatch.log   # just the beats
+```
+
+The log records each turn end to end: the triggering message, the
+prompt's working directory and session file, every `tool_use` and its
+result preview, the text Claude produced, token usage, and the reply
+that went back. `LOG_LEVEL=DEBUG` adds the ignored cable frames.
+
+`log/` is gitignored. Under systemd the units also append to
+`/var/log/vroxy-dispatch/`, which is now redundant but harmless.
 
 ## Run against local dev
 

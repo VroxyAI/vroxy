@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+- **Logs to a file as well as the terminal.** `log/dispatch.log`,
+  rotating at 10 MB × 5 backups, so a run started in a shell stays
+  readable (`tail -f`) after that shell is gone — and so a turn that
+  misbehaved can be read back rather than reconstructed. `LOG_FILE`
+  overrides the path, `LOG_FILE=""` disables it, and an unwritable
+  path warns instead of taking dispatch down.
+
 ## 0.2.0
 
 - **Rooms.** Dispatch now reads and answers in workspace chat rooms,
