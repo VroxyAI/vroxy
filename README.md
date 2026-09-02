@@ -28,8 +28,72 @@ service token).
 4. On `approve.requested` (operator clicked Ship-it) → writes the
    proposal files, `git commit`, `git push` (auto-deploys) — or
    opens a PR via `gh pr create` for `mode: pull_request`.
-5. Heartbeat every 20 s; one in-flight worker at a time
+5. On `room.message` → answers in a workspace **Room** as the
+   dispatch bot user. See [Rooms](#rooms) below.
+6. Heartbeat every 20 s; one in-flight worker at a time
    (Claude sessions aren't reentrant).
+
+## Rooms
+
+Dispatch also sits in workspace chat rooms, so the team can just
+talk to Claude Code where they already talk to each other. This is
+conversation, not the feedback pipeline: no proposal blocks, no
+Ship-it card, no tool chips in the room log.
+
+**Turning it on** is per-room, by an operator, at
+`/w/:workspace/:slug/rooms/:id/edit` → **Claude (dispatch)**:
+
+| Mode                        | Dispatch answers                                     |
+| --------------------------- | ---------------------------------------------------- |
+| `off` (default)             | never                                                 |
+| `mentioned`                 | only messages that `@Dispatch`                        |
+| `all`                       | every human message in the room                       |
+
+Rules that hold in both modes:
+
+- **The bot's own messages never wake it** — that's the loop guard.
+- **Webhook posts don't trigger a reply** unless they explicitly
+  `@Dispatch`, so a build-notification room doesn't get answered
+  once per deploy.
+- Dispatch posts as the `dispatch@vroxy.ai` service user (`agent`
+  flag, seated in the workspace at operator level and joined to the
+  room). Replies go through `RoomMessageService`, so they fan out to
+  the room cable, notifications, and outbound webhooks exactly like
+  a human's message.
+- **Each room gets its own Claude session**, separate from the
+  feedback queue and from every other room.
+- Long answers are split across several messages at the 4,000-char
+  `RoomMessage` cap, on paragraph boundaries where possible.
+
+**In-room commands:** `/reset` (aliases `/clear`, `/new`) drops that
+room's Claude session and starts fresh. It answers immediately
+without spending a Claude run.
+
+## Resetting a session
+
+Dispatch keeps one Claude session per conversation so follow-ups
+retain context. Two things go wrong with that, and each has a fix:
+
+- **The session id outlived its transcript** (cleared history, a
+  different host, a wiped `~/.claude`). `claude --resume` exits 1
+  having produced nothing, which used to surface as *"Claude
+  returned an empty response"* forever, because the dead id got
+  written back after every failure. Dispatch now detects this,
+  drops the id, and retries fresh automatically — no action needed.
+
+- **The session is merely WRONG** — too long, wandered off, carrying
+  stale assumptions. Nothing can detect that but you:
+
+```bash
+.venv/bin/python feedback_agent.py --reset            # feedback + every room, this PROJECT
+.venv/bin/python feedback_agent.py --reset bazhjzyq   # one room, by hashid
+.venv/bin/python feedback_agent.py --sessions         # list what's stored
+```
+
+`--reset` is safe to run while dispatch is live — the next message
+just starts a new session. Session files live in
+`~/.cache/claude-chat/`; `bin/claude-chat /clear` only clears the
+non-streamed one, which is why it never fixed the streamed path.
 
 ## Install
 
@@ -221,6 +285,12 @@ version if you need a global-scope alternative.
   with the fresh state.
 - **`approve.requested`** — operator clicked Ship-it on a
   proposal card. Dispatch writes files + commits + pushes.
+- **`room.message`** — a message in a dispatch-enabled Room that
+  passed `Room#dispatch_should_answer?`. Envelope: `{ room:
+  {hashid, name, topic, dispatch_mode}, message: {hashid, body,
+  created_at}, sender: {hashid, name, source}, history: [...] }`.
+  `history` is up to 30 prior turns, oldest first, excluding the
+  triggering message.
 
 ### Dispatch → server
 
@@ -228,9 +298,11 @@ Dispatch calls these `action`s on the channel:
 
 | Action    | Payload                                     | Server does                                                                          |
 | --------- | ------------------------------------------- | ------------------------------------------------------------------------------------ |
-| heartbeat | `version`, `meta`                           | `Rails.cache.write("vroxy_dispatch:heartbeat:<tenant.id>", {...}, expires_in: 60)` |
-| progress  | `chat_id`, `name`, `input`                  | Persists a `tool_call` `SupportChatMessage` + broadcasts a `tool` chip on `SupportChatChannel` |
-| reply     | `chat_id`, `body`, `kind` (opt), `proposal` (opt) | Persists an assistant `SupportChatMessage` + broadcasts `done` on `SupportChatChannel`; bumps linked feedback `open → triaged` |
+| heartbeat   | `version`, `meta`                         | `Rails.cache.write("vroxy_dispatch:heartbeat:<tenant.id>", {...}, expires_in: 60)` |
+| progress    | `chat_id`, `name`, `input`                | Persists a `tool_call` `SupportChatMessage` + broadcasts a `tool` chip on `SupportChatChannel` |
+| reply       | `chat_id`, `body`, `kind` (opt), `proposal` (opt) | Persists an assistant `SupportChatMessage` + broadcasts `done` on `SupportChatChannel`; bumps linked feedback `open → triaged` |
+| room_reply  | `room_id`, `body`, `reply_to` (opt)       | Posts a `RoomMessage` as the dispatch bot via `RoomMessageService` (refused unless the room has dispatch on) |
+| room_typing | `room_id`                                 | Ephemeral `typing` frame on the room's `RoomChannel`; nothing persists |
 
 ## Feedback source
 

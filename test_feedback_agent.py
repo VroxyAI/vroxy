@@ -6,7 +6,9 @@ at a real vroxy_web instance.
 """
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import feedback_agent as fa
 
@@ -128,6 +130,132 @@ class ParseProposalTest(unittest.TestCase):
         body, proposal = fa.parse_proposal(raw)
         self.assertEqual("pull_request", proposal["mode"])
         self.assertIn("Bigger change", body)
+
+
+ROOM_PAYLOAD = {
+    "type": "room.message",
+    "room": {"hashid": "rm123456", "name": "Claude",
+             "topic": "Claude Code sessions", "dispatch_mode": "all"},
+    "message": {"hashid": "ms123456", "body": "what version are we on?"},
+    "sender": {"hashid": "us123456", "name": "Sarah", "source": "app"},
+    "history": [
+        {"hashid": "ms000001", "body": "deploying now", "sender": "Sarah"},
+        {"hashid": "ms000002", "body": "🚀 v2.31.0 deployed", "sender": "deploy"},
+    ],
+}
+
+
+class BuildRoomPromptTest(unittest.TestCase):
+    def test_renders_room_history_and_current_turn(self):
+        prompt = fa.build_room_prompt(ROOM_PAYLOAD)
+        self.assertIn("## Room: #Claude", prompt)
+        self.assertIn("Claude Code sessions", prompt)
+        self.assertIn("## Recent conversation", prompt)
+        self.assertIn("Sarah: deploying now", prompt)
+        self.assertIn("deploy: 🚀 v2.31.0 deployed", prompt)
+        self.assertIn("## The message to answer", prompt)
+        self.assertIn("Sarah: what version are we on?", prompt)
+
+    def test_no_history_omits_the_section(self):
+        payload = {**ROOM_PAYLOAD, "history": []}
+        prompt = fa.build_room_prompt(payload)
+        self.assertNotIn("## Recent conversation", prompt)
+        self.assertIn("## The message to answer", prompt)
+
+    def test_sparse_payload_does_not_raise(self):
+        prompt = fa.build_room_prompt({"room": {}, "message": {}, "sender": {}})
+        self.assertIn("## Room: #?", prompt)
+        self.assertIn("someone:", prompt)
+
+    def test_chat_instructions_forbid_a_proposal_block(self):
+        prompt = fa.build_room_prompt(ROOM_PAYLOAD)
+        self.assertIn("no fenced proposal block", prompt)
+
+
+class RoomCommandTest(unittest.TestCase):
+    def test_recognizes_reset_aliases(self):
+        for word in ("/reset", "/clear", "/new"):
+            self.assertEqual(word, fa.room_command(word))
+            self.assertEqual(word, fa.room_command(f"  {word.upper()}  "))
+
+    def test_trailing_words_still_reset(self):
+        self.assertEqual("/reset", fa.room_command("/reset please, you're confused"))
+
+    def test_ordinary_messages_are_not_commands(self):
+        for body in ("", "   ", "hello", "what about /reset?", "resetting the db"):
+            self.assertIsNone(fa.room_command(body))
+
+
+class SplitRoomBodyTest(unittest.TestCase):
+    def test_short_body_is_one_chunk(self):
+        self.assertEqual(["hello"], fa.split_room_body("hello"))
+
+    def test_empty_body_is_no_chunks(self):
+        self.assertEqual([], fa.split_room_body("   "))
+
+    def test_long_body_splits_on_paragraph_and_stays_under_the_cap(self):
+        para = ("x" * 200 + "\n\n") * 60
+        chunks = fa.split_room_body(para, limit=1000)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 1000)
+        self.assertEqual(para.replace("\n\n", "").strip(), "".join(chunks).replace("\n\n", ""))
+
+    def test_unbreakable_text_still_splits(self):
+        chunks = fa.split_room_body("y" * 2500, limit=1000)
+        self.assertEqual(3, len(chunks))
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 1000)
+
+
+class RoomSessionKeyTest(unittest.TestCase):
+    def test_rooms_get_distinct_session_keys(self):
+        self.assertNotEqual(fa._room_session_key("aaa"), fa._room_session_key("bbb"))
+
+    def test_session_key_is_scoped_to_the_project(self):
+        self.assertIn(fa.PROJECT, fa._room_session_key("aaa"))
+
+
+class ClearSessionsTest(unittest.TestCase):
+    """SID_DIR is redirected at a tmpdir — a test that reaches the
+    real ~/.cache/claude-chat would wipe a live session."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._real_dir = fa.SID_DIR
+        fa.SID_DIR = Path(self.tmp.name)
+        self.addCleanup(lambda: setattr(fa, "SID_DIR", self._real_dir))
+
+    def write(self, name):
+        (fa.SID_DIR / name).write_text("00000000-0000-0000-0000-000000000000")
+
+    def test_clears_feedback_and_every_room_for_this_project(self):
+        self.write(f"feedback_stream_{fa.PROJECT}")
+        self.write(f"feedback_{fa.PROJECT}")
+        self.write(f"feedback_stream_room_aaa_{fa.PROJECT}")
+        self.write(f"feedback_stream_room_bbb_{fa.PROJECT}")
+        removed = fa.clear_sessions()
+        self.assertEqual(4, len(removed))
+        self.assertEqual([], list(fa.SID_DIR.iterdir()))
+
+    def test_leaves_other_projects_alone(self):
+        self.write("feedback_stream_some_other_project")
+        self.write(f"feedback_stream_{fa.PROJECT}")
+        fa.clear_sessions()
+        self.assertEqual(["feedback_stream_some_other_project"],
+                         [p.name for p in fa.SID_DIR.iterdir()])
+
+    def test_named_rooms_clear_only_themselves(self):
+        self.write(f"feedback_stream_room_aaa_{fa.PROJECT}")
+        self.write(f"feedback_stream_room_bbb_{fa.PROJECT}")
+        self.write(f"feedback_stream_{fa.PROJECT}")
+        removed = fa.clear_sessions([fa._room_session_key("aaa")])
+        self.assertEqual([f"feedback_stream_room_aaa_{fa.PROJECT}"], removed)
+        self.assertEqual(2, len(list(fa.SID_DIR.iterdir())))
+
+    def test_clearing_nothing_is_not_an_error(self):
+        self.assertEqual([], fa.clear_sessions())
 
 
 if __name__ == "__main__":

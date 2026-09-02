@@ -34,7 +34,11 @@ Runtime shape mirrors vroxy_dispatch:
      parse an optional fenced ` ```proposal ``` ` block → reply.
   4. On approve.requested → write files, commit, push
      (inline_ship) or open a PR (pull_request).
-  5. Heartbeat every 20 s; one in-flight worker at a time.
+  5. On room.message → answer in the workspace Room as the
+     dispatch bot (conversation, not proposals — see
+     handle_room_message).  Each room keeps its own Claude
+     session; `/reset` in-room or `--reset` on the CLI clears it.
+  6. Heartbeat every 20 s; one in-flight worker at a time.
 """
 
 from __future__ import annotations
@@ -45,6 +49,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -71,8 +76,14 @@ CLAUDE_CHAT_BIN = os.environ.get(
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.1.0"
+AGENT_VERSION      = "vroxy_dispatch 0.2.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
+# Must stay under the 4 s the room UI holds a typing state for
+# (workspace_rooms.js `noteTyping`), or the indicator flickers.
+ROOM_TYPING_INTERVAL_SECONDS = 3
+# Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
+# truncates too, but splitting here keeps whole sentences.
+ROOM_BODY_MAX = 4_000
 
 # Mutable status reported on each heartbeat.  Updated by the worker
 # as it moves through feedback / apply lifecycles so the admin UI
@@ -140,6 +151,40 @@ async def reply(ws, chat_id: str, body: str, kind: str = "assistant",
     log.info("Reply sent chat=%s kind=%s body=%.80s", chat_id, kind, body)
 
 
+async def room_reply(ws, room_id: str, body: str, reply_to: str | None = None) -> None:
+    """`AdminFeedbackChannel#room_reply` — the server posts it into
+    the Room as the dispatch bot user through RoomMessageService, so
+    it fans out to the room's cable, notifications, and webhooks
+    exactly like a human message."""
+    payload: dict[str, Any] = {
+        "action":  "room_reply",
+        "room_id": room_id,
+        "body":    body,
+    }
+    if reply_to:
+        payload["reply_to"] = reply_to
+    await cable_send(ws, "message", payload)
+    log.info("Room reply sent room=%s body=%.80s", room_id, body)
+
+
+async def room_typing(ws, room_id: str) -> None:
+    """Ephemeral "dispatch is working" frame.  Nothing persists, so a
+    run that dies just stops refreshing it."""
+    await cable_send(ws, "message", {"action": "room_typing", "room_id": room_id})
+
+
+async def room_typing_forever(ws, room_id: str) -> None:
+    """Keeps the indicator alive for the length of a Claude run.  The
+    interval is under the ~5 s the room UI holds a typing state for,
+    so it never gaps."""
+    while True:
+        try:
+            await room_typing(ws, room_id)
+        except Exception:
+            return
+        await asyncio.sleep(ROOM_TYPING_INTERVAL_SECONDS)
+
+
 # ── Prompt builder ────────────────────────────────────────────────
 SYSTEM_PROMPT = """
 You are the UI-feedback agent for a Rails app.  A user filed a
@@ -197,6 +242,72 @@ job:
 Be concise; the user is watching this in a chat widget.
 Investigate first, then commit real content.
 """.strip()
+
+
+ROOM_SYSTEM_PROMPT = """
+You are Dispatch — Claude Code, headless, sitting in a workspace
+chat room with the team that builds this repo.  You have full read
+access to the checkout and the normal tools.
+
+How to behave here:
+
+- This is a CHAT, not a ticket queue.  Answer the question that was
+  asked, at the length it deserves.  One line is a fine answer.
+- You are talking to the people who wrote this code.  Skip the
+  preamble, skip restating the question, skip the summary of what
+  you're about to do.
+- Investigate before answering anything factual about the code —
+  read the files, run the greps.  Never guess at a filename, a
+  version, or a behavior you haven't checked.
+- Format for a chat window: short paragraphs, `code` spans for
+  identifiers, fenced blocks only for real code.  No headings.
+- If someone asks you to CHANGE something, you may edit files
+  directly — you're in the working tree.  Say what you changed and
+  in which files.  Do NOT commit or push unless asked explicitly.
+- If a request is ambiguous, ask the one question that unblocks you
+  rather than guessing.
+
+The conversation so far is below.  Reply with only your message —
+no "Dispatch:" prefix, no fenced proposal block.
+""".strip()
+
+
+def build_room_prompt(payload: dict) -> str:
+    """Compose the prompt for an `AdminFeedbackChannel` `room.message`
+    event.  The envelope carries the room, the triggering message, and
+    up to ROOM_HISTORY_LIMIT prior turns (oldest first) so a Claude
+    session that wasn't listening still knows what the room was
+    talking about."""
+    room    = payload.get("room") or {}
+    msg     = payload.get("message") or {}
+    sender  = payload.get("sender") or {}
+    history = payload.get("history") or []
+
+    lines: list[str] = [ROOM_SYSTEM_PROMPT, ""]
+
+    name  = room.get("name") or "?"
+    topic = (room.get("topic") or "").strip()
+    lines.append(f"## Room: #{name}")
+    if topic:
+        lines.append(f"Topic: {topic}")
+    lines.append(f"Repo: {PROJECT} (you are running inside its checkout)")
+    lines.append("")
+
+    if history:
+        lines.append("## Recent conversation")
+        for h in history:
+            who  = h.get("sender") or "someone"
+            body = _one_line(h.get("body") or "", 500)
+            if body:
+                lines.append(f"{who}: {body}")
+        lines.append("")
+
+    who  = sender.get("name") or "someone"
+    body = (msg.get("body") or "").strip()
+    lines.append("## The message to answer")
+    lines.append(f"{who}: {body}")
+
+    return "\n".join(lines)
 
 
 def build_prompt(payload: dict) -> str:
@@ -313,6 +424,52 @@ def _streamed_sid_file(project: str) -> Path:
     return SID_DIR / f"feedback_stream_{project}"
 
 
+def _room_session_key(room_hashid: str) -> str:
+    """Each room gets its own Claude session so two rooms (and the
+    feedback queue) never inherit each other's context."""
+    return f"room_{room_hashid}_{PROJECT}"
+
+
+def clear_sessions(keys: list[str] | None = None) -> list[str]:
+    """Delete stored session ids so the next run starts a fresh
+    Claude conversation.  Returns the names actually removed.
+
+    With no keys, clears every session this project owns — both the
+    streamed and the claude-chat file for PROJECT, plus every room.
+    Used by `--reset` and by the in-room `/reset` command."""
+    if not SID_DIR.is_dir():
+        return []
+    if keys:
+        targets = [SID_DIR / f"feedback_stream_{k}" for k in keys]
+    else:
+        targets = [_streamed_sid_file(PROJECT), SID_DIR / f"feedback_{PROJECT}"]
+        targets += [p for p in SID_DIR.glob(f"feedback_stream_room_*_{PROJECT}")]
+
+    removed = []
+    for path in targets:
+        if path.exists():
+            try:
+                path.unlink()
+                removed.append(path.name)
+            except OSError:
+                log.exception("could not remove %s", path)
+    return removed
+
+
+# `/reset` and its aliases, matching bin/claude-chat's vocabulary.
+RESET_COMMANDS = {"/reset", "/clear", "/new"}
+
+
+def room_command(body: str) -> str | None:
+    """A leading slash command in a room message, or None.  Only the
+    first token counts — "/reset please" resets."""
+    token = (body or "").strip().split(maxsplit=1)
+    if not token:
+        return None
+    head = token[0].lower()
+    return head if head in RESET_COMMANDS else None
+
+
 def _resolve_claude_bin() -> str:
     """Same resolution order as bin/claude-chat: $CLAUDE_BIN → PATH
     → ~/.local/bin/claude → /usr/local/bin/claude.  Fail-loud so a
@@ -330,13 +487,20 @@ def _resolve_claude_bin() -> str:
     raise FileNotFoundError("`claude` binary not found. Set CLAUDE_BIN or put it on PATH.")
 
 
-def run_claude_streamed(prompt: str, project: str, on_event) -> str:
+def run_claude_streamed(prompt: str, project: str, on_event,
+                        allow_resume: bool = True,
+                        session_key: str | None = None) -> str:
     """`claude -p ... --output-format stream-json` variant.
 
     Emits each JSON event to `on_event(dict)` as it arrives so
     callers can forward tool_use / text events into a chat widget
     live.  Blocking; call from a thread.  Returns aggregated final
-    result text."""
+    result text.
+
+    A stored session id can outlive the transcript it points at (a
+    cleared history, a different host, `~/.claude` wiped).  `--resume`
+    then exits 1 having produced nothing, so on that signature the
+    session file is dropped and the prompt retried fresh once."""
     work_dir = str(CODE_ROOT / project)
     if not Path(work_dir).is_dir():
         raise FileNotFoundError(
@@ -344,17 +508,20 @@ def run_claude_streamed(prompt: str, project: str, on_event) -> str:
             f"Set CODE_ROOT and/or PROJECT env vars — CODE_ROOT currently = {CODE_ROOT!r}"
         )
     claude_bin = _resolve_claude_bin()
-    sid_file = _streamed_sid_file(project)
+    sid_file = _streamed_sid_file(session_key or project)
     sid_file.parent.mkdir(parents=True, exist_ok=True)
 
     argv = [claude_bin, "-p", prompt,
             "--output-format", "stream-json",
             "--verbose",  # required alongside stream-json in current CLIs
             "--dangerously-skip-permissions"]
-    if sid_file.exists() and sid_file.read_text().strip():
+    resumed = False
+    if allow_resume and sid_file.exists() and sid_file.read_text().strip():
         argv += ["--resume", sid_file.read_text().strip()]
+        resumed = True
 
-    log.info("Running streamed claude in %s (session=%s)", work_dir, sid_file)
+    log.info("Running streamed claude in %s (session=%s, resume=%s)",
+             work_dir, sid_file, resumed)
     proc = subprocess.Popen(
         argv, cwd=work_dir, env=os.environ.copy(),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
@@ -434,21 +601,38 @@ def run_claude_streamed(prompt: str, project: str, on_event) -> str:
         proc.wait(timeout=30)
     finally:
         if proc.stdout: proc.stdout.close()
+        stderr_text = ""
         if proc.stderr:
-            err = proc.stderr.read()
-            if err:
-                log.info("claude stderr: %s", err[:400])
+            stderr_text = proc.stderr.read() or ""
+            if stderr_text:
+                log.info("claude stderr: %s", stderr_text[:400])
             proc.stderr.close()
 
-    if proc.returncode not in (0, None):
+    failed = proc.returncode not in (0, None)
+    if failed:
         log.warning("streamed claude rc=%s", proc.returncode)
 
-    if new_sid:
+    produced_nothing = not final_text_chunks and tool_calls == 0
+
+    if resumed and failed and produced_nothing:
+        log.warning("resume produced nothing (rc=%s) — dropping stale session "
+                    "id and retrying fresh", proc.returncode)
+        try: sid_file.unlink(missing_ok=True)
+        except Exception: log.exception("clearing session id failed")
+        return run_claude_streamed(prompt, project, on_event,
+                                   allow_resume=False, session_key=session_key)
+
+    if new_sid and not failed:
         try: sid_file.write_text(new_sid)
         except Exception: log.exception("saving session id failed")
 
     log.info("streamed claude done — tool_calls=%d text_chars=%d thinking_chars=%d",
              tool_calls, text_chars, thinking_chars)
+
+    if failed and produced_nothing:
+        raise RuntimeError(
+            f"claude exited {proc.returncode} with no output"
+            + (f": {_one_line(stderr_text, 300)}" if stderr_text else ""))
 
     return "".join(final_text_chunks).strip()
 
@@ -755,6 +939,83 @@ async def handle_feedback(ws, payload: dict) -> None:
         await reply(ws, chat_id, body)
 
 
+def split_room_body(text: str, limit: int = ROOM_BODY_MAX) -> list[str]:
+    """Claude can outrun a room message's length cap.  Split on
+    paragraph, then line, then hard characters — a fenced block that
+    exceeds the cap still has to break somewhere."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = window.rfind("\n\n")
+        if cut < limit // 2:
+            cut = window.rfind("\n")
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return [c for c in chunks if c]
+
+
+async def handle_room_message(ws, payload: dict) -> None:
+    """`room.message` handler — dispatch's turn in a workspace room.
+
+    Unlike feedback, a room answer is plain conversation: no proposal
+    block, no tool chips (a room log full of tool calls is noise), and
+    a per-room Claude session so two rooms stay independent."""
+    room    = payload.get("room") or {}
+    msg     = payload.get("message") or {}
+    sender  = payload.get("sender") or {}
+    room_id = room.get("hashid")
+    if not room_id:
+        log.warning("room.message without room.hashid: %s", payload)
+        return
+
+    body = (msg.get("body") or "").strip()
+    log.info("Handling room message room=%s (#%s) from=%s body=%.80s",
+             room_id, room.get("name"), sender.get("name"), body)
+
+    command = room_command(body)
+    if command:
+        removed = clear_sessions([_room_session_key(room_id)])
+        await room_reply(ws, room_id,
+                         "🧹 Fresh session — I've forgotten this room's history."
+                         if removed else
+                         "🧹 Already on a fresh session (nothing to clear).")
+        return
+
+    prompt = build_room_prompt(payload)
+    typing_task = asyncio.create_task(room_typing_forever(ws, room_id))
+    try:
+        raw = await asyncio.to_thread(
+            run_claude_streamed, prompt, PROJECT, lambda e: None,
+            True, _room_session_key(room_id))
+    except subprocess.TimeoutExpired:
+        await room_reply(ws, room_id, "⚠️ I timed out after 30 minutes.")
+        return
+    except Exception as e:
+        log.exception("claude crashed on room message")
+        await room_reply(ws, room_id, f"⚠️ I crashed: {type(e).__name__}: {e}")
+        return
+    finally:
+        typing_task.cancel()
+
+    if not raw:
+        await room_reply(ws, room_id, "(I came back with an empty response.)")
+        return
+
+    for chunk in split_room_body(raw):
+        await room_reply(ws, room_id, chunk)
+
+
 async def process_stream(ws) -> None:
     """One in-flight handler at a time — Claude sessions aren't
     reentrant and we don't want to race a `--resume` with itself."""
@@ -766,13 +1027,19 @@ async def process_stream(ws) -> None:
             kind, payload = await queue.get()
             fb_id = ((payload.get("feedback") or {}).get("hashid")
                      or payload.get("feedback_id") or "?")
-            _current_status = f"processing feedback {fb_id}" if kind == "feedback" \
-                              else f"applying feedback {fb_id}"
+            if kind == "room":
+                room = payload.get("room") or {}
+                _current_status = f"answering #{room.get('name') or room.get('hashid')}"
+            else:
+                _current_status = f"processing feedback {fb_id}" if kind == "feedback" \
+                                  else f"applying feedback {fb_id}"
             try:
                 if kind == "feedback":
                     await handle_feedback(ws, payload)
                 elif kind == "approve":
                     await handle_approve(ws, payload)
+                elif kind == "room":
+                    await handle_room_message(ws, payload)
             except Exception:
                 log.exception("worker failed on payload=%s", payload)
             finally:
@@ -814,6 +1081,8 @@ async def process_stream(ws) -> None:
                 await queue.put(("feedback", msg))
             elif msg.get("type") == "approve.requested":
                 await queue.put(("approve", msg))
+            elif msg.get("type") == "room.message":
+                await queue.put(("room", msg))
             else:
                 log.debug("Ignoring message type=%s", msg.get("type"))
     finally:
@@ -853,8 +1122,48 @@ async def main() -> None:
             await asyncio.sleep(5)
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """`--reset` clears stored Claude session ids and exits; anything
+    else starts the cable agent.  Reset is the escape hatch for a
+    poisoned or wandering session — dispatch also self-heals a session
+    id whose transcript has vanished, but a session that is merely
+    WRONG (too long, off on a tangent) needs a human to say so."""
+    if "--reset" in sys.argv:
+        keys = [a for a in sys.argv[1:] if not a.startswith("-")]
+        removed = clear_sessions([_room_session_key(k) for k in keys] if keys else None)
+        scope = f"room(s) {', '.join(keys)}" if keys else f"project {PROJECT}"
+        if removed:
+            print(f"cleared {len(removed)} session(s) for {scope}:")
+            for name in removed:
+                print(f"  {name}")
+        else:
+            print(f"no stored sessions for {scope} — nothing to clear")
+        return
+
+    if "--sessions" in sys.argv:
+        files = sorted(SID_DIR.glob("*")) if SID_DIR.is_dir() else []
+        if not files:
+            print(f"no stored sessions in {SID_DIR}")
+            return
+        for path in files:
+            print(f"{path.name}\t{path.read_text().strip()}")
+        return
+
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__ or "")
+        print("usage: feedback_agent.py [--reset [ROOM_HASHID …]] [--sessions] [--help]")
+        print()
+        print("  (no args)   run the cable agent")
+        print("  --reset     clear this project's stored Claude sessions "
+              "(feedback + every room); pass room hashids to clear only those")
+        print("  --sessions  list stored session ids")
+        return
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
+
+if __name__ == "__main__":
+    cli()

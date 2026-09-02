@@ -71,10 +71,17 @@ else
   exit 127
 fi
 
+out=""
 if [[ -s "$SID_FILE" ]]; then
   sid=$(cat "$SID_FILE")
-  out=$("$claude_bin" -p "$input" --resume "$sid" --output-format json "${extra_args[@]}")
-else
+  if ! out=$("$claude_bin" -p "$input" --resume "$sid" --output-format json "${extra_args[@]}"); then
+    echo "claude-chat: resume of session $sid failed — starting a fresh session" >&2
+    rm -f "$SID_FILE"
+    out=""
+  fi
+fi
+
+if [[ -z "$out" ]]; then
   out=$("$claude_bin" -p "$input" --output-format json "${extra_args[@]}")
 fi
 
