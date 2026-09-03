@@ -21,17 +21,96 @@ service token).
    `current_tenant`, and the channel streams for exactly that
    tenant.
 3. On `feedback.created` (fanned out by
-   `POST /widget/feedback`) → builds a prompt → runs `claude-chat`
-   (or streamed `claude -p --output-format stream-json` for live
-   tool chips) → parses an optional fenced ` ```proposal ``` `
-   block → replies over the socket.
-4. On `approve.requested` (operator clicked Ship-it) → writes the
-   proposal files, `git commit`, `git push` (auto-deploys) — or
-   opens a PR via `gh pr create` for `mode: pull_request`.
+   `POST /widget/feedback`) → builds a prompt → runs Claude **in a
+   throwaway git worktree** → parses an optional fenced
+   ` ```proposal ``` ` block → replies with the proposal and its
+   diffstat. See [The proposal worktree](#the-proposal-worktree).
+4. On `approve.requested` (operator clicked Apply) → writes the
+   proposal files and either commits to the base branch or opens a
+   PR, **as the server's ship policy directs**. See
+   [Ship policy](#ship-policy).
 5. On `room.message` → answers in a workspace **Room** as the
    dispatch bot user. See [Rooms](#rooms) below.
 6. Heartbeat every 20 s; one in-flight worker at a time
    (Claude sessions aren't reentrant).
+
+## The proposal worktree
+
+The proposal phase runs Claude in a **throwaway git worktree of
+HEAD**, not in your checkout. Before this, an investigation that
+decided to edit a file did so in the real tree — so a card reading
+"pending review" could be sitting on top of changes already written
+to disk. Propose-then-approve is now literally true: nothing reaches
+your working tree until you approve.
+
+Where the worktree lives is load-bearing:
+
+```
+~/code/vroxy/                     ← CODE_ROOT
+├── CLAUDE.md                     ← still loads (parent of the worktree)
+├── vroxy_web/                    ← PROJECT
+├── vroxy_dispatch/
+└── .dispatch-vroxy_web-a1b2c3d4/ ← the worktree, a SIBLING
+```
+
+It is created beside the project inside `CODE_ROOT`, never in
+`/tmp`, because that is what keeps a dispatch run's context identical
+to a human's in this workspace: the parent `CODE_ROOT/CLAUDE.md`
+still loads (Claude Code walks up from the working directory), and
+sibling repos still resolve at `../vroxy_dispatch`. A `/tmp` worktree
+silently loses both, and the model starts writing code that doesn't
+match the workspace's rules.
+
+Consequences worth knowing:
+
+- **The run sees committed HEAD, not your uncommitted work.** That's
+  the right default for a proposal, and it's why isolation is
+  possible at all.
+- **The diffstat is exact**, because the worktree started clean.
+  That's what the ship policy sizes on.
+- If Claude edits files but emits no fenced proposal, the worktree
+  diff is turned into one rather than thrown away.
+- Stale worktrees from a killed run are pruned on the next run.
+- **Rooms are unaffected** — room mode edits your real checkout on
+  purpose, because that's the point of asking it to change something.
+
+## Ship policy
+
+The operator decides how an approved proposal reaches the repo, per
+workspace and per project. Dispatch does not choose; it obeys the
+decision that arrives in the `approve.requested` payload.
+
+Configure at `/w/:workspace/:slug/settings` (workspace default) and
+`/w/:workspace/:slug/dispatch` (per project). Projects appear on that
+page automatically — dispatch reports its `PROJECT` on every
+heartbeat and the server upserts a row.
+
+| Policy | What an approved proposal does |
+| ------ | ------------------------------ |
+| `always_ship` | commits to the base branch and pushes (auto-deploys) |
+| `always_pr` | branches, pushes, opens a PR for you to merge |
+| `auto` (default) | small → ship; large → PR |
+
+`auto` routes to a **PR** when any of these is true:
+
+- more files than `auto_pr_file_threshold` (default 3)
+- more lines than `auto_pr_line_threshold` (default 80)
+- any path matches `always_pr_paths` (default `db/migrate/*` — a
+  schema change should never auto-land)
+- the note explicitly asked for one ("PR", "branch", "for review")
+
+Other settings: `base_ref`, `branch_prefix`, `pr_draft`, and
+`auto_apply` — which, when on, ships a policy-sized-small change
+with **no human clicking Apply**. Off by default. It never applies to
+anything routed to a PR.
+
+Every project field may be left blank to inherit the workspace's.
+A project can also be disabled entirely, in which case dispatch
+refuses to apply anything for it.
+
+A PR comes back into the chat as a link card (`kind:
+"pull_request"`), and the feedback stays `triaged` rather than
+`resolved` — it isn't done until you merge.
 
 ## Rooms
 
@@ -226,11 +305,12 @@ origin or dispatch starts getting rejected at connect.
 ### Local dev doesn't sandbox the ship path
 
 Pointing `VROXY_CABLE_URL` at localhost only redirects the cable.
-An approved proposal still runs a real `git commit` + `git push` in
-`CODE_ROOT/PROJECT` (`handle_approve`), and `mode: pull_request`
-still shells out to `gh pr create` against the real remote. Local
-dev is a safe place to exercise `feedback.created` → `reply`; it is
-not a safe place to click Ship-it unless you mean it.
+The PROPOSAL phase is now safe everywhere — it runs in a throwaway
+worktree — but an APPROVED proposal still runs a real `git commit` +
+`git push` in `CODE_ROOT/PROJECT`, and a PR-routed one still shells
+out to `gh pr create` against the real remote. Local dev is a safe
+place to exercise `feedback.created` → `reply`; it is not a safe
+place to click Apply unless you mean it.
 
 ## Run (systemd, recommended)
 
@@ -304,8 +384,11 @@ version if you need a global-scope alternative.
 - **`feedback.followup`** — visitor posted a follow-up on an
   existing feedback chat. Dispatch re-enters `handle_feedback`
   with the fresh state.
-- **`approve.requested`** — operator clicked Ship-it on a
-  proposal card. Dispatch writes files + commits + pushes.
+- **`approve.requested`** — operator clicked Apply on a proposal
+  card (or `auto_apply` fired). Carries `policy: { mode: "ship" |
+  "pr" | "none", base_ref, branch_prefix, pr_draft, reason }` — the
+  server's resolved decision, which dispatch obeys. The proposal's
+  own `mode` is only a fallback for a server that predates this.
 - **`room.message`** — a message in a dispatch-enabled Room that
   passed `Room#dispatch_should_answer?`. Envelope: `{ room:
   {hashid, name, topic, dispatch_mode}, message: {hashid, body,
@@ -321,7 +404,7 @@ Dispatch calls these `action`s on the channel:
 | --------- | ------------------------------------------- | ------------------------------------------------------------------------------------ |
 | heartbeat   | `version`, `meta`                         | `Rails.cache.write("vroxy_dispatch:heartbeat:<tenant.id>", {...}, expires_in: 60)` |
 | progress    | `chat_id`, `name`, `input`                | Persists a `tool_call` `SupportChatMessage` + broadcasts a `tool` chip on `SupportChatChannel` |
-| reply       | `chat_id`, `body`, `kind` (opt), `proposal` (opt) | Persists an assistant `SupportChatMessage` + broadcasts `done` on `SupportChatChannel`; bumps linked feedback `open → triaged` |
+| reply       | `chat_id`, `body`, `kind` (opt), `proposal` (opt), `pull_request` (opt) | Persists an assistant `SupportChatMessage` + broadcasts `done`; stamps the feedback id and the resolved policy onto the message; bumps linked feedback `open → triaged`; fires auto-apply when the policy allows |
 | room_reply  | `room_id`, `body`, `reply_to` (opt)       | Posts a `RoomMessage` as the dispatch bot via `RoomMessageService` (refused unless the room has dispatch on) |
 | room_typing | `room_id`                                 | Ephemeral `typing` frame on the room's `RoomChannel`; nothing persists |
 

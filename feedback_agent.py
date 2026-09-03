@@ -30,10 +30,15 @@ Runtime shape mirrors vroxy_dispatch:
 
   1. Connect wss://vroxy.ai/cable?token=<TOKEN>.
   2. Subscribe { channel: "AdminFeedbackChannel" }.
-  3. On feedback.created → build prompt → run claude-chat →
-     parse an optional fenced ` ```proposal ``` ` block → reply.
-  4. On approve.requested → write files, commit, push
-     (inline_ship) or open a PR (pull_request).
+  3. On feedback.created → build prompt → run Claude in a
+     THROWAWAY GIT WORKTREE (see proposal_worktree) → parse an
+     optional fenced ` ```proposal ``` ` block → reply with the
+     proposal and its exact diffstat.  The real checkout is never
+     touched before approval.
+  4. On approve.requested → write files, then commit to the base
+     branch or open a PR, as the SERVER's ship policy directs
+     (payload["policy"]["mode"]).  Dispatch obeys; it does not
+     decide.
   5. On room.message → answer in the workspace Room as the
      dispatch bot (conversation, not proposals — see
      handle_room_message).  Each room keeps its own Claude
@@ -44,6 +49,7 @@ Runtime shape mirrors vroxy_dispatch:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -51,6 +57,7 @@ import re
 import subprocess
 import sys
 import urllib.parse
+import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -77,7 +84,7 @@ CLAUDE_CHAT_BIN = os.environ.get(
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.2.1"
+AGENT_VERSION      = "vroxy_dispatch 0.3.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -169,7 +176,8 @@ async def heartbeat_forever(ws) -> None:
 
 
 async def reply(ws, chat_id: str, body: str, kind: str = "assistant",
-                proposal: dict | None = None) -> None:
+                proposal: dict | None = None,
+                pull_request: dict | None = None) -> None:
     """Sends an `AdminFeedbackChannel#reply` action back over the
     socket — the server persists it as an assistant SupportChatMessage
     and re-broadcasts on SupportChatChannel.  Chat IDs are hashids."""
@@ -181,6 +189,8 @@ async def reply(ws, chat_id: str, body: str, kind: str = "assistant",
     }
     if proposal is not None:
         payload["proposal"] = proposal
+    if pull_request is not None:
+        payload["pull_request"] = pull_request
     await cable_send(ws, "message", payload)
     log.info("Reply sent chat=%s kind=%s body=%.80s", chat_id, kind, body)
 
@@ -243,20 +253,16 @@ job:
    }
    ```
 
-3. Which mode?
+3. Mode.  You do NOT decide how this ships — the workspace's
+   dispatch policy does that server-side, based on the size and
+   shape of your change.  Leave `mode` as `inline_ship` unless the
+   note EXPLICITLY asks for a pull request ("PR", "pull request",
+   "branch", "for review", "don't ship yet"), in which case set
+   `pull_request` and the policy will honor it.
 
-   - **Default is `inline_ship`.**  The note is the fix request;
-     ship it.  Size / line count / file count are NOT grounds for
-     PR — a 400-line rewrite that solves the note is inline_ship.
-
-   - Use **`pull_request`** ONLY when the note explicitly asks for
-     one — look for words like "PR", "pull request", "branch",
-     "in a branch", "for review", "don't ship yet", or a similar
-     phrase.  PR mode is user-driven, not complexity-driven.
-
-   - If the feedback is genuinely ambiguous or you can't do it
-     without more info, reply with plain text asking the specific
-     question.  NO fenced proposal block.
+   If the feedback is genuinely ambiguous or you can't do it
+   without more info, reply with plain text asking the specific
+   question.  NO fenced proposal block.
 
 4. HARD RULES about `files`:
 
@@ -361,7 +367,27 @@ def build_prompt(payload: dict) -> str:
     chat      = payload.get("chat") or {}
     visitor   = payload.get("visitor") or {}
 
-    lines = [SYSTEM_PROMPT, "", "── Feedback ──", "", f"**Note:** {note}", ""]
+    lines = [SYSTEM_PROMPT, ""]
+
+    # How this workspace ships, so the model knows what will happen
+    # to its work rather than inferring it from the note's wording.
+    policy = payload.get("policy") or {}
+    if policy:
+        lines.append("── Ship policy (set by the operator, not by you) ──")
+        lines.append("")
+        described = {
+            "always_ship": "every approved change commits straight to the base branch",
+            "always_pr":   "every approved change becomes a pull request for review",
+            "auto":        "small changes commit to the base branch; larger ones become a PR",
+        }.get(str(policy.get("policy")), "decided server-side")
+        lines.append(f"- Workspace policy: **{policy.get('policy')}** — {described}.")
+        lines.append(f"- Base branch: `{policy.get('base_ref')}`")
+        if policy.get("auto_apply"):
+            lines.append("- Auto-apply is ON: a change the policy sizes as small ships "
+                         "WITHOUT a human clicking approve. Be correspondingly careful.")
+        lines.append("")
+
+    lines += ["── Feedback ──", "", f"**Note:** {note}", ""]
 
     # Reporter block — comes from the vroxy gem's identify()
     # payload on the customer site (email + name + role) plus
@@ -504,6 +530,84 @@ def room_command(body: str) -> str | None:
     return head if head in RESET_COMMANDS else None
 
 
+@contextlib.contextmanager
+def proposal_worktree(project_dir: Path):
+    """A throwaway checkout of HEAD for the PROPOSAL phase, so an
+    investigation that decides to edit files never touches the real
+    working tree.  "Pending review" is only honest if nothing has
+    been applied yet.
+
+    WHERE it lives matters.  The worktree is created as a SIBLING of
+    the project inside CODE_ROOT, not in /tmp, because that's what
+    keeps a Claude run's context identical to a human's in this
+    workspace: the parent CODE_ROOT/CLAUDE.md still loads (it's a
+    parent directory of the worktree), and sibling repos still
+    resolve at `../vroxy_dispatch`, `../vroxy_mobile`, and so on.
+    A /tmp worktree silently loses both.
+
+    Yields the worktree path, and removes it on the way out.  Stale
+    worktrees from a killed run are pruned on entry."""
+    _run(["git", "worktree", "prune"], project_dir)
+    name = f".dispatch-{project_dir.name}-{uuid.uuid4().hex[:8]}"
+    path = project_dir.parent / name
+
+    rc, _, err = _run(["git", "worktree", "add", "--detach", str(path), "HEAD"], project_dir)
+    if rc != 0:
+        raise RuntimeError(f"could not create worktree at {path}: {err[:300]}")
+    log.info("Proposal worktree %s", path)
+    try:
+        yield path
+    finally:
+        rc, _, err = _run(["git", "worktree", "remove", "--force", str(path)], project_dir)
+        if rc != 0:
+            log.warning("worktree remove failed (%s) — pruning", err[:200])
+            _run(["git", "worktree", "prune"], project_dir)
+
+
+def worktree_diffstat(worktree: Path) -> dict:
+    """`git diff --numstat HEAD` in the worktree — an exact count of
+    what the proposal actually changes, which is what the server's
+    ship policy sizes on.  Free only because the run was isolated."""
+    rc, out, _ = _run(["git", "diff", "--numstat", "HEAD"], worktree)
+    if rc != 0:
+        return {}
+    files = insertions = deletions = 0
+    for line in (out or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        files += 1
+        # Binary files report "-" for both counts.
+        if parts[0] != "-":
+            insertions += int(parts[0] or 0)
+        if parts[1] != "-":
+            deletions += int(parts[1] or 0)
+    return {"files": files, "insertions": insertions, "deletions": deletions}
+
+
+def worktree_changed_files(worktree: Path) -> list[dict]:
+    """Every file the run modified or added, as proposal entries.
+    Used when Claude edited the tree but didn't emit a fenced
+    proposal — the work is on disk either way and throwing it away
+    would be worse than shipping a proposal it didn't format."""
+    rc, out, _ = _run(["git", "diff", "--name-only", "HEAD"], worktree)
+    if rc != 0:
+        return []
+    rc2, untracked, _ = _run(["git", "ls-files", "--others", "--exclude-standard"], worktree)
+    names = [n for n in (out or "").splitlines() if n.strip()]
+    names += [n for n in (untracked or "").splitlines() if n.strip()]
+
+    files = []
+    for name in dict.fromkeys(names):
+        target = worktree / name
+        try:
+            if target.is_file():
+                files.append({"path": name, "content": target.read_text()})
+        except (OSError, UnicodeDecodeError):
+            log.warning("skipping unreadable/binary file in proposal: %s", name)
+    return files
+
+
 def _resolve_claude_bin() -> str:
     """Same resolution order as bin/claude-chat: $CLAUDE_BIN → PATH
     → ~/.local/bin/claude → /usr/local/bin/claude.  Fail-loud so a
@@ -523,7 +627,8 @@ def _resolve_claude_bin() -> str:
 
 def run_claude_streamed(prompt: str, project: str, on_event,
                         allow_resume: bool = True,
-                        session_key: str | None = None) -> str:
+                        session_key: str | None = None,
+                        work_dir_override: Path | None = None) -> str:
     """`claude -p ... --output-format stream-json` variant.
 
     Emits each JSON event to `on_event(dict)` as it arrives so
@@ -535,7 +640,7 @@ def run_claude_streamed(prompt: str, project: str, on_event,
     cleared history, a different host, `~/.claude` wiped).  `--resume`
     then exits 1 having produced nothing, so on that signature the
     session file is dropped and the prompt retried fresh once."""
-    work_dir = str(CODE_ROOT / project)
+    work_dir = str(work_dir_override or (CODE_ROOT / project))
     if not Path(work_dir).is_dir():
         raise FileNotFoundError(
             f"CODE_ROOT/{project} not found at {work_dir!r}. "
@@ -694,12 +799,12 @@ def _compact_tool_args(input_dict) -> str:
     return ", ".join(parts)[:200]
 
 
-def run_claude(prompt: str, project: str) -> str:
+def run_claude(prompt: str, project: str, work_dir_override: Path | None = None) -> str:
     """Blocking subprocess to `claude-chat` — fallback path when
     the streamed run crashes (broken CLI flag on a Claude Code
     upgrade, etc.).  Called from a thread so the asyncio loop
     keeps ticking."""
-    work_dir = str(CODE_ROOT / project)
+    work_dir = str(work_dir_override or (CODE_ROOT / project))
     if not Path(work_dir).is_dir():
         raise FileNotFoundError(
             f"CODE_ROOT/{project} not found at {work_dir!r}. "
@@ -759,8 +864,19 @@ async def handle_approve(ws, payload: dict) -> None:
     # bare id case comes in a follow-up.
     proposal = payload.get("proposal") or {}
     files    = proposal.get("files") or []
-    mode     = proposal.get("mode") or "inline_ship"
     summary  = proposal.get("summary") or "code proposal"
+
+    # The SERVER resolved the workspace/project ship policy and put
+    # the decision here.  Obey it; the proposal's own `mode` is only
+    # the fallback for a server that predates the policy.
+    policy = payload.get("policy") or {}
+    mode   = policy.get("mode")
+    if mode == "none":
+        await reply(ws, chat_id, f"⚠️ Dispatch is disabled for this project — {policy.get('reason')}")
+        return
+    if mode not in ("ship", "pr"):
+        mode = "pr" if proposal.get("mode") == "pull_request" else "ship"
+    log.info("Approve: mode=%s reason=%s", mode, policy.get("reason"))
     if not chat_id:
         return
     if not files:
@@ -785,12 +901,18 @@ async def handle_approve(ws, payload: dict) -> None:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
 
-        if mode == "pull_request":
-            outcome = await asyncio.to_thread(_git_open_pr, project_dir, summary, files)
+        if mode == "pr":
+            outcome, pr = await asyncio.to_thread(
+                _git_open_pr, project_dir, summary, files, policy,
+                payload.get("feedback_id"))
+            if pr:
+                await reply(ws, chat_id, outcome, kind="pull_request", pull_request=pr)
+            else:
+                await reply(ws, chat_id, outcome)
         else:
-            outcome = await asyncio.to_thread(_git_inline_ship, project_dir, summary, files)
-
-        await reply(ws, chat_id, outcome)
+            outcome = await asyncio.to_thread(_git_inline_ship, project_dir, summary,
+                                              files, policy)
+            await reply(ws, chat_id, outcome)
     except Exception as e:
         log.exception("apply failed")
         await reply(ws, chat_id, f"⚠️ Apply failed: {type(e).__name__}: {e}")
@@ -802,15 +924,23 @@ def _run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
-def _git_inline_ship(project_dir: Path, summary: str, files: list[dict]) -> str:
-    """Small-tweak path: commit the changed files, run
-    version_bump.sh if present (vroxy_web has one), push straight
-    to origin/HEAD which auto-deploys."""
-    paths = [ f["path"] for f in files if f.get("path") ]
-    log.info("Inline ship: %s → %s", summary, paths)
+def _git_inline_ship(project_dir: Path, summary: str, files: list[dict],
+                     policy: dict | None = None) -> str:
+    """Small-change path: commit the proposal's files onto the base
+    branch and push, which auto-deploys."""
+    policy = policy or {}
+    base   = policy.get("base_ref") or _current_branch(project_dir)
+    paths  = [ f["path"] for f in files if f.get("path") ]
+    log.info("Inline ship onto %s: %s -> %s", base, summary, paths)
+
+    on_base, err = _ensure_on_base(project_dir, base)
+    if not on_base:
+        return f"\u26a0\ufe0f Couldn't switch to `{base}`: {err[:200]}"
 
     _run(["git", "add"] + paths, project_dir)
 
+    # version_bump.sh rewrites the version constants and the
+    # changelog; stage exactly those two, and only if it succeeded.
     vb = project_dir / "version_bump.sh"
     if vb.is_file():
         rc, _, err = _run(["bash", "./version_bump.sh"], project_dir)
@@ -822,45 +952,107 @@ def _git_inline_ship(project_dir: Path, summary: str, files: list[dict]) -> str:
     msg = f"UI-feedback tweak: {summary}"
     rc, _, err = _run(["git", "commit", "-m", msg], project_dir)
     if rc != 0:
-        return f"⚠️ Commit failed: {err[:300]}"
+        return f"\u26a0\ufe0f Commit failed: {err[:300]}"
 
     rc, out, err = _run(["git", "rev-parse", "HEAD"], project_dir)
     sha = (out or "").strip()[:12]
 
-    rc, _, err = _run(["git", "push", "origin", "HEAD"], project_dir)
+    rc, _, err = _run(["git", "push", "origin", base], project_dir)
     if rc != 0:
-        return f"⚠️ Push failed after commit {sha}: {err[:300]}"
+        return f"\u26a0\ufe0f Push failed after commit {sha}: {err[:300]}"
 
-    return f"✅ Shipped `{sha}` — {summary}. Auto-deploy is rolling."
+    reason = policy.get("reason")
+    suffix = f" ({reason})" if reason else ""
+    return f"\u2705 Shipped `{sha}` to `{base}` \u2014 {summary}.{suffix} Auto-deploy is rolling."
 
 
-def _git_open_pr(project_dir: Path, summary: str, files: list[dict]) -> str:
-    """Bigger-change path: branch + commit + push + `gh pr create`."""
-    paths = [ f["path"] for f in files if f.get("path") ]
-    branch = "feedback/" + re.sub(r"[^a-z0-9-]+", "-", summary.lower())[:40].strip("-")
-    if not branch or branch == "feedback/":
-        branch = f"feedback/ui-{int(__import__('time').time())}"
+def _git_open_pr(project_dir: Path, summary: str, files: list[dict],
+                 policy: dict | None = None,
+                 feedback_id: str | None = None) -> tuple[str, dict | None]:
+    """Bigger-change path: branch off the base ref, commit, push, and
+    open a PR for a human to merge.
 
-    log.info("Open PR: %s on branch %s", summary, branch)
+    Returns (message, pull_request | None).  The checkout is ALWAYS
+    returned to the base branch, including on failure — leaving it on
+    the feature branch meant the next inline ship silently committed
+    onto someone else's PR."""
+    policy = policy or {}
+    base   = policy.get("base_ref") or _current_branch(project_dir)
+    prefix = policy.get("branch_prefix") or "feedback/"
+    paths  = [ f["path"] for f in files if f.get("path") ]
 
-    _run(["git", "checkout", "-b", branch], project_dir)
-    _run(["git", "add"] + paths, project_dir)
-    rc, _, err = _run(["git", "commit", "-m", f"UI feedback: {summary}"], project_dir)
-    if rc != 0:
-        return f"⚠️ Commit failed: {err[:300]}"
+    slug = re.sub(r"[^a-z0-9-]+", "-", summary.lower())[:40].strip("-") or "ui"
+    branch = f"{prefix}{slug}-{uuid.uuid4().hex[:6]}"
 
-    rc, _, err = _run(["git", "push", "-u", "origin", branch], project_dir)
-    if rc != 0:
-        return f"⚠️ Push failed: {err[:300]}"
+    log.info("Open PR on %s (base %s): %s", branch, base, summary)
 
-    rc, out, err = _run(
-        ["gh", "pr", "create", "--title", f"UI feedback: {summary}",
-         "--body", "Filed via vroxy_dispatch from an admin UI-feedback note."],
-        project_dir,
-    )
-    if rc != 0:
-        return f"⚠️ `gh pr create` failed: {err[:300]}"
-    return f"✅ PR opened on `{branch}` — {out.strip()}"
+    _run(["git", "fetch", "origin", base], project_dir)
+    on_base, err = _ensure_on_base(project_dir, base)
+    if not on_base:
+        return f"\u26a0\ufe0f Couldn't switch to `{base}`: {err[:200]}", None
+
+    try:
+        rc, _, err = _run(["git", "checkout", "-b", branch], project_dir)
+        if rc != 0:
+            return f"\u26a0\ufe0f Branch failed: {err[:300]}", None
+
+        _run(["git", "add"] + paths, project_dir)
+        rc, _, err = _run(["git", "commit", "-m", f"UI feedback: {summary}"], project_dir)
+        if rc != 0:
+            return f"\u26a0\ufe0f Commit failed: {err[:300]}", None
+
+        rc, _, err = _run(["git", "push", "-u", "origin", branch], project_dir)
+        if rc != 0:
+            return f"\u26a0\ufe0f Push failed: {err[:300]}", None
+
+        body = "Filed via vroxy_dispatch from an admin UI-feedback note."
+        if policy.get("reason"):
+            body += f"\n\nRouted to a PR because: {policy['reason']}."
+        if feedback_id:
+            body += f"\n\nFeedback: `{feedback_id}`"
+
+        argv = ["gh", "pr", "create", "--base", base, "--head", branch,
+                "--title", f"UI feedback: {summary}", "--body", body]
+        if policy.get("pr_draft"):
+            argv.append("--draft")
+
+        rc, out, err = _run(argv, project_dir)
+        if rc != 0:
+            return f"\u26a0\ufe0f `gh pr create` failed: {err[:300]}", None
+
+        url = (out or "").strip().splitlines()[-1] if out.strip() else ""
+        number = None
+        match = re.search(r"/pull/(\d+)", url)
+        if match:
+            number = int(match.group(1))
+
+        reason = policy.get("reason")
+        suffix = f" ({reason})" if reason else ""
+        pr = {"url": url, "number": number, "branch": branch, "base": base}
+        return f"\u2705 PR opened for review — {summary}.{suffix} {url}", pr
+    finally:
+        # Never leave the operator's checkout on a feature branch.
+        back, err = _ensure_on_base(project_dir, base)
+        if not back:
+            log.error("could not return to %s after PR: %s", base, err[:200])
+
+
+def _current_branch(project_dir: Path) -> str:
+    rc, out, _ = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], project_dir)
+    return (out or "").strip() or "main"
+
+
+def _ensure_on_base(project_dir: Path, base: str) -> tuple[bool, str]:
+    """Checkout `base` unless we're already there.  Refuses rather
+    than forcing when the tree is dirty \u2014 an operator's uncommitted
+    work is never dispatch's to discard."""
+    if _current_branch(project_dir) == base:
+        return True, ""
+    rc, out, _ = _run(["git", "status", "--porcelain"], project_dir)
+    if (out or "").strip():
+        return False, "the working tree has uncommitted changes"
+    rc, _, err = _run(["git", "checkout", base], project_dir)
+    return rc == 0, err
 
 
 async def _emit_progress(ws, chat_id: str, name: str, input_dict: dict | None) -> None:
@@ -941,18 +1133,17 @@ async def handle_feedback(ws, payload: dict) -> None:
                 _emit_progress(ws, chat_id, name, event.get("input")), loop)
             fut.add_done_callback(_log_future_error)
 
+    project_dir = CODE_ROOT / PROJECT
+    if not project_dir.is_dir():
+        await reply(ws, chat_id, f"⚠️ Can't investigate: {project_dir} not found.")
+        return
+
+    # The proposal phase runs in a throwaway worktree, so an
+    # investigation that edits files leaves the real checkout alone.
     try:
-        if STREAM_ENABLED:
-            try:
-                raw = await asyncio.to_thread(
-                    run_claude_streamed, prompt, PROJECT, on_stream_event)
-            except FileNotFoundError:
-                raise
-            except Exception:
-                log.exception("streamed run failed — falling back to non-streamed")
-                raw = await asyncio.to_thread(run_claude, prompt, PROJECT)
-        else:
-            raw = await asyncio.to_thread(run_claude, prompt, PROJECT)
+        with proposal_worktree(project_dir) as worktree:
+            raw, stats, changed = await _run_proposal(ws, chat_id, prompt,
+                                                      worktree, on_stream_event)
     except subprocess.TimeoutExpired:
         await reply(ws, chat_id, "⚠️ Claude timed out after 30 minutes.")
         return
@@ -961,16 +1152,51 @@ async def handle_feedback(ws, payload: dict) -> None:
         await reply(ws, chat_id, f"⚠️ Claude crashed: {type(e).__name__}: {e}")
         return
 
-    if not raw:
+    if not raw and not changed:
         await reply(ws, chat_id, "(Claude returned an empty response.)")
         return
 
-    body, proposal = parse_proposal(raw)
+    body, proposal = parse_proposal(raw or "")
+
+    # Claude edited the tree but never emitted a fenced proposal.
+    # The work is real and on disk; salvage it rather than dropping it.
+    if proposal is None and changed:
+        log.info("no fenced proposal but %d file(s) changed — building one", len(changed))
+        proposal = {"mode": "inline_ship",
+                    "summary": _one_line(body, 80) or "dispatch change",
+                    "files": changed}
+
     if proposal:
+        if stats:
+            proposal["stats"] = stats
         await reply(ws, chat_id, body or proposal.get("summary", ""),
                     kind="code_proposal", proposal=proposal)
     else:
         await reply(ws, chat_id, body)
+
+
+async def _run_proposal(ws, chat_id, prompt, worktree, on_stream_event):
+    """Run Claude inside the worktree and report back what it did:
+    (raw text, diffstat, changed files as proposal entries)."""
+    if STREAM_ENABLED:
+        try:
+            raw = await asyncio.to_thread(
+                run_claude_streamed, prompt, PROJECT, on_stream_event,
+                True, None, worktree)
+        except FileNotFoundError:
+            raise
+        except Exception:
+            log.exception("streamed run failed — falling back to non-streamed")
+            raw = await asyncio.to_thread(run_claude, prompt, PROJECT, worktree)
+    else:
+        raw = await asyncio.to_thread(run_claude, prompt, PROJECT, worktree)
+
+    stats   = await asyncio.to_thread(worktree_diffstat, worktree)
+    changed = await asyncio.to_thread(worktree_changed_files, worktree)
+    if stats:
+        log.info("proposal diffstat: %s file(s) +%s -%s",
+                 stats.get("files"), stats.get("insertions"), stats.get("deletions"))
+    return raw, stats, changed
 
 
 def split_room_body(text: str, limit: int = ROOM_BODY_MAX) -> list[str]:

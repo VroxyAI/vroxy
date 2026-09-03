@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.0
+
+- **The proposal phase runs in a throwaway git worktree.** Claude
+  investigates and edits freely in a detached checkout of HEAD, so
+  nothing reaches the real working tree before you approve —
+  "pending review" is now literally true. Previously an
+  investigation could (and did) leave edits on disk under a card
+  that claimed nothing had happened yet.
+- The worktree is created as a SIBLING of the project inside
+  `CODE_ROOT`, never in `/tmp`: that's what keeps the parent
+  workspace's `CLAUDE.md` loading and sibling repos resolving at
+  `../vroxy_dispatch`, so a dispatch run has the same context a
+  human working in that folder does.
+- Because the worktree starts clean, `git diff --numstat` gives an
+  exact diffstat, which now rides along with the proposal as
+  `stats` and is what the server's ship policy sizes on.
+- A run that edits files but emits no fenced proposal has one built
+  from the worktree diff rather than losing the work.
+- **Dispatch no longer decides how a change ships.** The server
+  resolves the workspace/project ship policy and sends the decision
+  in `approve.requested`; `handle_approve` obeys it. The system
+  prompt now tells the model how the workspace ships instead of
+  asking it to infer "PR or not" from the wording of the note.
+- **`_git_open_pr` rewritten** — it never returned to the base
+  branch, so the next inline ship silently committed onto the
+  previous PR's branch. It now branches from `origin/<base_ref>`
+  after a fetch, passes `--base`, adds a random suffix so the same
+  summary twice can't collide, honors `pr_draft`, links the PR body
+  back to the feedback, and returns to the base branch in a
+  `finally` — including when `gh pr create` fails.
+- `_git_inline_ship` commits to the configured base branch rather
+  than whatever happened to be checked out, and both paths refuse
+  to switch branches over uncommitted work rather than discarding
+  an operator's changes.
+- A PR is reported back to the chat as a structured
+  `kind: "pull_request"` reply so it renders as a link card.
+
 ## 0.2.1
 
 - **Logs to a file as well as the terminal.** `log/dispatch.log`,

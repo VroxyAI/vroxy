@@ -6,6 +6,7 @@ at a real vroxy_web instance.
 """
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -256,6 +257,159 @@ class ClearSessionsTest(unittest.TestCase):
 
     def test_clearing_nothing_is_not_an_error(self):
         self.assertEqual([], fa.clear_sessions())
+
+
+def _git(args, cwd):
+    subprocess.run(["git"] + args, cwd=cwd, check=True,
+                   capture_output=True, text=True)
+
+
+class GitRepoTestCase(unittest.TestCase):
+    """A real throwaway git repo — the worktree helpers are entirely
+    about git behavior, so stubbing git would test nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "vroxy_web"
+        self.repo.mkdir()
+        _git(["init", "-q", "-b", "main"], self.repo)
+        _git(["config", "user.email", "t@example.test"], self.repo)
+        _git(["config", "user.name", "Test"], self.repo)
+        (self.repo / "README.md").write_text("hello\n")
+        (self.repo / "CLAUDE.md").write_text("project rules\n")
+        _git(["add", "."], self.repo)
+        _git(["commit", "-qm", "init"], self.repo)
+
+
+class ProposalWorktreeTest(GitRepoTestCase):
+    def test_worktree_is_a_sibling_so_parent_claude_md_still_loads(self):
+        with fa.proposal_worktree(self.repo) as wt:
+            self.assertEqual(self.repo.parent, wt.parent,
+                             "worktree must sit beside the project, not in /tmp — "
+                             "the workspace CLAUDE.md and sibling repos hang off that parent")
+            self.assertTrue((wt / "CLAUDE.md").is_file())
+
+    def test_edits_in_the_worktree_never_touch_the_real_checkout(self):
+        with fa.proposal_worktree(self.repo) as wt:
+            (wt / "README.md").write_text("EDITED BY CLAUDE\n")
+            (wt / "new_file.rb").write_text("fresh\n")
+        self.assertEqual("hello\n", (self.repo / "README.md").read_text())
+        self.assertFalse((self.repo / "new_file.rb").exists())
+
+    def test_worktree_is_removed_afterwards(self):
+        with fa.proposal_worktree(self.repo) as wt:
+            path = wt
+            self.assertTrue(path.is_dir())
+        self.assertFalse(path.exists())
+
+    def test_worktree_is_removed_even_when_the_run_raises(self):
+        path = None
+        with self.assertRaises(RuntimeError):
+            with fa.proposal_worktree(self.repo) as wt:
+                path = wt
+                raise RuntimeError("claude blew up")
+        self.assertFalse(path.exists())
+
+    def test_two_runs_do_not_collide(self):
+        with fa.proposal_worktree(self.repo) as a:
+            with fa.proposal_worktree(self.repo) as b:
+                self.assertNotEqual(a, b)
+
+
+class WorktreeDiffstatTest(GitRepoTestCase):
+    def test_no_changes_is_all_zeroes(self):
+        with fa.proposal_worktree(self.repo) as wt:
+            self.assertEqual({"files": 0, "insertions": 0, "deletions": 0},
+                             fa.worktree_diffstat(wt))
+
+    def test_counts_modified_lines(self):
+        with fa.proposal_worktree(self.repo) as wt:
+            (wt / "README.md").write_text("one\ntwo\nthree\n")
+            stats = fa.worktree_diffstat(wt)
+        self.assertEqual(1, stats["files"])
+        self.assertEqual(3, stats["insertions"])
+        self.assertEqual(1, stats["deletions"])
+
+    def test_binary_files_do_not_crash_the_count(self):
+        with fa.proposal_worktree(self.repo) as wt:
+            (wt / "logo.png").write_bytes(b"\x89PNG\x00\x01\x02")
+            _git(["add", "logo.png"], wt)
+            stats = fa.worktree_diffstat(wt)
+        self.assertGreaterEqual(stats["files"], 1)
+
+
+class WorktreeChangedFilesTest(GitRepoTestCase):
+    def test_collects_modified_and_new_files(self):
+        with fa.proposal_worktree(self.repo) as wt:
+            (wt / "README.md").write_text("changed\n")
+            (wt / "added.rb").write_text("puts 1\n")
+            files = fa.worktree_changed_files(wt)
+        by_path = {f["path"]: f["content"] for f in files}
+        self.assertEqual("changed\n", by_path["README.md"])
+        self.assertEqual("puts 1\n", by_path["added.rb"])
+
+    def test_an_untouched_worktree_yields_nothing(self):
+        with fa.proposal_worktree(self.repo) as wt:
+            self.assertEqual([], fa.worktree_changed_files(wt))
+
+    def test_a_binary_file_is_skipped_rather_than_crashing(self):
+        with fa.proposal_worktree(self.repo) as wt:
+            (wt / "ok.rb").write_text("fine\n")
+            (wt / "blob.bin").write_bytes(b"\xff\xfe\x00\x01")
+            paths = [f["path"] for f in fa.worktree_changed_files(wt)]
+        self.assertIn("ok.rb", paths)
+        self.assertNotIn("blob.bin", paths)
+
+
+class GitBranchHelpersTest(GitRepoTestCase):
+    def test_current_branch(self):
+        self.assertEqual("main", fa._current_branch(self.repo))
+
+    def test_ensure_on_base_is_a_noop_when_already_there(self):
+        ok, _ = fa._ensure_on_base(self.repo, "main")
+        self.assertTrue(ok)
+
+    def test_ensure_on_base_switches_branches(self):
+        _git(["checkout", "-q", "-b", "feature"], self.repo)
+        ok, _ = fa._ensure_on_base(self.repo, "main")
+        self.assertTrue(ok)
+        self.assertEqual("main", fa._current_branch(self.repo))
+
+    def test_ensure_on_base_refuses_to_discard_uncommitted_work(self):
+        _git(["checkout", "-q", "-b", "feature"], self.repo)
+        (self.repo / "README.md").write_text("work in progress\n")
+        ok, err = fa._ensure_on_base(self.repo, "main")
+        self.assertFalse(ok)
+        self.assertIn("uncommitted", err)
+        self.assertEqual("feature", fa._current_branch(self.repo))
+        self.assertEqual("work in progress\n", (self.repo / "README.md").read_text())
+
+
+class BuildPromptPolicyTest(unittest.TestCase):
+    def test_policy_block_tells_the_model_how_the_workspace_ships(self):
+        prompt = fa.build_prompt({
+            "feedback": {"note": "tweak it"}, "chat": {"hashid": "c"},
+            "policy": {"policy": "auto", "base_ref": "master", "auto_apply": False},
+        })
+        self.assertIn("Ship policy", prompt)
+        self.assertIn("`master`", prompt)
+        self.assertIn("small changes commit", prompt)
+
+    def test_auto_apply_is_called_out_because_it_removes_the_human(self):
+        prompt = fa.build_prompt({
+            "feedback": {"note": "tweak it"}, "chat": {"hashid": "c"},
+            "policy": {"policy": "auto", "base_ref": "main", "auto_apply": True},
+        })
+        self.assertIn("Auto-apply is ON", prompt)
+
+    def test_no_policy_block_when_the_server_sent_none(self):
+        prompt = fa.build_prompt({"feedback": {"note": "x"}, "chat": {"hashid": "c"}})
+        self.assertNotIn("Ship policy", prompt)
+
+    def test_the_model_is_told_it_does_not_choose_the_mode(self):
+        self.assertIn("You do NOT decide how this ships", fa.SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":
