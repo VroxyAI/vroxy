@@ -74,16 +74,40 @@ Consequences worth knowing:
 - **Rooms are unaffected** — room mode edits your real checkout on
   purpose, because that's the point of asking it to change something.
 
+## Code agents
+
+Dispatch is one KIND of code agent, not the only one. A workspace
+configures agents at `/w/:workspace/:slug/dispatch`:
+
+- **`claude_code`** — local: a `vroxy_dispatch` process holding a
+  checkout, reached over `AdminFeedbackChannel`. That's this program.
+- **`copilot`** — remote: GitHub's agent API, which always ends in a
+  pull request.
+
+Every agent gets its own Room, so it's reachable from the web app,
+the mobile app, or a widget chat that routed there. Each agent
+answers to a `/slash-command` derived from its name (`Claude Code` →
+`/claude-code`), which overrides a room's configured agent for one
+message.
+
+An agent has many **targets** — environments it works on, each with
+its own base ref. For a local agent that's a checkout; for a remote
+one it's a repository, and **one agent can cover several**. A room
+picks which target it works on; with several and no pick, nothing is
+guessed and the room says so.
+
 ## Ship policy
 
-The operator decides how an approved proposal reaches the repo, per
-workspace and per project. Dispatch does not choose; it obeys the
+Applies to LOCAL agents (a remote one always opens a PR — that's all
+Copilot produces).  The operator decides how an approved proposal
+reaches the repo, per workspace and per target. Dispatch does not choose; it obeys the
 decision that arrives in the `approve.requested` payload.
 
 Configure at `/w/:workspace/:slug/settings` (workspace default) and
-`/w/:workspace/:slug/dispatch` (per project). Projects appear on that
+`/w/:workspace/:slug/dispatch` (per target). Targets appear on that
 page automatically — dispatch reports its `PROJECT` on every
-heartbeat and the server upserts a row.
+heartbeat, the server upserts a row, and the row is adopted by the
+workspace's local agent when there is exactly one.
 
 | Policy | What an approved proposal does |
 | ------ | ------------------------------ |
@@ -104,8 +128,8 @@ Other settings: `base_ref`, `branch_prefix`, `pr_draft`, and
 with **no human clicking Apply**. Off by default. It never applies to
 anything routed to a PR.
 
-Every project field may be left blank to inherit the workspace's.
-A project can also be disabled entirely, in which case dispatch
+Every target field may be left blank to inherit the workspace's.
+A target can also be disabled entirely, in which case dispatch
 refuses to apply anything for it.
 
 A PR comes back into the chat as a link card (`kind:
@@ -314,13 +338,18 @@ place to click Apply unless you mean it.
 
 ## Run (systemd, recommended)
 
-> **Rename migration note:** the dispatch host currently runs the
-> pre-rename units (`ctovibe-dispatch*.service` reading
-> `/etc/default/ctovibe-dispatch`, checkout under
-> `/home/ubuntu/code/ctovibe`). The live units get migrated to the
-> `vroxy-dispatch*` names below at deploy time (rename plan B6.3):
-> install the new unit + env file with values copied over, disable
-> the `ctovibe-dispatch*` units, verify heartbeats.
+The unit installed on the dispatch host is
+`vroxy-dispatch-feedback-agent.service`, reading
+`/etc/default/vroxy-dispatch`.
+
+> **If it hangs at "Connecting" and never says "Subscribed", the
+> token is wrong.** A rejected connect closes the socket without a
+> frame, which looks exactly like a stall from the client side. Check
+> the server: `[vroxy.cable] connect REJECT reason=unauthenticated`
+> means the token isn't a live `Tenant`-owned `ApiToken` with
+> `platform:dispatch` or `full`. Mint a new one (below) rather than
+> guessing — a token carried over from before the rename authenticates
+> against nothing.
 
 `/etc/default/vroxy-dispatch`:
 
@@ -335,11 +364,11 @@ LOG_LEVEL=INFO
 PYTHONUNBUFFERED=1
 ```
 
-`/etc/systemd/system/vroxy-dispatch.service`:
+`/etc/systemd/system/vroxy-dispatch-feedback-agent.service`:
 
 ```ini
 [Unit]
-Description=vroxy dispatch — AdminFeedbackChannel cable subscriber
+Description=vroxy dispatch — AdminFeedbackChannel cable subscriber (feedback_agent.py)
 After=network-online.target
 Wants=network-online.target
 
@@ -359,9 +388,15 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now vroxy-dispatch
-sudo journalctl -u vroxy-dispatch -f
+sudo systemctl enable --now vroxy-dispatch-feedback-agent
+sudo journalctl -u vroxy-dispatch-feedback-agent -f
+# or the agent's own rotating file:
+tail -f /home/ubuntu/code/vroxy/vroxy_dispatch/log/dispatch.log
 ```
+
+There is no `server.py` in this repo — if you find a
+`vroxy-dispatch-server.service` on a host, it is a leftover pointing
+at code that no longer exists and should be removed.
 
 ## One tenant per process
 
