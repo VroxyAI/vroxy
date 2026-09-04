@@ -84,7 +84,7 @@ CLAUDE_CHAT_BIN = os.environ.get(
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.3.1"
+AGENT_VERSION      = "vroxy_dispatch 0.4.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -916,14 +916,22 @@ async def handle_approve(ws, payload: dict) -> None:
                 f"rebuild it against current code.")
             return
 
+    # Resolve EVERY path before writing ANY of them, so a proposal
+    # with one bad entry is refused whole rather than half-applied.
     try:
-        # Write every file to disk (paths are RELATIVE to the project).
+        writes = []
         for f in files:
-            path = f.get("path")
-            content = f.get("content")
+            path, content = f.get("path"), f.get("content")
             if not path or content is None:
                 continue
-            target = project_dir / path
+            writes.append((safe_target(project_dir, path), content))
+    except ValueError as e:
+        log.error("refusing proposal: %s", e)
+        await reply(ws, chat_id, f"⚠️ Refused — {e}. Nothing was written.")
+        return
+
+    try:
+        for target, content in writes:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
 
@@ -942,6 +950,34 @@ async def handle_approve(ws, payload: dict) -> None:
     except Exception as e:
         log.exception("apply failed")
         await reply(ws, chat_id, f"⚠️ Apply failed: {type(e).__name__}: {e}")
+
+
+def safe_target(project_dir: Path, path: str) -> Path:
+    """Resolve a proposal path INSIDE the project, or refuse.
+
+    `project_dir / path` is not a containment check.  An absolute path
+    REPLACES the base entirely (`Path("/a/b") / "/etc/x"` is
+    `/etc/x`), and `../` walks out of it — so a proposal naming
+    `~/.ssh/authorized_keys` or `~/.claude/settings.json` would be
+    written there, as this user, by the apply step.  The model is told
+    to send relative paths; that is an instruction, not a boundary.
+
+    `.git/` is refused separately even though it IS inside the
+    project: a proposal that writes `.git/hooks/pre-commit` executes
+    on the very commit the caller is about to make."""
+    if not path or "\x00" in path:
+        raise ValueError("empty path")
+    candidate = Path(path)
+    if candidate.is_absolute():
+        raise ValueError(f"{path!r} is absolute — proposal paths are relative to the project")
+
+    root   = project_dir.resolve()
+    target = (root / candidate).resolve()
+    if target == root or root not in target.parents:
+        raise ValueError(f"{path!r} resolves outside the project ({target})")
+    if target.relative_to(root).parts[0] == ".git":
+        raise ValueError(f"{path!r} writes into .git/ — a hook there would run on the next commit")
+    return target
 
 
 def _run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
@@ -963,7 +999,7 @@ def _git_inline_ship(project_dir: Path, summary: str, files: list[dict],
     if not on_base:
         return f"\u26a0\ufe0f Couldn't switch to `{base}`: {err[:200]}"
 
-    _run(["git", "add"] + paths, project_dir)
+    _run(["git", "add", "--"] + paths, project_dir)
 
     # version_bump.sh rewrites the version constants and the
     # changelog; stage exactly those two, and only if it succeeded.
@@ -971,7 +1007,7 @@ def _git_inline_ship(project_dir: Path, summary: str, files: list[dict],
     if vb.is_file():
         rc, _, err = _run(["bash", "./version_bump.sh"], project_dir)
         if rc == 0:
-            _run(["git", "add", "config/application.rb", "CHANGELOG.md"], project_dir)
+            _run(["git", "add", "--", "config/application.rb", "CHANGELOG.md"], project_dir)
         else:
             log.warning("version_bump.sh failed: %s", err[:200])
 
@@ -1022,7 +1058,7 @@ def _git_open_pr(project_dir: Path, summary: str, files: list[dict],
         if rc != 0:
             return f"\u26a0\ufe0f Branch failed: {err[:300]}", None
 
-        _run(["git", "add"] + paths, project_dir)
+        _run(["git", "add", "--"] + paths, project_dir)
         rc, _, err = _run(["git", "commit", "-m", f"UI feedback: {summary}"], project_dir)
         if rc != 0:
             return f"\u26a0\ufe0f Commit failed: {err[:300]}", None

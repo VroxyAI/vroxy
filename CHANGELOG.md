@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0
+
+- **Security: a proposal could write outside the project.** The apply
+  step did `project_dir / path` with a path the model wrote, and that
+  is not a containment check — an absolute path REPLACES the base
+  (`Path("/a/b") / "/etc/x"` is `/etc/x`) and `../` walks out of it.
+  A proposal naming `~/.ssh/authorized_keys` or
+  `~/.claude/settings.json` would have been written there, as this
+  user, by the Apply button. Paths are now resolved and confined to
+  the project.
+- **`.git/` is refused too**, even though it is inside the project: a
+  proposal writing `.git/hooks/pre-commit` executes on the very commit
+  the apply step is about to make.
+- Every path is resolved BEFORE any file is written, so a proposal
+  with one bad entry is refused whole rather than half-applied.
+- `git add --` so a path can never be parsed as a git flag.
+
 ## 0.3.1
 
 - **Refuse a stale proposal instead of reverting work with it.** A

@@ -363,6 +363,56 @@ class WorktreeChangedFilesTest(GitRepoTestCase):
         self.assertNotIn("blob.bin", paths)
 
 
+class SafeTargetTest(GitRepoTestCase):
+    """A proposal's `path` is LLM-authored and reaches the apply step
+    from a note a widget visitor wrote.  `project_dir / path` is not a
+    containment check, so these are the escapes it has to refuse."""
+
+    def test_an_ordinary_relative_path_resolves_inside(self):
+        t = fa.safe_target(self.repo, "app/views/foo.erb")
+        self.assertEqual(self.repo.resolve() / "app/views/foo.erb", t)
+
+    def test_an_absolute_path_is_refused(self):
+        # Path("/a/b") / "/etc/x" is "/etc/x" — the base is discarded.
+        for probe in ("/etc/cron.d/pwn", "/home/ubuntu/.ssh/authorized_keys",
+                      "/home/ubuntu/.claude/settings.json"):
+            with self.assertRaises(ValueError, msg=probe) as cm:
+                fa.safe_target(self.repo, probe)
+            self.assertIn("absolute", str(cm.exception))
+
+    def test_traversal_out_of_the_project_is_refused(self):
+        for probe in ("../escaped.txt", "../../.claude/settings.json",
+                      "app/../../outside.rb", "a/b/../../../../etc/passwd"):
+            with self.assertRaises(ValueError, msg=probe):
+                fa.safe_target(self.repo, probe)
+
+    def test_writing_into_dot_git_is_refused(self):
+        # Inside the project, but .git/hooks/pre-commit runs on the
+        # very commit the apply step is about to make.
+        for probe in (".git/hooks/pre-commit", ".git/config",
+                      ".git/hooks/post-checkout"):
+            with self.assertRaises(ValueError, msg=probe) as cm:
+                fa.safe_target(self.repo, probe)
+            self.assertIn(".git", str(cm.exception))
+
+    def test_the_project_root_itself_is_refused(self):
+        for probe in (".", "", "./"):
+            with self.assertRaises(ValueError):
+                fa.safe_target(self.repo, probe)
+
+    def test_a_path_that_merely_looks_scary_but_stays_inside_is_allowed(self):
+        # Containment is decided by where it RESOLVES, not by spelling.
+        t = fa.safe_target(self.repo, "app/../lib/ok.rb")
+        self.assertEqual(self.repo.resolve() / "lib/ok.rb", t)
+
+    def test_a_sibling_prefix_is_not_treated_as_inside(self):
+        # /repo-evil must not pass because it starts with /repo.
+        sibling = self.repo.parent / (self.repo.name + "-evil")
+        sibling.mkdir()
+        with self.assertRaises(ValueError):
+            fa.safe_target(self.repo, f"../{sibling.name}/x.rb")
+
+
 class HeadShaTest(GitRepoTestCase):
     def test_reports_the_current_commit(self):
         sha = fa.head_sha(self.repo)
