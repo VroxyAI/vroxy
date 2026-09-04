@@ -84,7 +84,7 @@ CLAUDE_CHAT_BIN = os.environ.get(
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.4.0"
+AGENT_VERSION      = "vroxy_dispatch 0.5.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -138,18 +138,87 @@ def _setup_logging() -> logging.Logger:
 log = _setup_logging()
 
 
+# ── The cable link ────────────────────────────────────────────────
+class CableLink:
+    """The socket, decoupled from its lifetime.
+
+    A run takes minutes; a deploy drops the cable in the middle of one.
+    Handlers used to hold the websocket they started with, so a
+    reconnect left them writing into a dead socket — the Claude run
+    finished, spent its tokens, and the answer went nowhere.
+
+    Handlers hold THIS instead.  It swaps the underlying socket on
+    reconnect, and buffers anything sent while there isn't one so the
+    result still lands once the server comes back."""
+
+    # A deploy is seconds, not hours.  Bounded so a genuinely dead
+    # server can't grow this without limit; oldest go first because a
+    # stale progress chip matters less than a fresh reply.
+    MAX_OUTBOX = 200
+
+    def __init__(self):
+        self.ws = None
+        self.outbox: list[str] = []
+
+    def attach(self, ws) -> None:
+        self.ws = ws
+
+    def detach(self) -> None:
+        self.ws = None
+
+    async def send(self, frame: str, buffer: bool = True) -> None:
+        """`buffer=False` for frames that are only true right now — a
+        heartbeat replayed after a reconnect reports a stale status as
+        current, which is worse than the gap it was covering."""
+        if self.ws is None:
+            if buffer:
+                self._buffer(frame)
+            return
+        try:
+            await self.ws.send(frame)
+        except Exception as e:
+            log.warning("send failed (%s) — %s", e,
+                        "buffering for the next connection" if buffer else "dropping")
+            self.ws = None
+            if buffer:
+                self._buffer(frame)
+
+    def _buffer(self, frame: str) -> None:
+        if len(self.outbox) >= self.MAX_OUTBOX:
+            dropped = self.outbox.pop(0)
+            log.warning("outbox full — dropped the oldest frame (%.80s)", dropped)
+        self.outbox.append(frame)
+
+    async def flush(self) -> None:
+        """Send everything that piled up while the cable was down.
+        Anything that fails is re-buffered by `send`."""
+        if not self.outbox:
+            return
+        pending, self.outbox = self.outbox, []
+        log.info("flushing %d buffered frame(s)", len(pending))
+        for frame in pending:
+            await self.send(frame)
+
+
 # ── ActionCable helpers ───────────────────────────────────────────
-async def cable_send(ws, command: str, data: dict | None = None) -> None:
+async def cable_send(ws, command: str, data: dict | None = None,
+                     buffer: bool = True) -> None:
     """One ActionCable frame.  `command` is 'subscribe' or
     'message'; `data` is the per-command payload."""
     frame: dict[str, Any] = {"command": command, "identifier": CHANNEL_IDENTIFIER}
     if data is not None:
         frame["data"] = json.dumps(data)
-    await ws.send(json.dumps(frame))
+    payload = json.dumps(frame)
+    if isinstance(ws, CableLink):
+        await ws.send(payload, buffer=buffer)
+    else:
+        await ws.send(payload)
 
 
 async def subscribe(ws) -> None:
-    await cable_send(ws, "subscribe")
+    # Belongs to the socket that asked for it; replaying an old
+    # subscribe onto a new connection is meaningless.
+    await cable_send(ws, "subscribe", buffer=False)
 
 
 async def heartbeat(ws) -> None:
@@ -160,7 +229,7 @@ async def heartbeat(ws) -> None:
         "action":  "heartbeat",
         "version": AGENT_VERSION,
         "meta":    {"status": _current_status, "project": PROJECT},
-    })
+    }, buffer=False)
 
 
 async def heartbeat_forever(ws) -> None:
@@ -1341,38 +1410,54 @@ async def handle_room_message(ws, payload: dict) -> None:
         await room_reply(ws, room_id, chunk)
 
 
-async def process_stream(ws) -> None:
+# The work queue and its worker live for the PROCESS, not for one
+# connection.  They used to be created inside process_stream and
+# cancelled in its `finally`, so every reconnect destroyed the run in
+# flight — the Claude thread kept going, finished, and had nothing
+# left to reply through.
+_work_queue: asyncio.Queue | None = None
+
+
+async def worker_loop(link: CableLink) -> None:
     """One in-flight handler at a time — Claude sessions aren't
     reentrant and we don't want to race a `--resume` with itself."""
-    queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
+    global _current_status
+    assert _work_queue is not None
+    while True:
+        kind, payload = await _work_queue.get()
+        fb_id = ((payload.get("feedback") or {}).get("hashid")
+                 or payload.get("feedback_id") or "?")
+        if kind == "room":
+            room = payload.get("room") or {}
+            _current_status = f"answering #{room.get('name') or room.get('hashid')}"
+        else:
+            _current_status = f"processing feedback {fb_id}" if kind == "feedback" \
+                              else f"applying feedback {fb_id}"
+        try:
+            if kind == "feedback":
+                await handle_feedback(link, payload)
+            elif kind == "approve":
+                await handle_approve(link, payload)
+            elif kind == "room":
+                await handle_room_message(link, payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("worker failed on payload=%s", payload)
+        finally:
+            _current_status = "idle"
+            _work_queue.task_done()
 
-    async def worker():
-        global _current_status
-        while True:
-            kind, payload = await queue.get()
-            fb_id = ((payload.get("feedback") or {}).get("hashid")
-                     or payload.get("feedback_id") or "?")
-            if kind == "room":
-                room = payload.get("room") or {}
-                _current_status = f"answering #{room.get('name') or room.get('hashid')}"
-            else:
-                _current_status = f"processing feedback {fb_id}" if kind == "feedback" \
-                                  else f"applying feedback {fb_id}"
-            try:
-                if kind == "feedback":
-                    await handle_feedback(ws, payload)
-                elif kind == "approve":
-                    await handle_approve(ws, payload)
-                elif kind == "room":
-                    await handle_room_message(ws, payload)
-            except Exception:
-                log.exception("worker failed on payload=%s", payload)
-            finally:
-                _current_status = "idle"
-                queue.task_done()
 
-    worker_task    = asyncio.create_task(worker())
-    heartbeat_task = asyncio.create_task(heartbeat_forever(ws))
+async def process_stream(link: CableLink, ws) -> None:
+    """Read one connection's frames onto the shared work queue.
+
+    Returns when the socket closes.  It deliberately owns NOTHING that
+    outlives the connection — the worker and the queue are the
+    process's, so a reconnect is invisible to a run in progress."""
+    assert _work_queue is not None
+    link.attach(ws)
+    heartbeat_task = asyncio.create_task(heartbeat_forever(link))
 
     try:
         async for raw in ws:
@@ -1381,10 +1466,13 @@ async def process_stream(ws) -> None:
 
             if frame_type == "welcome":
                 log.info("Cable connected — subscribing")
-                await subscribe(ws)
+                await subscribe(link)
                 continue
             if frame_type == "confirm_subscription":
                 log.info("Subscribed to AdminFeedbackChannel")
+                # Anything that finished while the cable was down goes
+                # out now that the channel will accept it.
+                await link.flush()
                 continue
             if frame_type in ("ping", "disconnect", "reject_subscription"):
                 if frame_type == "reject_subscription":
@@ -1398,21 +1486,18 @@ async def process_stream(ws) -> None:
             # Vroxy channel keys on `type` in the message payload,
             # matching vroxy's convention.
             if msg.get("type") == "feedback.created":
-                await queue.put(("feedback", msg))
+                await _work_queue.put(("feedback", msg))
             elif msg.get("type") == "feedback.followup":
-                # Followup carries just chat/message/feedback ids —
-                # re-enter handle_feedback with the fresh chat state
-                # so Claude picks up the new turn.
-                await queue.put(("feedback", msg))
+                await _work_queue.put(("feedback", msg))
             elif msg.get("type") == "approve.requested":
-                await queue.put(("approve", msg))
+                await _work_queue.put(("approve", msg))
             elif msg.get("type") == "room.message":
-                await queue.put(("room", msg))
+                await _work_queue.put(("room", msg))
             else:
                 log.debug("Ignoring message type=%s", msg.get("type"))
     finally:
-        worker_task.cancel()
         heartbeat_task.cancel()
+        link.detach()
 
 
 async def main() -> None:
@@ -1432,12 +1517,19 @@ async def main() -> None:
     origin = f"{origin_scheme}://{parsed.hostname}" + (f":{parsed.port}" if parsed.port else "")
     log.info("Connecting to %s (origin=%s)", CABLE_URL, origin)
 
+    global _work_queue
+    _work_queue = asyncio.Queue()
+    link = CableLink()
+    # Started once, outside the reconnect loop, so a run in progress
+    # survives the cable dropping under it.
+    worker_task = asyncio.create_task(worker_loop(link))
+
     backoff = 1
     while True:
         try:
             async with websockets.connect(uri, ping_interval=30, origin=origin) as ws:
                 backoff = 1
-                await process_stream(ws)
+                await process_stream(link, ws)
         except (websockets.ConnectionClosed, OSError) as e:
             log.warning("Cable connection lost (%s) — reconnecting in %ss", e, backoff)
             await asyncio.sleep(backoff)
@@ -1445,6 +1537,12 @@ async def main() -> None:
         except Exception:
             log.exception("Unexpected error in cable loop")
             await asyncio.sleep(5)
+        finally:
+            if worker_task.done():
+                # The worker dying silently would leave dispatch
+                # connected and permanently deaf.
+                log.error("worker stopped unexpectedly — restarting it")
+                worker_task = asyncio.create_task(worker_loop(link))
 
 
 def cli() -> None:

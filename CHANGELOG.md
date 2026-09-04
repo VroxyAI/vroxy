@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0
+
+- **A deploy no longer throws away the run it interrupted.** The work
+  queue and its worker were created inside `process_stream` and
+  cancelled in its `finally`, so any reconnect destroyed the run in
+  flight — the Claude thread kept going, finished, spent its tokens,
+  and had nothing left to reply through. Seen for real: a 56-tool-call
+  run completed with 3,275 characters of answer at 13:24:06 and no
+  reply was ever sent. The queue and worker now live for the process.
+- **Handlers hold a `CableLink`, not a socket.** It swaps the
+  underlying connection on reconnect and buffers anything sent while
+  there isn't one, so a result produced during a deploy is delivered
+  when the server comes back rather than written into a dead socket.
+  The outbox is bounded and drops oldest-first — a fresh reply
+  outranks a stale progress chip.
+- Heartbeats and subscribes are explicitly *not* buffered: replaying a
+  heartbeat after a reconnect reports a stale status as current, and a
+  subscribe belongs to the socket that asked for it.
+- The worker is restarted if it ever stops, since a dead worker left
+  dispatch connected and permanently deaf.
+
 ## 0.4.0
 
 - **Security: a proposal could write outside the project.** The apply

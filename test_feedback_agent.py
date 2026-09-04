@@ -6,6 +6,7 @@ at a real vroxy_web instance.
 """
 
 import json
+import asyncio
 import subprocess
 import tempfile
 import unittest
@@ -483,6 +484,163 @@ class BuildPromptPolicyTest(unittest.TestCase):
 
     def test_the_model_is_told_it_does_not_choose_the_mode(self):
         self.assertIn("You do NOT decide how this ships", fa.SYSTEM_PROMPT)
+
+
+class FakeSocket:
+    """Records frames; can be made to fail like a dropped cable."""
+
+    def __init__(self, broken=False):
+        self.sent = []
+        self.broken = broken
+
+    async def send(self, frame):
+        if self.broken:
+            raise ConnectionError("socket is gone")
+        self.sent.append(frame)
+
+
+class CableLinkTest(unittest.IsolatedAsyncioTestCase):
+    """A deploy drops the cable mid-run.  The answer has already cost
+    minutes and tokens by then, so it has to survive the gap."""
+
+    async def test_sends_straight_through_when_connected(self):
+        link, ws = fa.CableLink(), FakeSocket()
+        link.attach(ws)
+        await link.send("hello")
+        self.assertEqual(["hello"], ws.sent)
+        self.assertEqual([], link.outbox)
+
+    async def test_buffers_while_disconnected_then_flushes(self):
+        link = fa.CableLink()
+        await link.send("one")
+        await link.send("two")
+        self.assertEqual(["one", "two"], link.outbox)
+
+        ws = FakeSocket()
+        link.attach(ws)
+        await link.flush()
+        self.assertEqual(["one", "two"], ws.sent, "order must be preserved")
+        self.assertEqual([], link.outbox)
+
+    async def test_a_send_onto_a_dead_socket_is_buffered_not_lost(self):
+        # The exact shape of the bug: the run finished, the socket had
+        # already died, and the reply went nowhere.
+        link = fa.CableLink()
+        link.attach(FakeSocket(broken=True))
+        await link.send("the answer")
+        self.assertEqual(["the answer"], link.outbox)
+        self.assertIsNone(link.ws, "a failed send must drop the dead socket")
+
+        good = FakeSocket()
+        link.attach(good)
+        await link.flush()
+        self.assertEqual(["the answer"], good.sent)
+
+    async def test_unbufferable_frames_are_dropped_not_replayed(self):
+        # A heartbeat replayed after reconnect reports a stale status.
+        link = fa.CableLink()
+        await link.send("heartbeat", buffer=False)
+        self.assertEqual([], link.outbox)
+
+    async def test_the_outbox_is_bounded(self):
+        link = fa.CableLink()
+        for i in range(fa.CableLink.MAX_OUTBOX + 25):
+            await link.send(f"frame-{i}")
+        self.assertEqual(fa.CableLink.MAX_OUTBOX, len(link.outbox))
+        # Oldest dropped first — a fresh reply outranks a stale chip.
+        self.assertEqual(f"frame-{fa.CableLink.MAX_OUTBOX + 24}", link.outbox[-1])
+        self.assertNotIn("frame-0", link.outbox)
+
+    async def test_flush_re_buffers_when_the_new_socket_also_fails(self):
+        link = fa.CableLink()
+        await link.send("keep me")
+        link.attach(FakeSocket(broken=True))
+        await link.flush()
+        self.assertEqual(["keep me"], link.outbox, "must not be dropped on a failed flush")
+
+    async def test_detach_keeps_the_outbox(self):
+        link = fa.CableLink()
+        link.attach(FakeSocket())
+        link.detach()
+        await link.send("after detach")
+        self.assertEqual(["after detach"], link.outbox)
+
+
+class WorkerSurvivesReconnectTest(unittest.IsolatedAsyncioTestCase):
+    """The worker used to be created inside process_stream and
+    cancelled in its `finally`, so a reconnect destroyed the run in
+    flight.  The Claude thread kept going, finished, and had nothing
+    left to reply through."""
+
+    async def asyncSetUp(self):
+        self._saved_queue = fa._work_queue
+        fa._work_queue = asyncio.Queue()
+
+    async def asyncTearDown(self):
+        fa._work_queue = self._saved_queue
+
+    async def test_a_queued_item_still_runs_after_the_socket_drops(self):
+        link = fa.CableLink()
+        started = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def slow_handler(_link, _payload):
+            started.set()
+            await asyncio.sleep(0.2)          # the Claude run
+            await _link.send("the answer")    # replies afterwards
+            finished.set()
+
+        original = fa.handle_room_message
+        fa.handle_room_message = slow_handler
+        worker = asyncio.create_task(fa.worker_loop(link))
+        try:
+            link.attach(FakeSocket())
+            await fa._work_queue.put(("room", {"room": {"hashid": "r1"}}))
+            await asyncio.wait_for(started.wait(), 2)
+
+            # The deploy lands mid-run.
+            link.detach()
+
+            await asyncio.wait_for(finished.wait(), 2)
+            self.assertFalse(worker.done(), "the worker must outlive the connection")
+            self.assertEqual(["the answer"], link.outbox,
+                             "the result must be held for the next connection")
+        finally:
+            worker.cancel()
+            fa.handle_room_message = original
+
+    async def test_a_handler_raising_does_not_kill_the_worker(self):
+        link = fa.CableLink()
+        boom = asyncio.Event()
+
+        async def bad_handler(_link, _payload):
+            boom.set()
+            raise RuntimeError("handler blew up")
+
+        original = fa.handle_room_message
+        fa.handle_room_message = bad_handler
+        worker = asyncio.create_task(fa.worker_loop(link))
+        try:
+            await fa._work_queue.put(("room", {"room": {}}))
+            await asyncio.wait_for(boom.wait(), 2)
+            await asyncio.sleep(0.05)
+            self.assertFalse(worker.done(), "one bad payload must not deafen dispatch")
+        finally:
+            worker.cancel()
+            fa.handle_room_message = original
+
+
+class CableSendTest(unittest.IsolatedAsyncioTestCase):
+    async def test_cable_send_routes_through_the_link(self):
+        link = fa.CableLink()
+        await fa.cable_send(link, "message", {"action": "reply", "body": "hi"})
+        self.assertEqual(1, len(link.outbox))
+        self.assertIn("reply", link.outbox[0])
+
+    async def test_heartbeat_is_not_buffered(self):
+        link = fa.CableLink()
+        await fa.heartbeat(link)
+        self.assertEqual([], link.outbox, "a stale heartbeat must not be replayed")
 
 
 if __name__ == "__main__":
