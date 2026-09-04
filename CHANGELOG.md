@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+- **Refuse a stale proposal instead of reverting work with it.** A
+  proposal carries the COMPLETE contents of each file as of the commit
+  it was generated against, so applying one after the branch has moved
+  silently undoes everything that landed in between. Proposals now
+  record `base_sha`, and `handle_approve` compares it to HEAD before
+  writing anything — a mismatch explains the drift and asks for the
+  request to be filed again rather than quietly rewinding the repo.
+
 ## 0.3.0
 
 - **The proposal phase runs in a throwaway git worktree.** Claude

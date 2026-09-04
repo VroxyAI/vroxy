@@ -363,6 +363,29 @@ class WorktreeChangedFilesTest(GitRepoTestCase):
         self.assertNotIn("blob.bin", paths)
 
 
+class HeadShaTest(GitRepoTestCase):
+    def test_reports_the_current_commit(self):
+        sha = fa.head_sha(self.repo)
+        self.assertEqual(40, len(sha))
+        self.assertRegex(sha, r"\A[0-9a-f]{40}\Z")
+
+    def test_changes_when_a_commit_lands(self):
+        before = fa.head_sha(self.repo)
+        (self.repo / "NEW.md").write_text("x\n")
+        _git(["add", "."], self.repo)
+        _git(["commit", "-qm", "second"], self.repo)
+        self.assertNotEqual(before, fa.head_sha(self.repo))
+
+    def test_a_non_repo_yields_empty_rather_than_raising(self):
+        self.assertEqual("", fa.head_sha(self.root))
+
+    def test_a_proposal_worktree_shares_the_base_commit(self):
+        # The proposal is generated in the worktree, so the sha it
+        # stamps must match the project it will be applied to.
+        with fa.proposal_worktree(self.repo) as wt:
+            self.assertEqual(fa.head_sha(self.repo), fa.head_sha(wt))
+
+
 class GitBranchHelpersTest(GitRepoTestCase):
     def test_current_branch(self):
         self.assertEqual("main", fa._current_branch(self.repo))

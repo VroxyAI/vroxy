@@ -84,7 +84,7 @@ CLAUDE_CHAT_BIN = os.environ.get(
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.3.0"
+AGENT_VERSION      = "vroxy_dispatch 0.3.1"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -564,6 +564,15 @@ def proposal_worktree(project_dir: Path):
             _run(["git", "worktree", "prune"], project_dir)
 
 
+def head_sha(project_dir: Path) -> str:
+    """The commit a proposal was generated against.  Sent with the
+    proposal so the server can refuse to apply one whose base has
+    moved on — file contents are a snapshot, and applying a snapshot
+    of an old tree silently reverts whatever landed since."""
+    rc, out, _ = _run(["git", "rev-parse", "HEAD"], project_dir)
+    return (out or "").strip() if rc == 0 else ""
+
+
 def worktree_diffstat(worktree: Path) -> dict:
     """`git diff --numstat HEAD` in the worktree — an exact count of
     what the proposal actually changes, which is what the server's
@@ -890,6 +899,23 @@ async def handle_approve(ws, payload: dict) -> None:
         await reply(ws, chat_id, f"⚠️ Can't apply: {project_dir} not found.")
         return
 
+    # A proposal's `files` are the COMPLETE contents of each file as of
+    # the commit it was generated against.  Writing them onto a branch
+    # that has moved since silently reverts everything that landed in
+    # between — so refuse, and say what to do about it.
+    base = proposal.get("base_sha")
+    if base:
+        current = await asyncio.to_thread(head_sha, project_dir)
+        if current and current != base:
+            log.warning("stale proposal: generated on %s, HEAD is now %s", base[:12], current[:12])
+            await reply(
+                ws, chat_id,
+                f"⚠️ This proposal was written against `{base[:12]}` but the branch is now "
+                f"`{current[:12]}`. Its files are a snapshot of the older tree, so applying "
+                f"it would undo whatever landed since. File the request again and I'll "
+                f"rebuild it against current code.")
+            return
+
     try:
         # Write every file to disk (paths are RELATIVE to the project).
         for f in files:
@@ -1169,6 +1195,9 @@ async def handle_feedback(ws, payload: dict) -> None:
     if proposal:
         if stats:
             proposal["stats"] = stats
+        base = await asyncio.to_thread(head_sha, project_dir)
+        if base:
+            proposal["base_sha"] = base
         await reply(ws, chat_id, body or proposal.get("summary", ""),
                     kind="code_proposal", proposal=proposal)
     else:
