@@ -57,6 +57,7 @@ import re
 import subprocess
 import sys
 import urllib.parse
+import urllib.request
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -84,7 +85,7 @@ CLAUDE_CHAT_BIN = os.environ.get(
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.5.0"
+AGENT_VERSION      = "vroxy_dispatch 0.6.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -381,7 +382,87 @@ no "Dispatch:" prefix, no fenced proposal block.
 """.strip()
 
 
-def build_room_prompt(payload: dict) -> str:
+# ── Attachments ───────────────────────────────────────────────────
+# A screenshot is usually the whole point of the message ("why does
+# this look wrong?"), and Claude can only look at a file that exists
+# on disk.  The envelope carries a fetch URL per attachment; we pull
+# each one down beside the session cache — never into the checkout,
+# which would show up as untracked junk in the very diff we're about
+# to propose — and hand the model absolute paths.
+ATTACHMENT_DIR       = SID_DIR.parent / "vroxy-attachments"
+ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+ATTACHMENT_MAX_COUNT = 5
+ATTACHMENT_TIMEOUT   = 20
+
+
+def _app_base_url() -> str:
+    """`https://host[:port]` for the app behind CABLE_URL.  A
+    bucket-less dev server serves uploads as a relative path, so the
+    envelope's URL needs a host bolted on; the cable's is the one host
+    we know is right."""
+    parsed = urllib.parse.urlparse(CABLE_URL)
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    port   = f":{parsed.port}" if parsed.port else ""
+    return f"{scheme}://{parsed.hostname}{port}"
+
+
+def _safe_attachment_name(name: str, fallback: str) -> str:
+    """Filenames come from whoever uploaded them.  Keep the basename,
+    keep it boring, and never let it climb out of the directory."""
+    base = Path(str(name or "")).name
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base).lstrip(".")
+    return base[:120] or fallback
+
+
+def download_attachments(msg: dict) -> list[dict]:
+    """Fetch the message's attachments to disk.  Returns the ones that
+    landed, each with a `path`.  Best-effort per file: a screenshot we
+    couldn't fetch must not cost the room its answer."""
+    items = msg.get("attachments") or []
+    if not items:
+        return []
+
+    hashid = str(msg.get("hashid") or "msg")
+    target_dir = ATTACHMENT_DIR / _safe_attachment_name(hashid, "msg")
+    got: list[dict] = []
+
+    for i, item in enumerate(items[:ATTACHMENT_MAX_COUNT]):
+        url = (item.get("url") or "").strip()
+        if not url:
+            continue
+        if url.startswith("/"):
+            url = _app_base_url() + url
+        if not url.startswith(("http://", "https://")):
+            log.warning("skipping attachment with odd URL scheme: %.60s", url)
+            continue
+
+        size = item.get("byte_size") or 0
+        if size and size > ATTACHMENT_MAX_BYTES:
+            log.warning("skipping attachment %s — %s bytes over the cap",
+                        item.get("filename"), size)
+            continue
+
+        name = _safe_attachment_name(item.get("filename"), f"attachment-{i + 1}")
+        dest = target_dir / name
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            with urllib.request.urlopen(url, timeout=ATTACHMENT_TIMEOUT) as resp:
+                data = resp.read(ATTACHMENT_MAX_BYTES + 1)
+            if len(data) > ATTACHMENT_MAX_BYTES:
+                log.warning("skipping attachment %s — body over the cap", name)
+                continue
+            dest.write_bytes(data)
+        except Exception as e:
+            log.warning("attachment download failed (%s): %s: %s", name, type(e).__name__, e)
+            continue
+
+        got.append({**item, "path": str(dest), "bytes": len(data)})
+        log.info("Attachment saved %s (%d bytes)", dest, len(data))
+
+    return got
+
+
+def build_room_prompt(payload: dict, attachments: list[dict] | None = None) -> str:
     """Compose the prompt for an `AdminFeedbackChannel` `room.message`
     event.  The envelope carries the room, the triggering message, and
     up to ROOM_HISTORY_LIMIT prior turns (oldest first) so a Claude
@@ -415,6 +496,17 @@ def build_room_prompt(payload: dict) -> str:
     body = (msg.get("body") or "").strip()
     lines.append("## The message to answer")
     lines.append(f"{who}: {body}")
+
+    if attachments:
+        lines.append("")
+        lines.append("## Attachments on that message")
+        lines.append("Already downloaded — read them with the Read tool; "
+                     "a screenshot is usually the point of the message.")
+        for a in attachments:
+            kind = a.get("kind") or "file"
+            size = a.get("bytes") or a.get("byte_size") or 0
+            lines.append(f"- `{a['path']}` — {a.get('filename') or '?'} "
+                         f"({kind}, {size} bytes)")
 
     return "\n".join(lines)
 
@@ -1386,7 +1478,10 @@ async def handle_room_message(ws, payload: dict) -> None:
                          "🧹 Already on a fresh session (nothing to clear).")
         return
 
-    prompt = build_room_prompt(payload)
+    # Fetched before the prompt is built so the paths can go in it,
+    # and off the event loop because it's blocking network I/O.
+    attachments = await asyncio.to_thread(download_attachments, msg)
+    prompt = build_room_prompt(payload, attachments)
     typing_task = asyncio.create_task(room_typing_forever(ws, room_id))
     try:
         raw = await asyncio.to_thread(

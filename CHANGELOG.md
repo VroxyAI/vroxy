@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.0
+
+- **A screenshot posted in a room reaches the agent.** The envelope
+  now carries each attachment's fetch URL (vroxy_web 2.72.0), so the
+  files are downloaded before the prompt is built and listed in it by
+  absolute path — Claude can only look at a picture that exists on
+  disk. They land beside the session cache in
+  `~/.cache/vroxy-attachments/<message>/`, never in the checkout,
+  which would otherwise show up as untracked junk in the very diff
+  the run is about to propose.
+- Best-effort per file, and bounded: 5 files, 25 MB each, a 20-second
+  fetch. A download that fails is logged and skipped — a screenshot
+  we couldn't reach must not cost the room its answer. Filenames come
+  from whoever uploaded them, so they're reduced to a safe basename
+  before anything is written.
+
 ## 0.5.0
 
 - **A deploy no longer throws away the run it interrupted.** The work

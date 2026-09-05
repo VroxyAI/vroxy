@@ -174,6 +174,114 @@ class BuildRoomPromptTest(unittest.TestCase):
         self.assertIn("no fenced proposal block", prompt)
 
 
+class AttachmentTest(unittest.TestCase):
+    """Screenshots reach the model as files on disk, or not at all —
+    a half-downloaded picture must never cost the room its answer."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._real_dir = fa.ATTACHMENT_DIR
+        fa.ATTACHMENT_DIR = Path(self.tmp.name)
+        self.addCleanup(lambda: setattr(fa, "ATTACHMENT_DIR", self._real_dir))
+
+    def _serve(self, body: bytes):
+        """Stub urlopen with a context manager yielding `body`."""
+        class _Resp:
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *a): return False
+            def read(self_inner, n=None): return body
+        real = fa.urllib.request.urlopen
+        fa.urllib.request.urlopen = lambda url, timeout=None: _Resp()
+        self.addCleanup(lambda: setattr(fa.urllib.request, "urlopen", real))
+
+    def test_downloads_to_disk_and_reports_the_path(self):
+        self._serve(b"\x89PNG fake bytes")
+        got = fa.download_attachments({
+            "hashid": "msg00001",
+            "attachments": [{
+                "filename": "shot.png", "kind": "image",
+                "content_type": "image/png", "byte_size": 15,
+                "url": "https://cdn.example/u/shot.png",
+            }],
+        })
+        self.assertEqual(1, len(got))
+        path = Path(got[0]["path"])
+        self.assertTrue(path.is_file())
+        self.assertEqual(b"\x89PNG fake bytes", path.read_bytes())
+
+    def test_a_failed_download_is_skipped_not_raised(self):
+        def boom(url, timeout=None):
+            raise OSError("connection reset")
+        real = fa.urllib.request.urlopen
+        fa.urllib.request.urlopen = boom
+        self.addCleanup(lambda: setattr(fa.urllib.request, "urlopen", real))
+
+        got = fa.download_attachments({
+            "hashid": "msg2",
+            "attachments": [{"filename": "a.png", "url": "https://cdn.example/a.png"}],
+        })
+        self.assertEqual([], got)
+
+    def test_a_relative_url_is_resolved_against_the_cable_host(self):
+        seen = []
+        real = fa.urllib.request.urlopen
+
+        class _Resp:
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *a): return False
+            def read(self_inner, n=None): return b"x"
+
+        def capture(url, timeout=None):
+            seen.append(url)
+            return _Resp()
+
+        fa.urllib.request.urlopen = capture
+        self.addCleanup(lambda: setattr(fa.urllib.request, "urlopen", real))
+
+        fa.download_attachments({
+            "hashid": "msg3",
+            "attachments": [{"filename": "d.png", "url": "/u-test/d.png"}],
+        })
+        self.assertEqual(1, len(seen))
+        self.assertTrue(seen[0].startswith("http"), seen)
+        self.assertTrue(seen[0].endswith("/u-test/d.png"), seen)
+
+    def test_a_filename_cannot_climb_out_of_the_directory(self):
+        self._serve(b"x")
+        got = fa.download_attachments({
+            "hashid": "msg4",
+            "attachments": [{"filename": "../../../etc/cron.d/pwn",
+                             "url": "https://cdn.example/x"}],
+        })
+        self.assertEqual(1, len(got))
+        written = Path(got[0]["path"]).resolve()
+        self.assertTrue(
+            str(written).startswith(str(Path(self.tmp.name).resolve())),
+            f"{written} escaped the attachment directory")
+
+    def test_an_oversized_attachment_is_skipped(self):
+        self._serve(b"x")
+        got = fa.download_attachments({
+            "hashid": "msg5",
+            "attachments": [{"filename": "huge.bin", "byte_size": 10**9,
+                             "url": "https://cdn.example/huge.bin"}],
+        })
+        self.assertEqual([], got)
+
+    def test_the_prompt_lists_downloaded_paths(self):
+        prompt = fa.build_room_prompt(ROOM_PAYLOAD, [
+            {"path": "/tmp/shot.png", "filename": "shot.png",
+             "kind": "image", "bytes": 1234},
+        ])
+        self.assertIn("## Attachments on that message", prompt)
+        self.assertIn("/tmp/shot.png", prompt)
+        self.assertIn("Read tool", prompt)
+
+    def test_no_attachments_omits_the_section(self):
+        self.assertNotIn("## Attachments", fa.build_room_prompt(ROOM_PAYLOAD))
+
+
 class RoomCommandTest(unittest.TestCase):
     def test_recognizes_reset_aliases(self):
         for word in ("/reset", "/clear", "/new"):
