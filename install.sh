@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+#
+# vroxy_dispatch installer.
+#
+#   ./install.sh              interactive: add a workspace
+#   ./install.sh --update     git pull + reinstall deps + restart all
+#   ./install.sh --list       what's installed, and whether it's up
+#   ./install.sh --remove ID  stop, disable and forget one instance
+#
+# ONE PROCESS PER WORKSPACE. AdminFeedbackChannel streams for exactly
+# one tenant, so running dispatch for both vroxy and arubamu means two
+# units, not one process with two connections. That's why this uses a
+# systemd TEMPLATE unit (`vroxy-dispatch@<id>.service`) — adding the
+# second workspace costs one env file, not a second copy of the unit.
+#
+# Each instance gets a generated VROXY_INSTALL_ID. The server keys the
+# agent row on it, which is what makes several dispatches in ONE
+# workspace possible too; without it the server can only tell them
+# apart when there's exactly one.
+#
+# Nothing here writes a token to stdout, the log, or the process list.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UNIT_NAME="vroxy-dispatch@.service"
+UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
+ENV_DIR="/etc/vroxy-dispatch"
+RUN_USER="${SUDO_USER:-$(id -un)}"
+RUN_GROUP="$(id -gn "$RUN_USER")"
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+# ── venv ──────────────────────────────────────────────────────────
+ensure_venv() {
+  need python3
+  if [[ ! -x "$HERE/.venv/bin/python" ]]; then
+    say "Creating virtualenv…"
+    python3 -m venv "$HERE/.venv"
+  fi
+  say "Installing Python dependencies…"
+  "$HERE/.venv/bin/pip" install --quiet --upgrade pip
+  "$HERE/.venv/bin/pip" install --quiet -r "$HERE/requirements.txt"
+}
+
+# ── the template unit ─────────────────────────────────────────────
+# `%i` is the instance id, so one file serves every workspace.
+install_unit() {
+  say "Installing ${UNIT_NAME}…"
+  sudo mkdir -p "$ENV_DIR"
+  sudo chmod 750 "$ENV_DIR"
+  sudo tee "$UNIT_PATH" >/dev/null <<UNIT
+[Unit]
+Description=vroxy dispatch — %i
+Documentation=https://github.com/wartron/vroxy_dispatch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${RUN_USER}
+Group=${RUN_GROUP}
+WorkingDirectory=${HERE}
+EnvironmentFile=${ENV_DIR}/%i.env
+ExecStart=${HERE}/.venv/bin/python ${HERE}/feedback_agent.py
+Restart=on-failure
+RestartSec=5
+# Long enough for an in-flight run's SIGTERM spool to reach disk.
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  sudo systemctl daemon-reload
+}
+
+# ── verifying a token before we wire anything to it ───────────────
+# The point is the workspace NAME. Installing an agent against the
+# wrong token is the kind of mistake you find out about a week later,
+# in someone else's rooms.
+verify_token() {
+  local host="$1" token="$2"
+  need curl
+  curl -fsS -m 15 -H "Authorization: Bearer ${token}" \
+       -H "Accept: application/json" "${host%/}/api/v1/whoami" 2>/dev/null || true
+}
+
+json_field() { python3 -c 'import json,sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+cur = data
+for part in sys.argv[1].split("."):
+    cur = (cur or {}).get(part)
+print("" if cur is None else cur)' "$1"; }
+
+add_workspace() {
+  ensure_venv
+  install_unit
+
+  local host token slug name id code_root project agent_name body
+  read -rp "vroxy host [https://vroxy.ai]: " host
+  host="${host:-https://vroxy.ai}"
+
+  # -s: a token must not land in the terminal scrollback or history.
+  read -rsp "Workspace API token (platform:dispatch or full): " token; echo
+  [[ -n "$token" ]] || die "a token is required"
+
+  say "Checking the token…"
+  body="$(verify_token "$host" "$token")"
+  [[ -n "$body" ]] || die "couldn't reach ${host}/api/v1/whoami, or the token was refused"
+  name="$(printf '%s' "$body" | json_field workspace.name || true)"
+  slug="$(printf '%s' "$body" | json_field workspace.slug || true)"
+  [[ -n "$name" ]] || die "that response didn't name a workspace — is the host right?"
+
+  if [[ "$(printf '%s' "$body" | json_field dispatch_ok)" != "True" ]]; then
+    warn "That token lacks platform:dispatch (or full) scope — the cable will refuse it."
+    read -rp "Continue anyway? [y/N]: " go
+    [[ "$go" == "y" || "$go" == "Y" ]] || exit 1
+  fi
+
+  say ""
+  say "Workspace: ${name} (${slug})"
+  read -rp "Install dispatch for this workspace? [Y/n]: " confirm
+  [[ -z "$confirm" || "$confirm" == "y" || "$confirm" == "Y" ]] || exit 1
+
+  read -rp "Code root (the folder holding the repos it works on) [$(dirname "$HERE")]: " code_root
+  code_root="${code_root:-$(dirname "$HERE")}"
+  [[ -d "$code_root" ]] || die "no such directory: $code_root"
+
+  read -rp "Default project (repo folder name under that root) [vroxy_web]: " project
+  project="${project:-vroxy_web}"
+
+  read -rp "Agent name as it appears in the workspace [Dispatch]: " agent_name
+  agent_name="${agent_name:-Dispatch}"
+
+  id="${slug:-workspace}"
+  local env_file="${ENV_DIR}/${id}.env"
+  if [[ -e "$env_file" ]]; then
+    read -rp "${id} is already installed — overwrite its config? [y/N]: " over
+    [[ "$over" == "y" || "$over" == "Y" ]] || exit 1
+  fi
+
+  # Generated once and never regenerated: it IS this instance's
+  # identity on the server. Rewriting it would orphan the agent row,
+  # its room, and its history.
+  local install_id
+  install_id="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+
+  local cable="${host%/}/cable"
+  cable="${cable/https:/wss:}"
+  cable="${cable/http:/ws:}"
+
+  sudo tee "$env_file" >/dev/null <<ENVFILE
+# vroxy_dispatch — ${name}
+# Written by install.sh. Contains a workspace token: keep 0640.
+VROXY_CABLE_URL=${cable}
+VROXY_SERVICE_TOKEN=${token}
+VROXY_INSTALL_ID=${install_id}
+VROXY_AGENT_NAME=${agent_name}
+VROXY_DISPATCH_UNIT=vroxy-dispatch@${id}.service
+CODE_ROOT=${code_root}
+PROJECT=${project}
+LOG_FILE=${HERE}/log/dispatch-${id}.log
+LOG_LEVEL=INFO
+PYTHONUNBUFFERED=1
+PATH=${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
+ENVFILE
+  sudo chown root:"$RUN_GROUP" "$env_file"
+  sudo chmod 640 "$env_file"
+
+  say "Starting vroxy-dispatch@${id}…"
+  sudo systemctl enable --now "vroxy-dispatch@${id}.service"
+  sleep 2
+  systemctl is-active --quiet "vroxy-dispatch@${id}.service" \
+    && say "Running. It registers itself as \"${agent_name}\" in ${name} on its first heartbeat." \
+    || warn "Not running — journalctl -u vroxy-dispatch@${id} -n 50"
+}
+
+instances() {
+  [[ -d "$ENV_DIR" ]] || return 0
+  find "$ENV_DIR" -maxdepth 1 -name '*.env' -printf '%f\n' 2>/dev/null | sed 's/\.env$//' | sort
+}
+
+list_instances() {
+  local any=0
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    any=1
+    printf '%-20s %s\n' "$id" "$(systemctl is-active "vroxy-dispatch@${id}.service" 2>/dev/null || echo unknown)"
+  done < <(instances)
+  [[ $any -eq 1 ]] || say "Nothing installed yet — run ./install.sh"
+}
+
+update_all() {
+  say "Updating the checkout…"
+  git -C "$HERE" pull --ff-only
+  ensure_venv
+  install_unit
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    say "Restarting vroxy-dispatch@${id}…"
+    # Out of band: a restart issued from inside the unit's own cgroup
+    # takes this script down with it when systemd stops the unit.
+    sudo systemd-run --on-active=2s --unit="vroxy-dispatch-update-${id}-$RANDOM" --collect \
+      systemctl restart "vroxy-dispatch@${id}.service"
+  done < <(instances)
+  say "Restarts scheduled. Each instance spools its in-flight work and replays it on boot."
+}
+
+remove_instance() {
+  local id="$1"
+  [[ -n "$id" ]] || die "usage: ./install.sh --remove <id>"
+  sudo systemctl disable --now "vroxy-dispatch@${id}.service" 2>/dev/null || true
+  sudo rm -f "${ENV_DIR}/${id}.env"
+  say "Removed ${id}. The agent row and its room stay in the workspace — delete them there if you want them gone."
+}
+
+case "${1:-}" in
+  --update) update_all ;;
+  --list)   list_instances ;;
+  --remove) remove_instance "${2:-}" ;;
+  --help|-h)
+    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    ;;
+  "")       add_workspace ;;
+  *)        die "unknown option: $1 (try --help)" ;;
+esac

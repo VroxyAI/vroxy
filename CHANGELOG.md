@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.13.0
+
+- **`install.sh`** — installs, updates and removes dispatch instances.
+  Creates the venv, installs a systemd TEMPLATE unit
+  (`vroxy-dispatch@<workspace>.service`) so a second workspace costs
+  one env file rather than a second copy of the unit, asks for the
+  host and a workspace token, and **confirms the workspace by name**
+  via `GET /api/v1/whoami` before wiring anything to it. `--update`
+  pulls, reinstalls deps and restarts every instance from OUTSIDE
+  their cgroups; `--list` and `--remove` do the obvious.
+- The token is read with `read -s` and written to a 0640 file owned by
+  root — never to stdout, the shell history, or the process list.
+- **`VROXY_INSTALL_ID` / `VROXY_AGENT_NAME` ride on the heartbeat.**
+  The server (vroxy_web 2.82.0) resolves the agent row by the install
+  id and registers a new one the first time it sees it, which is what
+  lets several dispatch processes serve one workspace — each with its
+  own room and its own `@Name`. Only sent when configured: an install
+  predating `install.sh` keeps the old single-agent resolution instead
+  of registering a duplicate under a name nobody chose.
+- The install id is generated once and never regenerated. Rewriting it
+  would orphan the agent row, its room and its history.
+
 ## 0.12.0
 
 - **Says where a request is before it produces anything.** New

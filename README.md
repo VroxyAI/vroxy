@@ -200,6 +200,37 @@ non-streamed one, which is why it never fixed the streamed path.
 
 ## Install
 
+Run `./install.sh`. It creates the venv, installs a systemd TEMPLATE
+unit (`vroxy-dispatch@<workspace>.service`), asks for the vroxy host
+and a workspace API token, **confirms the workspace by name** before
+wiring anything to it, and writes `/etc/vroxy-dispatch/<id>.env` at
+0640.
+
+```bash
+./install.sh              # add a workspace (interactive)
+./install.sh --list       # what's installed, and whether it's up
+./install.sh --update     # git pull + deps + restart every instance
+./install.sh --remove ID  # stop, disable, forget one instance
+```
+
+**One process per workspace.** `AdminFeedbackChannel` streams for
+exactly one tenant, so running dispatch for both vroxy and arubamu is
+two units, not one process with two connections — which is why the
+unit is a template and adding the second workspace costs one env file.
+
+Each install generates a `VROXY_INSTALL_ID` once. The server keys the
+agent row on it, so SEVERAL dispatches can also serve ONE workspace,
+each with its own room and its own `@Name`. It is never regenerated:
+rewriting it would orphan the agent row, its room, and its history.
+
+The token needs `platform:dispatch` (or `full`) scope. `install.sh`
+checks it against `GET /api/v1/whoami` and prints the workspace name
+before asking you to confirm — installing an agent against the wrong
+token is the kind of mistake you find a week later in someone else's
+rooms.
+
+### Manual install
+
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt

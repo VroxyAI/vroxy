@@ -91,6 +91,14 @@ SID_DIR         = Path.home() / ".cache" / "claude-chat"
 # run can leave the process running code that no longer exists on
 # disk.  The unit name is what a restart targets; the state dir is
 # how a notice survives the process that wrote it.
+# Who this process is. `INSTALL_ID` is written once by install.sh and
+# is what lets SEVERAL dispatch processes serve one workspace: the
+# server resolves the agent row by it instead of the old "exactly one
+# local agent or we can't tell who called" rule. `AGENT_NAME` is only
+# a preference — the server makes it unique per workspace.
+INSTALL_ID      = os.environ.get("VROXY_INSTALL_ID", "")
+AGENT_NAME      = os.environ.get("VROXY_AGENT_NAME", "")
+
 SERVICE_UNIT    = os.environ.get("VROXY_DISPATCH_UNIT",
                                  "vroxy-dispatch-feedback-agent.service")
 RESTART_DELAY_SECONDS = int(os.environ.get("VROXY_DISPATCH_RESTART_DELAY", "5"))
@@ -111,7 +119,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.12.0"
+AGENT_VERSION      = "vroxy_dispatch 0.13.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -252,10 +260,18 @@ async def heartbeat(ws) -> None:
     """Heartbeat frame.  AdminFeedbackChannel#heartbeat writes it
     into Rails.cache under a tenant-scoped key with a 60 s TTL —
     the admin index card polls that key to show 🟢/🔴 + version."""
+    meta = {"status": _current_status, "project": PROJECT}
+    # Only sent when configured — an install that predates install.sh
+    # keeps the old single-agent resolution rather than registering a
+    # duplicate under a name nobody chose.
+    if INSTALL_ID:
+        meta["install_id"] = INSTALL_ID
+    if AGENT_NAME:
+        meta["agent_name"] = AGENT_NAME
     await cable_send(ws, "message", {
         "action":  "heartbeat",
         "version": AGENT_VERSION,
-        "meta":    {"status": _current_status, "project": PROJECT},
+        "meta":    meta,
     }, buffer=False)
 
 
