@@ -111,7 +111,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.11.0"
+AGENT_VERSION      = "vroxy_dispatch 0.12.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -305,6 +305,20 @@ async def room_reply(ws, room_id: str, body: str, reply_to: str | None = None) -
         payload["reply_to"] = reply_to
     await cable_send(ws, "message", payload)
     log.info("Room reply sent room=%s body=%.80s", room_id, body)
+
+
+async def room_status(ws, room_id: str, reply_to: str | None, state: str) -> None:
+    """`queued` when it lands on the work queue, `working` when the
+    worker picks it up.  One in-flight run at a time means a request
+    can sit for twenty minutes before anything happens, and a room
+    with no signal at all is indistinguishable from one where the
+    message never arrived."""
+    if not reply_to:
+        return
+    await cable_send(ws, "message", {
+        "action": "room_status", "room_id": room_id,
+        "reply_to": reply_to, "state": state,
+    })
 
 
 async def room_typing(ws, room_id: str) -> None:
@@ -1996,6 +2010,9 @@ async def worker_loop(link: CableLink) -> None:
         if kind == "room":
             room = payload.get("room") or {}
             _current_status = f"answering #{room.get('name') or room.get('hashid')}"
+            with contextlib.suppress(Exception):
+                await room_status(link, room.get("hashid"),
+                                  (payload.get("message") or {}).get("hashid"), "working")
         else:
             _current_status = f"processing feedback {fb_id}" if kind == "feedback" \
                               else f"applying feedback {fb_id}"
@@ -2072,6 +2089,9 @@ async def process_stream(link: CableLink, ws) -> None:
                 await _work_queue.put(("approve", msg))
             elif msg.get("type") == "room.message":
                 await _work_queue.put(("room", msg))
+                with contextlib.suppress(Exception):
+                    await room_status(link, (msg.get("room") or {}).get("hashid"),
+                                      (msg.get("message") or {}).get("hashid"), "queued")
             else:
                 log.debug("Ignoring message type=%s", msg.get("type"))
     finally:

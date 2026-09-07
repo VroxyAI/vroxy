@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.0
+
+- **Says where a request is before it produces anything.** New
+  `room_status` action (vroxy_web 2.80.0): `queued` the moment a room
+  message lands on the work queue, `working` when the worker picks it
+  up. One in-flight run at a time means a request can sit for twenty
+  minutes before the first tool call, and until now that looked
+  exactly like a message nobody received.
+- Best-effort, like every other status frame — a run is never worth
+  losing over a badge.
+
 ## 0.11.0
 
 - **A stop no longer swallows the queue.** The work queue lives in

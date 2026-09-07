@@ -1015,6 +1015,26 @@ class RestartIfSelfUpdatedTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCa
         self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
 
 
+class RoomStatusTest(unittest.IsolatedAsyncioTestCase):
+    """A run can sit queued behind a twenty-minute one. Silence and
+    "never arrived" look identical from the room."""
+
+    async def test_queued_and_working_are_announced(self):
+        link = fa.CableLink()
+        await fa.room_status(link, "rm123456", "ms123456", "queued")
+        await fa.room_status(link, "rm123456", "ms123456", "working")
+
+        frames = [json.loads(json.loads(f)["data"]) for f in link.outbox]
+        self.assertEqual(["room_status", "room_status"], [f["action"] for f in frames])
+        self.assertEqual(["queued", "working"], [f["state"] for f in frames])
+        self.assertEqual("ms123456", frames[0]["reply_to"])
+
+    async def test_no_message_to_hang_it_on_means_no_frame(self):
+        link = fa.CableLink()
+        await fa.room_status(link, "rm123456", None, "queued")
+        self.assertEqual([], link.outbox, "a status with nothing to attach to is noise")
+
+
 class WorkSpoolTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCase):
     """A restart used to swallow whatever was queued. The server
     broadcasts each message exactly once, so a task lost here is a
