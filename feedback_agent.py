@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -96,12 +97,21 @@ RESTART_DELAY_SECONDS = int(os.environ.get("VROXY_DISPATCH_RESTART_DELAY", "5"))
 STATE_DIR       = Path(os.environ.get("VROXY_DISPATCH_STATE_DIR",
                                       str(Path.home() / ".cache" / "vroxy-dispatch")))
 RESTART_NOTICE_PATH = STATE_DIR / "restart-notice.json"
+# Work that was queued or in flight when the process died.  The queue
+# lives in memory and the server broadcasts each message exactly once,
+# so anything still on it when systemd stops the unit is gone with no
+# trace — the asker just never hears back.
+WORK_SPOOL_PATH = STATE_DIR / "work-spool.json"
+WORK_SPOOL_MAX = 50
+# Replaying a question from an hour ago is worse than dropping it:
+# the answer arrives with no context and the asker has moved on.
+WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 # A notice older than this belongs to a restart nobody is still
 # waiting on — announcing it would be confusing, not informative.
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.10.0"
+AGENT_VERSION      = "vroxy_dispatch 0.11.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -1263,6 +1273,86 @@ async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
                          reply_to)
 
 
+# ── Surviving a stop ──────────────────────────────────────────────
+# systemd stops a unit by killing its whole cgroup.  Whatever the
+# worker was running dies with it, and whatever was still queued dies
+# unread — the server broadcast it once and does not repeat itself.
+_current_work: tuple[str, dict] | None = None
+
+
+def spool_pending_work() -> int:
+    """Write the in-flight task and everything still queued to disk.
+
+    The in-flight one is included deliberately: it was taken off the
+    queue but never answered, so from the asker's side it is exactly
+    as lost as the ones behind it."""
+    items: list[dict] = []
+    if _current_work:
+        items.append({"kind": _current_work[0], "payload": _current_work[1]})
+    if _work_queue is not None:
+        while not _work_queue.empty():
+            try:
+                kind, payload = _work_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            items.append({"kind": kind, "payload": payload})
+
+    if not items:
+        with contextlib.suppress(OSError):
+            WORK_SPOOL_PATH.unlink()
+        return 0
+
+    items = items[:WORK_SPOOL_MAX]
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        WORK_SPOOL_PATH.write_text(
+            json.dumps({"at": time.time(), "items": items}), encoding="utf-8")
+    except OSError as e:
+        log.error("could not spool %d unfinished task(s): %s", len(items), e)
+        return 0
+    log.warning("spooled %d unfinished task(s) for the next process", len(items))
+    return len(items)
+
+
+def take_spooled_work() -> list[dict]:
+    """Read and DELETE.  A spool that survived one boot would replay
+    on every boot after it."""
+    try:
+        raw = WORK_SPOOL_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    with contextlib.suppress(OSError):
+        WORK_SPOOL_PATH.unlink()
+    try:
+        spool = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(spool, dict):
+        return []
+
+    age = time.time() - float(spool.get("at") or 0)
+    if age > WORK_SPOOL_MAX_AGE_SECONDS:
+        log.warning("dropping a work spool %.0fs old — too late to be useful", age)
+        return []
+    return [item for item in spool.get("items") or []
+            if isinstance(item, dict) and isinstance(item.get("payload"), dict)
+            and item.get("kind")]
+
+
+def install_shutdown_handler(loop) -> None:
+    """SIGTERM is what `systemctl restart` sends.  Spool first, then
+    go — the alternative is what happened on 2026-09-06: a restart
+    armed while a request was queued, and the request evaporated."""
+    def handle(signum):
+        log.warning("received %s — spooling and shutting down", signal.Signals(signum).name)
+        spool_pending_work()
+        os._exit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(sig, handle, sig)
+
+
 async def announce_restart(link) -> None:
     """The other half: the process that came back says so."""
     notice = take_restart_notice()
@@ -1853,13 +1943,13 @@ async def handle_room_message(ws, payload: dict) -> None:
             run_claude_streamed, prompt, PROJECT, on_stream_event,
             True, _room_session_key(room_id))
     except subprocess.TimeoutExpired:
-        await room_reply(ws, room_id, "⚠️ I timed out after 30 minutes.")
+        await room_reply(ws, room_id, "⚠️ I timed out after 30 minutes.", msg.get("hashid"))
         result["is_error"] = True
         await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
         return
     except Exception as e:
         log.exception("claude crashed on room message")
-        await room_reply(ws, room_id, f"⚠️ I crashed: {type(e).__name__}: {e}")
+        await room_reply(ws, room_id, f"⚠️ I crashed: {type(e).__name__}: {e}", msg.get("hashid"))
         result["is_error"] = True
         await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
         return
@@ -1867,13 +1957,16 @@ async def handle_room_message(ws, payload: dict) -> None:
         typing_task.cancel()
 
     if not raw:
-        await room_reply(ws, room_id, "(I came back with an empty response.)")
+        await room_reply(ws, room_id, "(I came back with an empty response.)", msg.get("hashid"))
         result["is_error"] = True
         await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
         return
 
+    # Threaded under the message that asked.  A room where three
+    # people are talking at once is unreadable when the answers float
+    # free of their questions.
     for chunk in split_room_body(raw):
-        await room_reply(ws, room_id, chunk)
+        await room_reply(ws, room_id, chunk, msg.get("hashid"))
 
     # After the answer: the run is only worth recording once the
     # person has it, and a failure here must not look like a failure
@@ -1894,8 +1987,10 @@ async def worker_loop(link: CableLink) -> None:
     reentrant and we don't want to race a `--resume` with itself."""
     global _current_status
     assert _work_queue is not None
+    global _current_work
     while True:
         kind, payload = await _work_queue.get()
+        _current_work = (kind, payload)
         fb_id = ((payload.get("feedback") or {}).get("hashid")
                  or payload.get("feedback_id") or "?")
         if kind == "room":
@@ -1917,6 +2012,7 @@ async def worker_loop(link: CableLink) -> None:
             log.exception("worker failed on payload=%s", payload)
         finally:
             _current_status = "idle"
+            _current_work = None
             _work_queue.task_done()
 
         # Outside the try so a task's own failure doesn't mask it,
@@ -2002,6 +2098,15 @@ async def main() -> None:
 
     global _work_queue
     _work_queue = asyncio.Queue()
+    install_shutdown_handler(asyncio.get_running_loop())
+
+    # Anything the previous process was holding when it was stopped.
+    # Re-queued before the socket is even open, so it runs in the
+    # order it was asked rather than behind whatever arrives next.
+    for item in take_spooled_work():
+        log.warning("replaying a %s task the last process never finished", item["kind"])
+        _work_queue.put_nowait((item["kind"], item["payload"]))
+
     link = CableLink()
     # Started once, outside the reconnect loop, so a run in progress
     # survives the cable dropping under it.
@@ -2013,8 +2118,16 @@ async def main() -> None:
             async with websockets.connect(uri, ping_interval=30, origin=origin) as ws:
                 backoff = 1
                 await process_stream(link, ws)
-        except (websockets.ConnectionClosed, OSError) as e:
-            log.warning("Cable connection lost (%s) — reconnecting in %ss", e, backoff)
+        # WebSocketException covers a refused handshake as well as a
+        # dropped socket.  A deploy answers `502` for a few seconds
+        # while the new container boots, and that used to fall through
+        # to the catch-all below: logged as an unexpected error with a
+        # full traceback, and retried on a flat 5s instead of the
+        # backoff.  A rejected handshake during a deploy is the most
+        # ordinary thing that happens to this process.
+        except (websockets.WebSocketException, OSError) as e:
+            log.warning("Cable unavailable (%s: %s) — reconnecting in %ss",
+                        type(e).__name__, e, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         except Exception:

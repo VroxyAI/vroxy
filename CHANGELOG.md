@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.11.0
+
+- **A stop no longer swallows the queue.** The work queue lives in
+  memory and the server broadcasts each `room.message` exactly once,
+  so anything queued when systemd killed the cgroup was gone with no
+  trace — the asker simply never heard back. Seen for real on
+  2026-09-06: a restart armed at 19:16:37 while a request was still
+  queued, and the request evaporated. SIGTERM/SIGINT now spool the
+  in-flight task and everything behind it to
+  `~/.cache/vroxy-dispatch/work-spool.json`, and the next process
+  re-queues them before it even opens the socket, in the order they
+  were asked.
+- The IN-FLIGHT task is spooled first, deliberately: it was taken off
+  the queue but never answered, so from the asker's side it is exactly
+  as lost as the ones behind it, and it was asked first. Bounded to 50
+  items and 30 minutes — replaying a half-hour-old question is worse
+  than dropping it, since the answer arrives with no context.
+- **A refused handshake is an ordinary event, not a crash.** Railway
+  answers `502` for a few seconds mid-deploy;
+  `websockets.InvalidStatusCode` isn't `ConnectionClosed`, so it fell
+  through to the catch-all and was logged as "Unexpected error in
+  cable loop" with a full traceback, then retried on a flat 5s instead
+  of the backoff. Now caught as `websockets.WebSocketException`, which
+  covers a rejected handshake as well as a dropped socket.
+- **Room answers are threaded under the message that asked** — the
+  final reply passed no `reply_to`, so answers floated free of their
+  questions in a busy room. The timeout, crash and empty-response
+  replies thread too.
+- The test suite no longer writes into `log/dispatch.log`. It
+  exercises the real reply and self-restart paths, so every run was
+  filing fake "Room reply sent" lines into the operator's log and
+  making the real history unreadable.
+
 ## 0.10.0
 
 - **Dispatch restarts itself when a run edits its own checkout.**

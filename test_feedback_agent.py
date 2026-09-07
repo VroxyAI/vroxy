@@ -6,6 +6,14 @@ at a real vroxy_web instance.
 """
 
 import json
+import os
+
+# Before feedback_agent is imported: it configures logging at import
+# time, and the suite exercises the real reply/restart paths.  Without
+# this every test run writes fake "Room reply sent" lines into the
+# operator's log/dispatch.log and makes the real history unreadable.
+os.environ.setdefault("LOG_FILE", "")
+
 import asyncio
 import subprocess
 import time
@@ -1005,6 +1013,69 @@ class RestartIfSelfUpdatedTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCa
         self.assertEqual([1], self.scheduled)
         self.assertEqual([], sent_bodies(link))
         self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
+
+
+class WorkSpoolTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCase):
+    """A restart used to swallow whatever was queued. The server
+    broadcasts each message exactly once, so a task lost here is a
+    question the asker never hears back about."""
+
+    async def asyncSetUp(self):
+        self.start_sandbox()
+        fa.WORK_SPOOL_PATH = fa.STATE_DIR / "work-spool.json"
+        self._saved_queue, self._saved_work = fa._work_queue, fa._current_work
+        fa._work_queue, fa._current_work = asyncio.Queue(), None
+
+    async def asyncTearDown(self):
+        fa._work_queue, fa._current_work = self._saved_queue, self._saved_work
+        self.stop_sandbox()
+
+    async def test_the_in_flight_task_is_spooled_ahead_of_the_queued_ones(self):
+        # The one being worked was taken off the queue but never
+        # answered — from the asker's side it is exactly as lost as
+        # the ones behind it, and it was asked first.
+        fa._current_work = ("room", {"message": {"body": "the one running"}})
+        fa._work_queue.put_nowait(("room", {"message": {"body": "next"}}))
+
+        self.assertEqual(2, fa.spool_pending_work())
+        replayed = fa.take_spooled_work()
+        self.assertEqual(["the one running", "next"],
+                         [i["payload"]["message"]["body"] for i in replayed])
+
+    async def test_nothing_pending_leaves_no_spool(self):
+        self.assertEqual(0, fa.spool_pending_work())
+        self.assertFalse(fa.WORK_SPOOL_PATH.exists())
+        self.assertEqual([], fa.take_spooled_work())
+
+    async def test_taking_the_spool_deletes_it(self):
+        fa._current_work = ("room", {"message": {"body": "x"}})
+        fa.spool_pending_work()
+        self.assertEqual(1, len(fa.take_spooled_work()))
+        self.assertEqual([], fa.take_spooled_work(), "a spool must not replay on every boot")
+
+    async def test_a_stale_spool_is_dropped(self):
+        fa._current_work = ("room", {"message": {"body": "x"}})
+        fa.spool_pending_work()
+        stale = json.loads(fa.WORK_SPOOL_PATH.read_text())
+        stale["at"] = stale["at"] - fa.WORK_SPOOL_MAX_AGE_SECONDS - 60
+        fa.WORK_SPOOL_PATH.write_text(json.dumps(stale), encoding="utf-8")
+        self.assertEqual([], fa.take_spooled_work())
+
+    async def test_a_corrupt_or_malformed_spool_is_dropped_not_raised(self):
+        fa.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        fa.WORK_SPOOL_PATH.write_text("{not json", encoding="utf-8")
+        self.assertEqual([], fa.take_spooled_work())
+
+        fa.WORK_SPOOL_PATH.write_text(
+            json.dumps({"at": time.time(),
+                        "items": [{"kind": "room"}, {"payload": {}}, {"kind": "room", "payload": {"ok": 1}}]}),
+            encoding="utf-8")
+        self.assertEqual([{"kind": "room", "payload": {"ok": 1}}], fa.take_spooled_work())
+
+    async def test_the_spool_is_bounded(self):
+        for i in range(fa.WORK_SPOOL_MAX + 20):
+            fa._work_queue.put_nowait(("room", {"i": i}))
+        self.assertEqual(fa.WORK_SPOOL_MAX, fa.spool_pending_work())
 
 
 class AnnounceRestartTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCase):
