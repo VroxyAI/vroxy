@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0
+
+- **Reasoning reaches the room, not just tool calls.** `thinking`
+  blocks were parsed and written to the log and nowhere else; they now
+  go out as `room_progress` lines with `kind: thinking` alongside the
+  tool lines. The final answer is deliberately not echoed into the
+  trail — it arrives as the reply a second later, and saying it twice
+  helps nobody.
+- Rails keeps these for three days in Redis now (vroxy_web 2.76.0), so
+  the cap went to 120 lines per run: a trail worth reopening tomorrow
+  can afford to be longer than one that vanishes on refresh.
+
 ## 0.7.0
 
 - **A room run reports what it's doing while it does it.** Each tool

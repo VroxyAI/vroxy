@@ -85,7 +85,7 @@ CLAUDE_CHAT_BIN = os.environ.get(
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.7.0"
+AGENT_VERSION      = "vroxy_dispatch 0.8.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -888,6 +888,10 @@ def run_claude_streamed(prompt: str, project: str, on_event,
                         if thought:
                             thinking_chars += len(thought)
                             log.info("  · thinking %s", _one_line(thought, 200))
+                            try:
+                                on_event({"type": "thinking", "text": thought})
+                            except Exception:
+                                log.exception("on_event thinking raised")
 
             elif etype == "user":
                 content = ((event.get("message") or {}).get("content")) or event.get("content") or []
@@ -1278,7 +1282,8 @@ def _ensure_on_base(project_dir: Path, base: str) -> tuple[bool, str]:
     return rc == 0, err
 
 
-ROOM_PROGRESS_MAX = 60
+ROOM_PROGRESS_MAX = 120
+ROOM_PROGRESS_TEXT_MAX = 400
 
 
 def _progress_line(name: str, input_dict: dict | None) -> str:
@@ -1298,18 +1303,18 @@ def _progress_line(name: str, input_dict: dict | None) -> str:
 
 
 async def _emit_room_progress(ws, room_id: str, reply_to: str | None,
-                              name: str, input_dict: dict | None) -> None:
+                              kind: str, text: str) -> None:
     """One `room_progress` action — Rails broadcasts it on the room's
-    channel and stores NOTHING, so the trail is live-only and a
-    reader who doesn't care never opens it.  Non-fatal on error: a
-    progress line is never worth losing the answer over."""
+    channel and keeps it in Redis for three days, so a refresh finds
+    the trail but nothing lands in the database.  Non-fatal on error:
+    a progress line is never worth losing the answer over."""
     try:
         await cable_send(ws, "message", {
             "action":   "room_progress",
             "room_id":  room_id,
             "reply_to": reply_to,
-            "kind":     "tool",
-            "text":     _progress_line(name, input_dict),
+            "kind":     kind,
+            "text":     text,
         })
     except Exception:
         log.exception("emit_room_progress failed")
@@ -1525,17 +1530,32 @@ async def handle_room_message(ws, payload: dict) -> None:
 
     def on_stream_event(event: dict) -> None:
         # Runs on the claude thread, so hop back to the loop to send.
-        # Capped: a long run can make hundreds of tool calls and the
-        # point is a glanceable trail, not a transcript.
+        # Capped: a long run can make hundreds of these and the point
+        # is a readable trail, not a transcript.
         nonlocal sent
-        if event.get("type") != "tool_use" or sent >= ROOM_PROGRESS_MAX:
+        if sent >= ROOM_PROGRESS_MAX:
             return
+        etype = event.get("type")
+        if etype == "tool_use":
+            kind = "tool"
+            text = _progress_line(event.get("name") or "tool", event.get("input"))
+        elif etype == "thinking":
+            kind = "thinking"
+            text = _one_line(event.get("text") or "", ROOM_PROGRESS_TEXT_MAX)
+        elif etype == "text_delta":
+            # The answer itself arrives here in pieces and is posted
+            # as the reply — repeating it in the trail would just be
+            # the message twice.  Only the running commentary before
+            # the final turn is worth showing.
+            return
+        else:
+            return
+        if not text:
+            return
+
         sent += 1
         fut = asyncio.run_coroutine_threadsafe(
-            _emit_room_progress(ws, room_id, msg.get("hashid"),
-                                event.get("name") or "tool",
-                                event.get("input")),
-            loop)
+            _emit_room_progress(ws, room_id, msg.get("hashid"), kind, text), loop)
         fut.add_done_callback(_log_future_error)
 
     try:
