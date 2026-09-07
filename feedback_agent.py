@@ -85,7 +85,7 @@ CLAUDE_CHAT_BIN = os.environ.get(
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.6.0"
+AGENT_VERSION      = "vroxy_dispatch 0.7.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -1278,6 +1278,43 @@ def _ensure_on_base(project_dir: Path, base: str) -> tuple[bool, str]:
     return rc == 0, err
 
 
+ROOM_PROGRESS_MAX = 60
+
+
+def _progress_line(name: str, input_dict: dict | None) -> str:
+    """One glanceable line: the tool and the argument that says what
+    it touched.  A whole input dict on a chat line is unreadable, and
+    the interesting part is almost always the path or the command."""
+    interesting = ("file_path", "path", "command", "pattern", "query",
+                   "url", "prompt", "description")
+    detail = ""
+    if isinstance(input_dict, dict):
+        for key in interesting:
+            value = input_dict.get(key)
+            if isinstance(value, str) and value.strip():
+                detail = value.strip().splitlines()[0][:120]
+                break
+    return f"{name}({detail})" if detail else str(name)
+
+
+async def _emit_room_progress(ws, room_id: str, reply_to: str | None,
+                              name: str, input_dict: dict | None) -> None:
+    """One `room_progress` action — Rails broadcasts it on the room's
+    channel and stores NOTHING, so the trail is live-only and a
+    reader who doesn't care never opens it.  Non-fatal on error: a
+    progress line is never worth losing the answer over."""
+    try:
+        await cable_send(ws, "message", {
+            "action":   "room_progress",
+            "room_id":  room_id,
+            "reply_to": reply_to,
+            "kind":     "tool",
+            "text":     _progress_line(name, input_dict),
+        })
+    except Exception:
+        log.exception("emit_room_progress failed")
+
+
 async def _emit_progress(ws, chat_id: str, name: str, input_dict: dict | None) -> None:
     """One `progress` action on AdminFeedbackChannel — Rails
     persists a `tool_call` SupportChatMessage row + broadcasts a
@@ -1483,9 +1520,27 @@ async def handle_room_message(ws, payload: dict) -> None:
     attachments = await asyncio.to_thread(download_attachments, msg)
     prompt = build_room_prompt(payload, attachments)
     typing_task = asyncio.create_task(room_typing_forever(ws, room_id))
+    loop = asyncio.get_running_loop()
+    sent = 0
+
+    def on_stream_event(event: dict) -> None:
+        # Runs on the claude thread, so hop back to the loop to send.
+        # Capped: a long run can make hundreds of tool calls and the
+        # point is a glanceable trail, not a transcript.
+        nonlocal sent
+        if event.get("type") != "tool_use" or sent >= ROOM_PROGRESS_MAX:
+            return
+        sent += 1
+        fut = asyncio.run_coroutine_threadsafe(
+            _emit_room_progress(ws, room_id, msg.get("hashid"),
+                                event.get("name") or "tool",
+                                event.get("input")),
+            loop)
+        fut.add_done_callback(_log_future_error)
+
     try:
         raw = await asyncio.to_thread(
-            run_claude_streamed, prompt, PROJECT, lambda e: None,
+            run_claude_streamed, prompt, PROJECT, on_stream_event,
             True, _room_session_key(room_id))
     except subprocess.TimeoutExpired:
         await room_reply(ws, room_id, "⚠️ I timed out after 30 minutes.")

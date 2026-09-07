@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.0
+
+- **A room run reports what it's doing while it does it.** Each tool
+  call sends a `room_progress` action (vroxy_web 2.75.0) carrying one
+  glanceable line — the tool plus the argument that says what it
+  touched, `Read(config/application.rb)`, never the whole input dict —
+  tagged with the message that asked so the room UI can hang it under
+  that message. Nothing is stored on either side.
+- Capped at 60 lines per run and one line per tool call: the point is
+  a glance, not a transcript. The send is best-effort and hops from
+  the Claude thread to the event loop the same way the widget's
+  progress chips already do — a progress line is never worth losing
+  the answer over.
+
 ## 0.6.0
 
 - **A screenshot posted in a room reaches the agent.** The envelope

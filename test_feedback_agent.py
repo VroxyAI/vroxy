@@ -282,6 +282,31 @@ class AttachmentTest(unittest.TestCase):
         self.assertNotIn("## Attachments", fa.build_room_prompt(ROOM_PAYLOAD))
 
 
+class RoomProgressLineTest(unittest.TestCase):
+    """One glanceable line per tool call: the tool plus the argument
+    that says what it touched, never the whole input dict."""
+
+    def test_prefers_the_argument_that_names_the_target(self):
+        self.assertEqual("Read(config/application.rb)",
+                         fa._progress_line("Read", {"file_path": "config/application.rb"}))
+        self.assertEqual("Bash(git log -1)",
+                         fa._progress_line("Bash", {"command": "git log -1",
+                                                    "description": "recent commit"}))
+
+    def test_falls_back_to_the_bare_tool_name(self):
+        self.assertEqual("Read", fa._progress_line("Read", None))
+        self.assertEqual("Read", fa._progress_line("Read", {"unknown_key": "x"}))
+        self.assertEqual("Read", fa._progress_line("Read", {"file_path": "   "}))
+
+    def test_takes_one_line_and_caps_its_length(self):
+        line = fa._progress_line("Bash", {"command": "echo one\necho two"})
+        self.assertEqual("Bash(echo one)", line)
+
+        long_line = fa._progress_line("Bash", {"command": "x" * 400})
+        self.assertLessEqual(len(long_line), 140)
+        self.assertTrue(long_line.startswith("Bash(x"))
+
+
 class RoomCommandTest(unittest.TestCase):
     def test_recognizes_reset_aliases(self):
         for word in ("/reset", "/clear", "/new"):
