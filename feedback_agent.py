@@ -85,7 +85,7 @@ CLAUDE_CHAT_BIN = os.environ.get(
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.8.0"
+AGENT_VERSION      = "vroxy_dispatch 0.9.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -910,6 +910,20 @@ def run_claude_streamed(prompt: str, project: str, on_event,
                 usage = event.get("usage") or {}
                 if usage:
                     log.info("  · usage %s", usage)
+                # The CLI is the only thing that knows what the run
+                # actually cost — cache reads and writes price nothing
+                # like base input, so this is reported, never derived.
+                try:
+                    on_event({
+                        "type":        "result",
+                        "usage":       usage,
+                        "cost_usd":    event.get("total_cost_usd"),
+                        "duration_ms": event.get("duration_ms"),
+                        "num_turns":   event.get("num_turns"),
+                        "is_error":    bool(event.get("is_error")),
+                    })
+                except Exception:
+                    log.exception("on_event result raised")
 
         proc.wait(timeout=30)
     finally:
@@ -1283,6 +1297,7 @@ def _ensure_on_base(project_dir: Path, base: str) -> tuple[bool, str]:
 
 
 ROOM_PROGRESS_MAX = 120
+ROOM_RUN_STEPS_MAX = 500
 ROOM_PROGRESS_TEXT_MAX = 400
 
 
@@ -1300,6 +1315,34 @@ def _progress_line(name: str, input_dict: dict | None) -> str:
                 detail = value.strip().splitlines()[0][:120]
                 break
     return f"{name}({detail})" if detail else str(name)
+
+
+async def _emit_room_run(ws, room_id: str, reply_to: str | None,
+                         steps: list[dict], result: dict) -> None:
+    """One `room_run` action at the end of a run — Rails writes a
+    DispatchRun row holding the working log, the token counts and the
+    CLI's own cost figure.  Sent once rather than per step: a long run
+    makes hundreds of steps and they're read as one document.
+
+    Best-effort.  The answer is already in the room by the time this
+    goes out, and bookkeeping must never be what breaks a reply."""
+    try:
+        usage = result.get("usage") or {}
+        await cable_send(ws, "message", {
+            "action":        "room_run",
+            "room_id":       room_id,
+            "reply_to":      reply_to,
+            "status":        "error" if result.get("is_error") else "ok",
+            "agent_version": AGENT_VERSION,
+            "project":       PROJECT,
+            "usage":         usage,
+            "cost_usd":      result.get("cost_usd"),
+            "duration_ms":   result.get("duration_ms"),
+            "num_turns":     result.get("num_turns"),
+            "steps":         steps[:ROOM_RUN_STEPS_MAX],
+        })
+    except Exception:
+        log.exception("emit_room_run failed")
 
 
 async def _emit_room_progress(ws, room_id: str, reply_to: str | None,
@@ -1527,12 +1570,19 @@ async def handle_room_message(ws, payload: dict) -> None:
     typing_task = asyncio.create_task(room_typing_forever(ws, room_id))
     loop = asyncio.get_running_loop()
     sent = 0
+    # Kept alongside the live sends so the finished run can be saved
+    # as one document, with the tokens and cost the CLI reports.
+    steps: list[dict] = []
+    result: dict = {}
 
     def on_stream_event(event: dict) -> None:
         # Runs on the claude thread, so hop back to the loop to send.
         # Capped: a long run can make hundreds of these and the point
         # is a readable trail, not a transcript.
         nonlocal sent
+        if event.get("type") == "result":
+            result.update(event)
+            return
         if sent >= ROOM_PROGRESS_MAX:
             return
         etype = event.get("type")
@@ -1554,6 +1604,7 @@ async def handle_room_message(ws, payload: dict) -> None:
             return
 
         sent += 1
+        steps.append({"kind": kind, "text": text})
         fut = asyncio.run_coroutine_threadsafe(
             _emit_room_progress(ws, room_id, msg.get("hashid"), kind, text), loop)
         fut.add_done_callback(_log_future_error)
@@ -1564,20 +1615,31 @@ async def handle_room_message(ws, payload: dict) -> None:
             True, _room_session_key(room_id))
     except subprocess.TimeoutExpired:
         await room_reply(ws, room_id, "⚠️ I timed out after 30 minutes.")
+        result["is_error"] = True
+        await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
         return
     except Exception as e:
         log.exception("claude crashed on room message")
         await room_reply(ws, room_id, f"⚠️ I crashed: {type(e).__name__}: {e}")
+        result["is_error"] = True
+        await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
         return
     finally:
         typing_task.cancel()
 
     if not raw:
         await room_reply(ws, room_id, "(I came back with an empty response.)")
+        result["is_error"] = True
+        await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
         return
 
     for chunk in split_room_body(raw):
         await room_reply(ws, room_id, chunk)
+
+    # After the answer: the run is only worth recording once the
+    # person has it, and a failure here must not look like a failure
+    # to reply.
+    await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
 
 
 # The work queue and its worker live for the PROCESS, not for one

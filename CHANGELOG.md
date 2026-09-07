@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.0
+
+- **Every run reports what it cost.** The CLI's `result` event carries
+  `total_cost_usd`, `usage` and `num_turns`; all of it was being logged
+  and thrown away. A new `room_run` action sends it to Rails at the end
+  of a run (vroxy_web 2.78.0) along with the working log, which becomes
+  a durable `DispatchRun` row — so spend can be shown per workspace and
+  per person.
+- The cost figure is reported, never derived. A real session on this box
+  used 37.7M cache-read tokens against 19k output, and cache reads price
+  at a fraction of fresh input, so multiplying tokens by a rate table
+  would have been wrong by an order of magnitude.
+- Sent AFTER the answer is posted, and best-effort: a failure to record
+  a run must never look like a failure to reply. A timeout, a crash and
+  an empty response each record too, marked as errors — a run that cost
+  money and produced nothing is exactly the one worth seeing.
+
 ## 0.8.0
 
 - **Reasoning reaches the room, not just tool calls.** `thinking`
