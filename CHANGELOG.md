@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.21.0
+
+### Removed
+
+- **Dispatch no longer claims to be typing.** `room_typing_forever`
+  kept a human "someone is composing a reply" indicator alive for the
+  length of every run. A bot has the queued/working badge, the live
+  progress trail, and an elapsed clock to say it is busy; borrowing
+  the human signal claimed a presence it doesn't have.
+- The server drops the frame too, so an older dispatch build stops
+  showing it the moment vroxy_web 2.95.0 is deployed rather than
+  waiting for the agent to update.
+
 ## 0.20.0
 
 ### Added

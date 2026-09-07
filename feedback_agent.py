@@ -122,11 +122,8 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.20.0"
+AGENT_VERSION      = "vroxy_dispatch 0.21.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
-# Must stay under the 4 s the room UI holds a typing state for
-# (workspace_rooms.js `noteTyping`), or the indicator flickers.
-ROOM_TYPING_INTERVAL_SECONDS = 3
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
 ROOM_BODY_MAX = 4_000
@@ -433,22 +430,6 @@ async def room_status(ws, room_id: str, reply_to: str | None, state: str) -> Non
     })
 
 
-async def room_typing(ws, room_id: str) -> None:
-    """Ephemeral "dispatch is working" frame.  Nothing persists, so a
-    run that dies just stops refreshing it."""
-    await cable_send(ws, "message", {"action": "room_typing", "room_id": room_id})
-
-
-async def room_typing_forever(ws, room_id: str) -> None:
-    """Keeps the indicator alive for the length of a Claude run.  The
-    interval is under the ~5 s the room UI holds a typing state for,
-    so it never gaps."""
-    while True:
-        try:
-            await room_typing(ws, room_id)
-        except Exception:
-            return
-        await asyncio.sleep(ROOM_TYPING_INTERVAL_SECONDS)
 
 
 # ── Prompt builder ────────────────────────────────────────────────
@@ -2373,7 +2354,6 @@ async def handle_room_message(ws, payload: dict) -> None:
     # and off the event loop because it's blocking network I/O.
     attachments = await asyncio.to_thread(download_attachments, msg)
     prompt = build_room_prompt(payload, attachments)
-    typing_task = asyncio.create_task(room_typing_forever(ws, room_id))
     loop = asyncio.get_running_loop()
     sent = 0
     truncated = False
@@ -2427,9 +2407,6 @@ async def handle_room_message(ws, payload: dict) -> None:
         result["is_error"] = True
         await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
         return
-    finally:
-        typing_task.cancel()
-
     if not raw:
         await room_reply(ws, room_id, "(I came back with an empty response.)", msg.get("hashid"))
         result["is_error"] = True
