@@ -6,6 +6,7 @@ at a real vroxy_web instance.
 """
 
 import json
+import re
 import os
 
 # Before feedback_agent is imported: it configures logging at import
@@ -141,6 +142,367 @@ class ParseProposalTest(unittest.TestCase):
         body, proposal = fa.parse_proposal(raw)
         self.assertEqual("pull_request", proposal["mode"])
         self.assertIn("Bigger change", body)
+
+
+def ask_fence(payload) -> str:
+    return "```ask\n" + json.dumps(payload) + "\n```"
+
+
+class ParseRoomAskTest(unittest.TestCase):
+    """A fenced ask is a question the room can render as buttons. A
+    fence it can't use must cost the reply nothing."""
+
+    def test_no_block_returns_the_reply_untouched(self):
+        body, ask = fa.parse_room_ask("Shipped it — 3 files, no migration.")
+        self.assertEqual("Shipped it — 3 files, no migration.", body)
+        self.assertIsNone(ask)
+
+    def test_valid_block_is_extracted_and_the_fence_is_stripped(self):
+        raw = ("Both work. Which do you want?\n\n"
+               + ask_fence({"prompt": "Ship this to master or open a PR?",
+                            "mode": "one",
+                            "options": ["Ship to master", "Open a PR"]}))
+        body, ask = fa.parse_room_ask(raw)
+        self.assertEqual("Both work. Which do you want?", body)
+        self.assertNotIn("```", body)
+        self.assertNotIn("prompt", body)
+        self.assertEqual("one", ask["mode"])
+        self.assertEqual("Ship this to master or open a PR?", ask["prompt"])
+        self.assertEqual([{"label": "Ship to master", "value": "Ship to master"},
+                          {"label": "Open a PR", "value": "Open a PR"}], ask["options"])
+
+    def test_label_value_pairs_survive(self):
+        raw = ask_fence({"prompt": "Which repo?", "mode": "one",
+                         "options": [{"label": "vroxy_web", "value": "web"},
+                                     {"label": "vroxy_mobile", "value": "mobile"}]})
+        _, ask = fa.parse_room_ask(raw)
+        self.assertEqual(["web", "mobile"], [o["value"] for o in ask["options"]])
+
+    def test_malformed_json_leaves_the_reply_alone(self):
+        raw = "Here's the question:\n```ask\n{not json,}\n```"
+        body, ask = fa.parse_room_ask(raw)
+        self.assertEqual(raw, body)
+        self.assertIsNone(ask)
+
+    def test_options_without_a_prompt_are_not_a_question(self):
+        raw = "text\n" + ask_fence({"mode": "one", "options": ["a", "b"]})
+        body, ask = fa.parse_room_ask(raw)
+        self.assertEqual(raw, body)
+        self.assertIsNone(ask)
+
+    def test_pick_one_with_no_options_is_unanswerable(self):
+        raw = "text\n" + ask_fence({"prompt": "Which?", "mode": "one", "options": []})
+        body, ask = fa.parse_room_ask(raw)
+        self.assertEqual(raw, body)
+        self.assertIsNone(ask)
+
+    def test_text_mode_needs_no_options(self):
+        raw = "What should I call it?\n\n" + ask_fence(
+            {"prompt": "What should the column be called?", "mode": "text"})
+        body, ask = fa.parse_room_ask(raw)
+        self.assertEqual("What should I call it?", body)
+        self.assertEqual("text", ask["mode"])
+        self.assertEqual([], ask["options"])
+
+    def test_thirty_options_are_cut_to_the_twelve_the_room_stores(self):
+        raw = ask_fence({"prompt": "Pick a file", "mode": "many",
+                         "options": [f"file_{i}.rb" for i in range(30)]})
+        _, ask = fa.parse_room_ask(raw)
+        self.assertEqual(12, len(ask["options"]))
+        self.assertEqual("file_0.rb", ask["options"][0]["label"])
+        self.assertEqual("file_11.rb", ask["options"][-1]["label"])
+
+    def test_duplicates_and_blanks_are_dropped_before_the_cap(self):
+        raw = ask_fence({"prompt": "Pick", "mode": "one",
+                         "options": ["a", "a", "   ", None, {"label": ""}, "b"]})
+        _, ask = fa.parse_room_ask(raw)
+        self.assertEqual(["a", "b"], [o["label"] for o in ask["options"]])
+
+    def test_unknown_mode_falls_back_to_buttons(self):
+        raw = ask_fence({"prompt": "Pick", "mode": "dropdown", "options": ["a"]})
+        _, ask = fa.parse_room_ask(raw)
+        self.assertEqual("one", ask["mode"])
+
+    def test_long_prompt_and_labels_are_capped(self):
+        raw = ask_fence({"prompt": "p" * 900, "mode": "one",
+                         "options": ["l" * 400]})
+        _, ask = fa.parse_room_ask(raw)
+        self.assertEqual(fa.ASK_PROMPT_MAX, len(ask["prompt"]))
+        self.assertEqual(fa.ASK_LABEL_MAX, len(ask["options"][0]["label"]))
+
+    def test_oversized_block_is_left_as_text(self):
+        raw = "here\n" + ask_fence({"prompt": "Pick", "mode": "one",
+                                    "options": ["x" * 30_000]})
+        body, ask = fa.parse_room_ask(raw)
+        self.assertEqual(raw, body)
+        self.assertIsNone(ask)
+
+    def test_a_json_array_is_not_an_ask(self):
+        body, ask = fa.parse_room_ask("```ask\n{}\n```")
+        self.assertIsNone(ask)
+        self.assertEqual("```ask\n{}\n```", body)
+
+    def test_reply_that_is_only_a_fence_still_carries_the_question(self):
+        raw = ask_fence({"prompt": "Ship or PR?", "mode": "one",
+                         "options": ["Ship", "PR"]})
+        body, ask = fa.parse_room_ask(raw)
+        self.assertEqual("", body)
+        self.assertIn("Ship or PR?", fa.ask_fallback(body, ask))
+
+
+class AskFallbackTest(unittest.TestCase):
+    """The widget and older mobile builds render no buttons at all,
+    so the question has to survive as something typeable."""
+
+    ASK = {"prompt": "Ship this to master or open a PR?", "mode": "one",
+           "options": [{"label": "Ship to master", "value": "ship"},
+                       {"label": "Open a PR", "value": "pr"}]}
+
+    def test_prose_that_says_none_of_it_gets_the_whole_question(self):
+        out = fa.ask_fallback("Both are fine.", self.ASK)
+        self.assertIn("Both are fine.", out)
+        self.assertIn("Ship this to master or open a PR?", out)
+        self.assertIn("1. Ship to master", out)
+        self.assertIn("2. Open a PR", out)
+        self.assertIn(fa.ASK_FALLBACK_HINT, out)
+
+    def test_prose_that_already_says_all_of_it_is_left_alone(self):
+        prose = ("Ship this to master or open a PR? Ship to master is fine "
+                 "for three files; Open a PR if you want eyes on it.")
+        self.assertEqual(prose, fa.ask_fallback(prose, self.ASK))
+
+    def test_prose_that_asks_but_never_names_the_options_gets_the_list(self):
+        prose = "Ship this to master or open a PR?"
+        out = fa.ask_fallback(prose, self.ASK)
+        self.assertEqual(1, out.count("Ship this to master or open a PR?"))
+        self.assertIn("1. Ship to master", out)
+
+    def test_whitespace_and_case_do_not_defeat_the_check(self):
+        prose = "ship this to MASTER\n   or open a pr?  Ship to master. Open a PR."
+        self.assertEqual(prose.strip(), fa.ask_fallback(prose, self.ASK))
+
+    def test_text_mode_appends_the_prompt_with_no_numbered_list(self):
+        ask = {"prompt": "What should the column be called?", "mode": "text",
+               "options": []}
+        out = fa.ask_fallback("Need a name for it.", ask)
+        self.assertIn("What should the column be called?", out)
+        self.assertNotIn("1.", out)
+        self.assertNotIn(fa.ASK_FALLBACK_HINT, out)
+
+
+def frames_of(link, action):
+    out = []
+    for frame in link.outbox:
+        data = json.loads(json.loads(frame)["data"])
+        if data.get("action") == action:
+            out.append(data)
+    return out
+
+
+async def wait_for_replies(link, count):
+    for _ in range(5000):
+        if len(frames_of(link, "room_reply")) >= count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"expected {count} room_reply frames, "
+                         f"saw {len(frames_of(link, 'room_reply'))}")
+
+
+async def ack_each_reply(link, room_id, hashids):
+    """Answers each `room_reply` the way the server does — one
+    `room_reply.posted` per posted chunk, in order."""
+    for i, hashid in enumerate(hashids, 1):
+        await wait_for_replies(link, i)
+        fa.note_posted_message(room_id, hashid)
+
+
+class PostRoomReplyTest(unittest.IsolatedAsyncioTestCase):
+    """An ask hangs off a message hashid, and only the server knows
+    it. A split reply produces several — the ask belongs to the last,
+    or the buttons render in the middle of the answer."""
+
+    ASK = {"prompt": "Ship or PR?", "mode": "one",
+           "options": [{"label": "Ship", "value": "ship"},
+                       {"label": "PR", "value": "pr"}]}
+
+    async def asyncSetUp(self):
+        self._timeout = fa.ROOM_REPLY_ACK_TIMEOUT_SECONDS
+        fa.ROOM_REPLY_ACK_TIMEOUT_SECONDS = 0.2
+        fa._posted_message_acks.clear()
+
+    async def asyncTearDown(self):
+        fa.ROOM_REPLY_ACK_TIMEOUT_SECONDS = self._timeout
+        fa._posted_message_acks.clear()
+
+    async def test_the_last_chunk_is_the_one_returned(self):
+        link = fa.CableLink()
+        feeder = asyncio.create_task(
+            ack_each_reply(link, "rm123456", ["ms000001", "ms000002", "ms000003"]))
+        posted = await fa.post_room_reply(link, "rm123456", ["one", "two", "three"],
+                                          "ms123456")
+        await feeder
+        self.assertEqual("ms000003", posted)
+        self.assertEqual(["one", "two", "three"],
+                         [f["body"] for f in frames_of(link, "room_reply")])
+
+    async def test_the_ask_lands_on_the_final_chunk(self):
+        link = fa.CableLink()
+        feeder = asyncio.create_task(
+            ack_each_reply(link, "rm123456", ["ms000001", "ms000002"]))
+        posted = await fa.post_room_reply(link, "rm123456", ["first half", "second half"])
+        await feeder
+        await fa.room_ask(link, "rm123456", posted, self.ASK)
+
+        asks = frames_of(link, "room_ask")
+        self.assertEqual(1, len(asks))
+        self.assertEqual("ms000002", asks[0]["message_id"],
+                         "an ask on an earlier chunk renders mid-reply")
+        self.assertEqual("one", asks[0]["mode"])
+        self.assertEqual([{"label": "Ship", "value": "ship"},
+                          {"label": "PR", "value": "pr"}], asks[0]["options"])
+        self.assertEqual("Ship or PR?", asks[0]["prompt"])
+
+    async def test_a_server_that_never_acks_still_gets_the_reply(self):
+        link = fa.CableLink()
+        started = time.monotonic()
+        posted = await fa.post_room_reply(link, "rm123456", ["a", "b", "c"])
+        elapsed = time.monotonic() - started
+
+        self.assertIsNone(posted)
+        self.assertEqual(["a", "b", "c"], [f["body"] for f in frames_of(link, "room_reply")],
+                         "the reply must survive a server that can't name it")
+        self.assertLess(elapsed, fa.ROOM_REPLY_ACK_TIMEOUT_SECONDS * 3,
+                        "one timeout for the turn, not one per chunk")
+
+    async def test_no_hashid_means_no_ask_frame(self):
+        link = fa.CableLink()
+        await fa.room_ask(link, "rm123456", None, self.ASK)
+        self.assertEqual([], frames_of(link, "room_ask"))
+
+    async def test_an_ack_that_stops_arriving_midway_drops_the_ask(self):
+        link = fa.CableLink()
+        feeder = asyncio.create_task(ack_each_reply(link, "rm123456", ["ms000001"]))
+        posted = await fa.post_room_reply(link, "rm123456", ["one", "two"])
+        await feeder
+        self.assertIsNone(posted, "hanging the ask on chunk one would render it mid-reply")
+
+    async def test_a_duplicate_ack_is_not_mistaken_for_the_next_chunks(self):
+        link = fa.CableLink()
+
+        async def feeder():
+            await wait_for_replies(link, 1)
+            fa.note_posted_message("rm123456", "ms000001")
+            fa.note_posted_message("rm123456", "ms_DUPLICATE")
+            await wait_for_replies(link, 2)
+            fa.note_posted_message("rm123456", "ms000002")
+
+        task = asyncio.create_task(feeder())
+        posted = await fa.post_room_reply(link, "rm123456", ["one", "two"])
+        await task
+        self.assertEqual("ms000002", posted,
+                         "each chunk waits for its OWN acknowledgement")
+
+    async def test_an_ack_for_a_room_nobody_is_waiting_on_is_dropped(self):
+        fa.note_posted_message("rm999999", "ms000001")
+        self.assertEqual({}, fa._posted_message_acks)
+
+
+class HandleRoomMessageAskTest(unittest.IsolatedAsyncioTestCase):
+    """The whole path: Claude emits a fence, the room gets prose, and
+    the question hangs off the message the prose landed in."""
+
+    async def asyncSetUp(self):
+        self._run = fa.run_claude_streamed
+        self._timeout = fa.ROOM_REPLY_ACK_TIMEOUT_SECONDS
+        fa.ROOM_REPLY_ACK_TIMEOUT_SECONDS = 0.2
+        fa._posted_message_acks.clear()
+
+    async def asyncTearDown(self):
+        fa.run_claude_streamed = self._run
+        fa.ROOM_REPLY_ACK_TIMEOUT_SECONDS = self._timeout
+        fa._posted_message_acks.clear()
+
+    def answer_with_ask(self, prose):
+        return prose + "\n\n```ask\n" + json.dumps(
+            {"prompt": "Ship this to master or open a PR?", "mode": "one",
+             "options": ["Ship to master", "Open a PR"]}) + "\n```"
+
+    async def test_the_fence_becomes_prose_and_an_ask_on_the_reply(self):
+        link = fa.CableLink()
+        fa.run_claude_streamed = lambda *a, **k: self.answer_with_ask("Three files, no migration.")
+
+        feeder = asyncio.create_task(ack_each_reply(link, "rm123456", ["ms000009"]))
+        await fa.handle_room_message(link, ROOM_PAYLOAD)
+        await feeder
+
+        replies = frames_of(link, "room_reply")
+        self.assertEqual(1, len(replies))
+        self.assertNotIn("```", replies[0]["body"])
+        self.assertIn("Three files, no migration.", replies[0]["body"])
+        self.assertIn("Ship this to master or open a PR?", replies[0]["body"])
+        self.assertIn("1. Ship to master", replies[0]["body"])
+        self.assertEqual("ms123456", replies[0]["reply_to"])
+
+        asks = frames_of(link, "room_ask")
+        self.assertEqual(1, len(asks))
+        self.assertEqual("ms000009", asks[0]["message_id"])
+        self.assertEqual("rm123456", asks[0]["room_id"])
+
+    async def test_a_server_that_never_acks_keeps_the_reply(self):
+        link = fa.CableLink()
+        fa.run_claude_streamed = lambda *a, **k: self.answer_with_ask("Three files.")
+
+        await fa.handle_room_message(link, ROOM_PAYLOAD)
+
+        replies = frames_of(link, "room_reply")
+        self.assertEqual(1, len(replies))
+        self.assertIn("Ship this to master or open a PR?", replies[0]["body"],
+                      "the prose fallback is the whole degraded path")
+        self.assertEqual([], frames_of(link, "room_ask"))
+
+    async def test_an_answer_with_no_fence_sends_no_ask(self):
+        link = fa.CableLink()
+        fa.run_claude_streamed = lambda *a, **k: "We're on 2.86.1."
+
+        feeder = asyncio.create_task(ack_each_reply(link, "rm123456", ["ms000009"]))
+        await fa.handle_room_message(link, ROOM_PAYLOAD)
+        await feeder
+
+        self.assertEqual(["We're on 2.86.1."],
+                         [f["body"] for f in frames_of(link, "room_reply")])
+        self.assertEqual([], frames_of(link, "room_ask"))
+
+
+class RoomReplyPostedFrameTest(unittest.IsolatedAsyncioTestCase):
+    """The frame arrives on the socket reader while the worker is
+    mid-turn, so the stream loop has to route it."""
+
+    async def asyncSetUp(self):
+        self._saved_queue = fa._work_queue
+        fa._work_queue = asyncio.Queue()
+        fa._posted_message_acks.clear()
+
+    async def asyncTearDown(self):
+        fa._work_queue = self._saved_queue
+        fa._posted_message_acks.clear()
+
+    async def test_the_stream_loop_records_the_hashid(self):
+        queue = asyncio.Queue()
+        fa._posted_message_acks["rm123456"] = queue
+
+        class OneFrameSocket(FakeSocket):
+            def __aiter__(self):
+                async def gen():
+                    yield json.dumps({"identifier": fa.CHANNEL_IDENTIFIER,
+                                      "message": {"type": "room_reply.posted",
+                                                  "room_id": "rm123456",
+                                                  "message_id": "ms000042"}})
+                return gen()
+
+        await fa.process_stream(fa.CableLink(), OneFrameSocket())
+        self.assertEqual("ms000042", queue.get_nowait())
+        self.assertTrue(fa._work_queue.empty(),
+                        "an acknowledgement is not a unit of work")
 
 
 ROOM_PAYLOAD = {
@@ -1217,6 +1579,114 @@ class AnnounceRestartTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCase):
         await fa.announce_restart(link)
         await fa.announce_restart(link)
         self.assertEqual(1, len(sent_bodies(link)))
+
+
+class StreamLinesStallTest(unittest.TestCase):
+    """`_stream_lines` is the only thing standing between a wedged
+    claude and a room that waits forever."""
+
+    def setUp(self):
+        self._real = fa.STALL_SECONDS
+        fa.STALL_SECONDS = 0.05
+
+    def tearDown(self):
+        fa.STALL_SECONDS = self._real
+
+    def test_lines_pass_through_in_order_then_stop_at_eof(self):
+        proc = FakeProc(["a\n", "b\n"])
+        self.assertEqual(["a\n", "b\n"], list(fa._stream_lines(proc)))
+
+    def test_silence_yields_a_stall_marker_per_window(self):
+        proc = FakeProc(["a\n"], delay_before_last=0.18)
+        got = list(fa._stream_lines(proc))
+        self.assertGreaterEqual(got.count(fa._STALLED), 2)
+        self.assertEqual(["a\n"], [g for g in got if g is not fa._STALLED])
+
+    def test_a_stream_that_never_ends_still_lets_the_caller_out(self):
+        proc = FakeProc([], never_eof=True)
+        seen = 0
+        for item in fa._stream_lines(proc):
+            self.assertIs(fa._STALLED, item)
+            seen += 1
+            if seen == 3:
+                break
+        self.assertEqual(3, seen)
+
+
+class FakeProc:
+    """Stands in for Popen: a readable stdout and a poll()."""
+
+    def __init__(self, lines, delay_before_last=0.0, never_eof=False):
+        self._lines = list(lines)
+        self._delay = delay_before_last
+        self._never_eof = never_eof
+        self.stdout = self
+        self.pid = os.getpid()
+        self.returncode = None
+
+    def __iter__(self):
+        for line in self._lines:
+            yield line
+        if self._delay:
+            time.sleep(self._delay)
+        while self._never_eof:
+            time.sleep(0.01)
+
+    def poll(self):
+        return self.returncode
+
+
+class StallCeilingTest(unittest.TestCase):
+    """The 90 s ceiling is a rule, not a suggestion — every wait in
+    this process is derived from it, so a regression that raises one
+    of them fails here."""
+
+    def test_the_ceiling_is_ninety_seconds(self):
+        self.assertEqual(90, fa.STALL_SECONDS)
+
+    def test_the_hard_cap_is_the_ceiling_times_the_window_count(self):
+        self.assertEqual(fa.STALL_SECONDS * fa.STALL_WINDOWS_BEFORE_KILL,
+                         fa.SUBPROCESS_HARD_CAP_SECONDS)
+
+    def test_no_subprocess_wait_in_the_module_outruns_the_hard_cap(self):
+        source = Path(fa.__file__).read_text()
+        literals = [int(m) for m in re.findall(r"timeout=(\d+)", source)]
+        self.assertTrue(literals)
+        worst = max(literals)
+        self.assertLessEqual(
+            worst, fa.SUBPROCESS_HARD_CAP_SECONDS,
+            f"a literal timeout={worst} exceeds the "
+            f"{fa.SUBPROCESS_HARD_CAP_SECONDS}s cap — background it and poll instead")
+
+    def test_the_room_prompt_carries_the_ceiling(self):
+        self.assertIn("90 SECONDS", fa.ROOM_SYSTEM_PROMPT)
+        self.assertIn("timeout: 90000", fa.ROOM_SYSTEM_PROMPT)
+
+
+class StallTrailTest(unittest.TestCase):
+    """A stalled run must reach the room; silence rendered as nothing
+    is the bug the whole ceiling exists to prevent."""
+
+    def setUp(self):
+        self.lines = []
+        self.trail = fa.ProgressTrail(lambda kind, text: self.lines.append((kind, text)))
+
+    def test_a_stall_becomes_a_visible_trail_line(self):
+        self.trail.feed({"type": "stalled", "seconds": 90,
+                         "window": 1, "max_windows": 4})
+        self.assertEqual([("stalled", "still working — nothing back for 90s")],
+                         self.lines)
+
+    def test_the_last_window_says_it_is_giving_up(self):
+        self.trail.feed({"type": "stalled", "seconds": 360,
+                         "window": 4, "max_windows": 4})
+        self.assertIn("giving up", self.lines[-1][1])
+
+    def test_held_narration_is_flushed_before_the_stall_line(self):
+        self.trail.feed({"type": "text_delta", "text": "Running the suite."})
+        self.trail.feed({"type": "stalled", "seconds": 90,
+                         "window": 1, "max_windows": 4})
+        self.assertEqual(["text", "stalled"], [kind for kind, _ in self.lines])
 
 
 if __name__ == "__main__":

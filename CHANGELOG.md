@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.16.0
+
+- **Nothing waits on a response for more than 90 seconds.** The
+  streamed run had no timeout at all: iterating `proc.stdout` blocks
+  with no way out, so a wedged claude — a hung tool call, a dead
+  network read — held dispatch open forever behind a typing indicator
+  and the asker never heard back. A daemon thread now does the
+  blocking read and the run loop waits on a queue it can time out.
+- Every window of silence is reported to the room ("still working —
+  nothing back for 90s") instead of rendering as nothing.
+  `STALL_WINDOWS_BEFORE_KILL` consecutive windows means wedged, not
+  thinking: the process group is killed (SIGTERM, then SIGKILL) and
+  whatever the run did produce is returned with a note. The claude
+  subprocess gets its own session so the kill can't reach dispatch.
+- The two blind-wait paths — the non-streamed fallback (was 1800 s)
+  and the git helper (was 300 s) — now share one
+  `SUBPROCESS_HARD_CAP_SECONDS`, and a test fails if any timeout
+  literal in the module climbs back over it.
+- **The room prompt teaches the ceiling.** Every Bash call gets
+  `timeout: 90000` or less; run the tests that cover the change, never
+  the whole suite; background anything genuinely long and poll it
+  rather than raising the timeout. Whole-suite runs (`bin/system-test`
+  with no argument at 144 s, bare `bash ./test.sh`) were the single
+  biggest chunk of a room turn's wall clock.
+- Room messages log 1000 characters instead of 80 — reconstructing
+  what was actually asked was impossible from an 80-character prefix.
+- **The ask buttons are wired end to end.** `room_reply` echoes
+  `room_reply.posted` with the hashid it just created, `post_room_reply`
+  waits for each chunk's acknowledgement so the ask hangs off the
+  message that *ends* the reply, and `room_ask` emits against it. A
+  server that never acknowledges costs one timeout and the ask, never
+  the reply.
+
+## 0.15.0
+
+- **Claude can ask the room a question instead of guessing.** A reply
+  may end with a fenced ` ```ask ` block declaring a prompt, a mode
+  (`one` / `many` / `text`) and its options; the room prompt teaches
+  the shape with one example, which is what makes it fire at all.
+- The fence never reaches the room. `parse_room_ask` strips it and
+  `ask_fallback` appends only what the prose left out — the prompt if
+  it wasn't restated, a numbered option list if the options weren't
+  named. The widget and mobile builds that render no buttons still get
+  a question someone can answer by typing "2".
+- **The reply always survives the ask.** Unparseable JSON, a non-object,
+  a block over 20 KB, a missing prompt, or no options in a mode that
+  needs them all leave the raw text exactly as the model wrote it, and
+  the whole parse is wrapped so nothing it does can end a run. Options
+  normalize to `RoomAsk`'s own caps (12 options, 120-char labels,
+  500-char prompt) so what the fallback lists is what the room stores.
+- 19 tests for the two functions.
+- **Buttons are not wired up yet.** `AdminFeedbackChannel#room_ask`
+  needs the hashid of the message the question hangs under, and nothing
+  reports the hashid of a reply dispatch just posted: `room_reply`
+  returns nothing, `/api/v1` has no rooms endpoint, `RoomChannel`
+  rejects a connection with no `current_user`, and the bot's own post
+  never re-broadcasts. Emitting `room_ask` is a few lines once
+  `room_reply` echoes the posted hashid back.
+
 ## 0.14.0
 
 - **The narration between tool calls now reaches the room.** It was

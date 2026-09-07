@@ -58,11 +58,13 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 import uuid
 from logging.handlers import RotatingFileHandler
+from queue import Empty, SimpleQueue
 from pathlib import Path
 from typing import Any
 
@@ -119,7 +121,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.14.0"
+AGENT_VERSION      = "vroxy_dispatch 0.16.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -127,6 +129,11 @@ ROOM_TYPING_INTERVAL_SECONDS = 3
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
 ROOM_BODY_MAX = 4_000
+
+ROOM_LOG_BODY_MAX = 1_000
+STALL_SECONDS               = int(os.environ.get("VROXY_STALL_SECONDS", "90"))
+STALL_WINDOWS_BEFORE_KILL   = int(os.environ.get("VROXY_STALL_WINDOWS", "4"))
+SUBPROCESS_HARD_CAP_SECONDS = STALL_SECONDS * STALL_WINDOWS_BEFORE_KILL
 
 # Mutable status reported on each heartbeat.  Updated by the worker
 # as it moves through feedback / apply lifecycles so the admin UI
@@ -323,6 +330,72 @@ async def room_reply(ws, room_id: str, body: str, reply_to: str | None = None) -
     log.info("Room reply sent room=%s body=%.80s", room_id, body)
 
 
+ROOM_REPLY_ACK_TIMEOUT_SECONDS = 10
+
+_posted_message_acks: dict[str, asyncio.Queue] = {}
+
+
+def note_posted_message(room_id: str, message_id: str) -> None:
+    """Records the `room_reply.posted` acknowledgement the server
+    transmits to this subscriber alone, naming the message it just
+    created.  Dropped when no turn is waiting on that room."""
+    queue = _posted_message_acks.get(str(room_id or ""))
+    if queue is None or not message_id:
+        return
+    queue.put_nowait(str(message_id))
+
+
+async def post_room_reply(ws, room_id: str, chunks: list[str],
+                          reply_to: str | None = None) -> str | None:
+    """Posts every chunk of an answer and returns the hashid of the
+    LAST one, which is the only message an ask may hang off.
+
+    Each chunk waits for its own acknowledgement before the next goes
+    out, so the hashid returned belongs to the chunk that ends the
+    reply.  A server that never answers costs one timeout, not one per
+    chunk, and costs the ask rather than the reply."""
+    queue: asyncio.Queue = asyncio.Queue()
+    _posted_message_acks[room_id] = queue
+    posted: str | None = None
+    expect_acks = True
+    try:
+        for chunk in chunks:
+            while not queue.empty():
+                queue.get_nowait()
+            await room_reply(ws, room_id, chunk, reply_to)
+            if not expect_acks:
+                continue
+            try:
+                posted = await asyncio.wait_for(queue.get(),
+                                                ROOM_REPLY_ACK_TIMEOUT_SECONDS)
+            except (asyncio.TimeoutError, TimeoutError):
+                log.warning("No room_reply.posted for room=%s in %ss — "
+                            "the reply stands, the ask is dropped",
+                            room_id, ROOM_REPLY_ACK_TIMEOUT_SECONDS)
+                posted, expect_acks = None, False
+    finally:
+        _posted_message_acks.pop(room_id, None)
+    return posted
+
+
+async def room_ask(ws, room_id: str, message_id: str | None, ask: dict | None) -> None:
+    """`AdminFeedbackChannel#room_ask` — turns the question into
+    buttons under the message it names.  No message to hang it on
+    means no question; the prose fallback already carries it."""
+    if not message_id or not ask:
+        return
+    await cable_send(ws, "message", {
+        "action":     "room_ask",
+        "room_id":    room_id,
+        "message_id": message_id,
+        "prompt":     ask["prompt"],
+        "mode":       ask["mode"],
+        "options":    ask["options"],
+    })
+    log.info("Room ask sent room=%s message=%s mode=%s options=%d",
+             room_id, message_id, ask["mode"], len(ask["options"]))
+
+
 async def room_status(ws, room_id: str, reply_to: str | None, state: str) -> None:
     """`queued` when it lands on the work queue, `working` when the
     worker picks it up.  One in-flight run at a time means a request
@@ -432,6 +505,41 @@ How to behave here:
   in which files.  Do NOT commit or push unless asked explicitly.
 - If a request is ambiguous, ask the one question that unblocks you
   rather than guessing.
+
+NEVER BLOCK LONGER THAN 90 SECONDS ON ONE COMMAND.  Someone is
+watching a typing indicator while you work, so a wait they can't see
+the end of is the worst thing you can do to them.
+
+- Every Bash call you make gets `timeout: 90000` or less.  If a
+  command needs longer than that, you are running the wrong command.
+- Run the tests that cover your change — the specific files — never
+  the whole suite.  No `bin/system-test` with no argument, no bare
+  `bash ./test.sh`, no full `bin/test`.  CI runs everything on push;
+  a local full pass buys you nothing but the user's patience.
+- When something genuinely has to take minutes (a full suite you were
+  ASKED for, a build, waiting on a deploy), do NOT raise the timeout.
+  Background it and poll:
+
+      nohup bin/test test/models/foo_test.rb > /tmp/t.log 2>&1 &
+
+  then come back to `tail /tmp/t.log` between other work.  Do real
+  work in the gaps; never sleep waiting.
+- If you hit the ceiling anyway, say so in the room and move on to
+  the next thing rather than retrying the same long command.
+- When that question has a small set of answers, ask it in your prose
+  AND end the reply with one fenced `ask` block — the room turns it
+  into buttons:
+
+  ```ask
+  {"prompt": "Ship this to master or open a PR?",
+   "mode": "one",
+   "options": ["Ship to master", "Open a PR"]}
+  ```
+
+  `mode` is `one` (pick one), `many` (pick several), or `text` (a
+  free-text box, `options` omitted).  Twelve options at most, one
+  block per reply, last thing in the message.  Keep asking in the
+  prose too: not every surface draws the buttons.
 
 The conversation so far is below.  Reply with only your message —
 no "Dispatch:" prefix, no fenced proposal block.
@@ -851,6 +959,63 @@ def _resolve_claude_bin() -> str:
     raise FileNotFoundError("`claude` binary not found. Set CLAUDE_BIN or put it on PATH.")
 
 
+_STALLED = object()
+
+
+def _stream_lines(proc):
+    """Yield each stdout line of `proc`, and `_STALLED` once per
+    STALL_SECONDS that pass without one.
+
+    Iterating `proc.stdout` directly blocks with no way out: a claude
+    run that wedges — a hung tool call, a dead network read — held
+    dispatch open forever with a typing indicator and no answer.  A
+    daemon thread does the blocking read so the caller only ever waits
+    on a queue it can time out."""
+    lines: SimpleQueue = SimpleQueue()
+
+    def pump():
+        try:
+            for raw in proc.stdout:
+                lines.put(raw)
+        except Exception:
+            log.exception("stdout pump raised")
+        finally:
+            lines.put(None)
+
+    reader = threading.Thread(target=pump, name="claude-stdout", daemon=True)
+    reader.start()
+    while True:
+        try:
+            item = lines.get(timeout=STALL_SECONDS)
+        except Empty:
+            yield _STALLED
+            continue
+        if item is None:
+            return
+        yield item
+
+
+def _kill_process_tree(proc) -> None:
+    """SIGTERM the whole group, then SIGKILL what ignored it.  Claude
+    spawns its tools as children; killing only the parent leaves a
+    wedged `bin/test` holding the database."""
+    for sig, grace in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.send_signal(sig)
+            except (ProcessLookupError, OSError):
+                return
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def run_claude_streamed(prompt: str, project: str, on_event,
                         allow_resume: bool = True,
                         session_key: str | None = None,
@@ -890,6 +1055,7 @@ def run_claude_streamed(prompt: str, project: str, on_event,
     proc = subprocess.Popen(
         argv, cwd=work_dir, env=os.environ.copy(),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+        start_new_session=True,
     )
 
     final_text_chunks: list[str] = []
@@ -899,9 +1065,29 @@ def run_claude_streamed(prompt: str, project: str, on_event,
     tool_calls = 0
     text_chars = 0
     thinking_chars = 0
+    stalled_windows = 0
+    killed_for_stall = False
 
     try:
-        for raw in proc.stdout:
+        for raw in _stream_lines(proc):
+            if raw is _STALLED:
+                stalled_windows += 1
+                waited = stalled_windows * STALL_SECONDS
+                log.warning("claude produced nothing for %ss (window %s/%s)",
+                            waited, stalled_windows, STALL_WINDOWS_BEFORE_KILL)
+                try:
+                    on_event({"type": "stalled", "seconds": waited,
+                              "window": stalled_windows,
+                              "max_windows": STALL_WINDOWS_BEFORE_KILL})
+                except Exception:
+                    log.exception("on_event stalled raised")
+                if stalled_windows >= STALL_WINDOWS_BEFORE_KILL:
+                    killed_for_stall = True
+                    log.error("killing wedged claude run after %ss of silence", waited)
+                    _kill_process_tree(proc)
+                    break
+                continue
+            stalled_windows = 0
             line = raw.strip()
             if not line:
                 continue
@@ -981,11 +1167,17 @@ def run_claude_streamed(prompt: str, project: str, on_event,
                 except Exception:
                     log.exception("on_event result raised")
 
-        proc.wait(timeout=30)
+        try:
+            proc.wait(timeout=STALL_SECONDS)
+        except subprocess.TimeoutExpired:
+            log.error("claude closed stdout but would not exit — killing")
+            _kill_process_tree(proc)
     finally:
         if proc.stdout: proc.stdout.close()
         stderr_text = ""
         if proc.stderr:
+            if proc.poll() is None:
+                _kill_process_tree(proc)
             stderr_text = proc.stderr.read() or ""
             if stderr_text:
                 log.info("claude stderr: %s", stderr_text[:400])
@@ -996,6 +1188,16 @@ def run_claude_streamed(prompt: str, project: str, on_event,
         log.warning("streamed claude rc=%s", proc.returncode)
 
     produced_nothing = not final_text_chunks and tool_calls == 0
+
+    if killed_for_stall:
+        waited = STALL_SECONDS * STALL_WINDOWS_BEFORE_KILL
+        reason = (f"the run produced nothing for {waited}s, so I killed it as "
+                  f"wedged rather than leave you waiting")
+        if produced_nothing:
+            raise RuntimeError(reason)
+        log.warning("returning partial output from a stalled run")
+        partial = "".join(final_text_chunks).strip()
+        return f"{partial}\n\n⚠️ Cut short — {reason}.".strip()
 
     if resumed and failed and produced_nothing:
         log.warning("resume produced nothing (rc=%s) — dropping stale session "
@@ -1061,6 +1263,9 @@ class ProgressTrail:
         elif etype == "thinking":
             self._flush()
             self._emit("thinking", _one_line(event.get("text") or "", self._text_max))
+        elif etype == "stalled":
+            self._flush()
+            self._emit("stalled", _stall_line(event))
 
     def _flush(self) -> None:
         joined = " ".join(self._held).strip()
@@ -1096,7 +1301,11 @@ def run_claude(prompt: str, project: str, work_dir_override: Path | None = None)
     """Blocking subprocess to `claude-chat` — fallback path when
     the streamed run crashes (broken CLI flag on a Claude Code
     upgrade, etc.).  Called from a thread so the asyncio loop
-    keeps ticking."""
+    keeps ticking.
+
+    There is no stream here to watch for silence, so this path gets
+    the flat hard cap instead of the stall detector — which is the
+    other reason the streamed path is the default."""
     work_dir = str(work_dir_override or (CODE_ROOT / project))
     if not Path(work_dir).is_dir():
         raise FileNotFoundError(
@@ -1116,7 +1325,7 @@ def run_claude(prompt: str, project: str, work_dir_override: Path | None = None)
         env=env,
         capture_output=True,
         text=True,
-        timeout=1800,
+        timeout=SUBPROCESS_HARD_CAP_SECONDS,
     )
     if result.returncode != 0:
         log.warning("claude-chat rc=%s stderr=%.500s", result.returncode, result.stderr)
@@ -1569,7 +1778,8 @@ def safe_target(project_dir: Path, path: str) -> Path:
 
 def _run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
     """Small subprocess helper — returncode, stdout, stderr."""
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=300)
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                       timeout=SUBPROCESS_HARD_CAP_SECONDS)
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
@@ -1723,6 +1933,17 @@ def _progress_line(name: str, input_dict: dict | None) -> str:
                 detail = value.strip().splitlines()[0][:120]
                 break
     return f"{name}({detail})" if detail else str(name)
+
+
+def _stall_line(event: dict) -> str:
+    """What the room sees when a run goes quiet.  Silence is the one
+    thing a progress trail must never render as nothing."""
+    seconds = int(event.get("seconds") or STALL_SECONDS)
+    window  = int(event.get("window") or 1)
+    limit   = int(event.get("max_windows") or STALL_WINDOWS_BEFORE_KILL)
+    if window >= limit:
+        return f"no output for {seconds}s — giving up on this run"
+    return f"still working — nothing back for {seconds}s"
 
 
 async def _emit_room_run(ws, room_id: str, reply_to: str | None,
@@ -1944,6 +2165,108 @@ def split_room_body(text: str, limit: int = ROOM_BODY_MAX) -> list[str]:
     return [c for c in chunks if c]
 
 
+# ── Clickable questions ───────────────────────────────────────────
+ASK_FENCE_RE    = re.compile(r"```ask\s*(\{.*?\})\s*```", re.DOTALL)
+ASK_MODES       = ("one", "many", "text")
+ASK_MAX_OPTIONS = 12
+ASK_LABEL_MAX   = 120
+ASK_PROMPT_MAX  = 500
+ASK_JSON_MAX    = 20_000
+ASK_FALLBACK_HINT = "Reply with a number or the option, whichever is easier."
+
+
+def _flatten(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def _ask_options(raw) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    options: list[dict] = []
+    seen: set[str] = set()
+    for opt in raw:
+        if isinstance(opt, dict):
+            label, value = opt.get("label"), opt.get("value")
+        else:
+            label = value = opt
+        if isinstance(label, (dict, list)) or isinstance(value, (dict, list)):
+            continue
+        label = str("" if label is None else label).strip()[:ASK_LABEL_MAX]
+        if not label:
+            continue
+        value = str("" if value is None else value).strip()[:ASK_LABEL_MAX] or label
+        if value in seen:
+            continue
+        seen.add(value)
+        options.append({"label": label, "value": value})
+        if len(options) == ASK_MAX_OPTIONS:
+            break
+    return options
+
+
+def _parse_room_ask(raw: str) -> tuple[str, dict | None]:
+    match = ASK_FENCE_RE.search(raw or "")
+    if not match:
+        return raw, None
+
+    blob = match.group(1)
+    if len(blob) > ASK_JSON_MAX:
+        log.warning("Ask block is %d chars — leaving it as text", len(blob))
+        return raw, None
+    try:
+        declared = json.loads(blob)
+    except ValueError as e:
+        log.warning("Ask JSON invalid: %s — leaving it as text", e)
+        return raw, None
+    if not isinstance(declared, dict):
+        return raw, None
+
+    prompt  = str(declared.get("prompt") or "").strip()[:ASK_PROMPT_MAX]
+    mode    = str(declared.get("mode") or "one").strip().lower()
+    mode    = mode if mode in ASK_MODES else "one"
+    options = _ask_options(declared.get("options"))
+    if not prompt or (not options and mode != "text"):
+        log.warning("Ask block unusable (mode=%s, %d options) — leaving it as text",
+                    mode, len(options))
+        return raw, None
+
+    return ASK_FENCE_RE.sub("", raw).strip(), {
+        "prompt": prompt, "mode": mode, "options": options,
+    }
+
+
+def parse_room_ask(raw: str) -> tuple[str, dict | None]:
+    """Splits Claude's room answer into (body, ask_or_None), with the
+    fence stripped out of the body.  A block this can't turn into a
+    renderable question leaves the raw text exactly as it came."""
+    try:
+        return _parse_room_ask(raw)
+    except Exception as e:
+        log.warning("Ask parse failed (%s: %s) — leaving it as text", type(e).__name__, e)
+        return raw, None
+
+
+def ask_fallback(body: str, ask: dict) -> str:
+    """The question restated in prose, so a surface that renders no
+    buttons is still answerable by typing.  Appends only what the
+    model's own prose left out."""
+    body = (body or "").strip()
+    said = _flatten(body)
+    blocks: list[str] = []
+
+    if _flatten(ask["prompt"]) not in said:
+        blocks.append(ask["prompt"])
+    if any(_flatten(o["label"]) not in said for o in ask["options"]):
+        blocks.append("\n".join(f"{i}. {o['label']}"
+                                for i, o in enumerate(ask["options"], 1)))
+        blocks.append(ASK_FALLBACK_HINT)
+
+    if not blocks:
+        return body
+    tail = "\n\n".join(blocks)
+    return f"{body}\n\n{tail}" if body else tail
+
+
 async def handle_room_message(ws, payload: dict) -> None:
     """`room.message` handler — dispatch's turn in a workspace room.
 
@@ -1959,8 +2282,9 @@ async def handle_room_message(ws, payload: dict) -> None:
         return
 
     body = (msg.get("body") or "").strip()
-    log.info("Handling room message room=%s (#%s) from=%s body=%.80s",
-             room_id, room.get("name"), sender.get("name"), body)
+    log.info("Handling room message room=%s (#%s) from=%s body=%s",
+             room_id, room.get("name"), sender.get("name"),
+             _one_line(body, ROOM_LOG_BODY_MAX))
 
     command = room_command(body)
     if command:
@@ -2025,11 +2349,21 @@ async def handle_room_message(ws, payload: dict) -> None:
         await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
         return
 
+    body_text, ask = parse_room_ask(raw)
+    if ask:
+        body_text = ask_fallback(body_text, ask)
+
     # Threaded under the message that asked.  A room where three
     # people are talking at once is unreadable when the answers float
     # free of their questions.
-    for chunk in split_room_body(raw):
-        await room_reply(ws, room_id, chunk, msg.get("hashid"))
+    posted = await post_room_reply(ws, room_id, split_room_body(body_text),
+                                   msg.get("hashid"))
+
+    if ask:
+        try:
+            await room_ask(ws, room_id, posted, ask)
+        except Exception:
+            log.exception("could not send the ask — the reply is already posted")
 
     # After the answer: the run is only worth recording once the
     # person has it, and a failure here must not look like a failure
@@ -2141,6 +2475,8 @@ async def process_stream(link: CableLink, ws) -> None:
                 with contextlib.suppress(Exception):
                     await room_status(link, (msg.get("room") or {}).get("hashid"),
                                       (msg.get("message") or {}).get("hashid"), "queued")
+            elif msg.get("type") == "room_reply.posted":
+                note_posted_message(msg.get("room_id"), msg.get("message_id"))
             else:
                 log.debug("Ignoring message type=%s", msg.get("type"))
     finally:

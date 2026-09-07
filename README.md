@@ -172,6 +172,43 @@ Rules that hold in both modes:
 room's Claude session and starts fresh. It answers immediately
 without spending a Claude run.
 
+### Asking the room a question
+
+When Claude needs a decision it ends its reply with a fenced `ask`
+block — JSON, same grammar as ` ```proposal ` on the feedback path:
+
+````
+Both work. Three files, no migration.
+
+```ask
+{"prompt": "Ship this to master or open a PR?",
+ "mode": "one",
+ "options": ["Ship to master", "Open a PR"]}
+```
+````
+
+`mode` is `one` (buttons), `many` (checkboxes) or `text` (a free-text
+box, `options` omitted). `options` take strings or
+`{"label": …, "value": …}` pairs. The caps mirror `RoomAsk` on the
+Rails side: 12 options, 120-char labels, 500-char prompt.
+
+The fence never reaches the room — `parse_room_ask` strips it and
+`ask_fallback` appends whatever the model's prose didn't already say,
+as a numbered list, so the question is answerable by typing on
+surfaces that draw no buttons (the widget, older mobile builds).
+
+A block that isn't parseable, isn't a JSON object, is over 20 KB, has
+no prompt, or offers no options in a non-`text` mode is **left in the
+message as written**. Losing the reply to a bad fence would cost more
+than an ugly one.
+
+> **Not wired to buttons yet.** `AdminFeedbackChannel#room_ask` hangs
+> the question on a message hashid, and nothing tells dispatch the
+> hashid of the reply it just posted — `room_reply` returns nothing,
+> there is no rooms endpoint on `/api/v1`, and `RoomChannel` refuses a
+> connection with no `current_user`. Until `room_reply` echoes the
+> posted hashid back, the prose fallback is what the room gets.
+
 ## Resetting a session
 
 Dispatch keeps one Claude session per conversation so follow-ups
@@ -301,6 +338,41 @@ that went back. `LOG_LEVEL=DEBUG` adds the ignored cable frames.
 
 `log/` is gitignored. Under systemd the units also append to
 `/var/log/vroxy-dispatch/`, which is now redundant but harmless.
+
+## The 90-second ceiling
+
+Nothing in this process waits on a response for longer than
+`STALL_SECONDS` (90, override with `VROXY_STALL_SECONDS`). Someone is
+watching a typing indicator on the other end, so a wait they can't see
+the end of is the worst failure mode available.
+
+- **The streamed run is watched for silence.** A daemon thread does the
+  blocking `proc.stdout` read; the run loop waits on a queue it can
+  time out. Before this there was no timeout at all — a wedged claude
+  (a hung tool call, a dead network read) held dispatch open forever
+  and the asker never heard back.
+- **Silence is reported, not swallowed.** Each elapsed window emits a
+  `stalled` event that the progress trail renders into the room
+  ("still working — nothing back for 90s").
+- **Wedged gets killed.** After `STALL_WINDOWS_BEFORE_KILL` (4,
+  `VROXY_STALL_WINDOWS`) consecutive silent windows the run is wedged
+  rather than slow: the process group is killed (SIGTERM → SIGKILL) and
+  any partial output comes back with a note saying it was cut short.
+  The subprocess runs in its own session so that kill can't reach
+  dispatch itself.
+- **The blind-wait paths get a flat cap.** The non-streamed fallback
+  and the git helper have no stream to watch, so they share
+  `SUBPROCESS_HARD_CAP_SECONDS` (`STALL_SECONDS ×
+  STALL_WINDOWS_BEFORE_KILL`). `StallCeilingTest` fails if any timeout
+  literal in the module climbs back over it.
+- **The room prompt teaches Claude the same rule**: every Bash call
+  gets `timeout: 90000` or less, run only the tests that cover the
+  change (never a bare `bin/system-test` or `bash ./test.sh`), and
+  background-and-poll anything genuinely long instead of raising a
+  timeout.
+
+If you hit the ceiling, the fix is a different approach — not a bigger
+number.
 
 ## Run against local dev
 
@@ -543,8 +615,10 @@ python3 -m unittest test_feedback_agent
 ```
 
 Covers `build_prompt` (full / page-level / sparse / duplicate-
-partial cases) and `parse_proposal` (plain / inline_ship /
-pull_request / malformed JSON).
+partial cases), `parse_proposal` (plain / inline_ship /
+pull_request / malformed JSON) and `parse_room_ask` +
+`ask_fallback` (valid / malformed / absent / 30 options / caps /
+prose that already restates the question).
 
 ## See also
 
