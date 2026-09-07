@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.20.0
+
+### Added
+
+- **Editing a message that is still queued updates the queued task.**
+  Press up, fix the typo, and the agent reads what you meant rather
+  than what you first sent. The server sends `room.message.edited`
+  only while the run is still queued, and `apply_queued_edit` rewrites
+  the matching item, rebuilding the queue in order so nobody's
+  conversation gets reordered.
+- Once a run is in flight the edit is ignored on purpose: Claude is
+  already reading the old words, and swapping them would be a lie
+  about what it ran.
+
 ## 0.19.0
 
 ### Fixed

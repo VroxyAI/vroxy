@@ -1763,3 +1763,64 @@ class TaskLabelTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("#Claude tail the log", seen,
                          "tool_use lines are logged off the event loop; "
                          "an unpropagated context would leave them unlabelled")
+
+
+class QueuedEditTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        fa._work_queue = asyncio.Queue()
+
+    async def asyncTearDown(self):
+        fa._work_queue = None
+
+    def room_task(self, hashid, body, room="room1"):
+        return ("room", {"room": {"hashid": room},
+                         "message": {"hashid": hashid, "body": body}})
+
+    async def drain(self):
+        out = []
+        while not fa._work_queue.empty():
+            out.append(fa._work_queue.get_nowait())
+        return out
+
+    async def test_a_queued_task_picks_up_the_edit(self):
+        fa._work_queue.put_nowait(self.room_task("m1", "old words"))
+
+        self.assertTrue(fa.apply_queued_edit("room1", "m1", "new words"))
+
+        items = await self.drain()
+        self.assertEqual("new words", items[0][1]["message"]["body"])
+
+    async def test_order_survives_the_rewrite(self):
+        for i in range(4):
+            fa._work_queue.put_nowait(self.room_task(f"m{i}", f"body {i}"))
+
+        fa.apply_queued_edit("room1", "m2", "edited")
+
+        items = await self.drain()
+        self.assertEqual(["m0", "m1", "m2", "m3"],
+                         [i[1]["message"]["hashid"] for i in items])
+        self.assertEqual("edited", items[2][1]["message"]["body"])
+
+    async def test_an_unknown_message_changes_nothing(self):
+        fa._work_queue.put_nowait(self.room_task("m1", "keep me"))
+
+        self.assertFalse(fa.apply_queued_edit("room1", "nope", "clobbered"))
+
+        items = await self.drain()
+        self.assertEqual("keep me", items[0][1]["message"]["body"])
+
+    async def test_the_same_id_in_another_room_is_not_touched(self):
+        fa._work_queue.put_nowait(self.room_task("m1", "mine", room="other"))
+
+        self.assertFalse(fa.apply_queued_edit("room1", "m1", "clobbered"))
+
+        items = await self.drain()
+        self.assertEqual("mine", items[0][1]["message"]["body"])
+
+    async def test_non_room_work_is_left_alone(self):
+        fa._work_queue.put_nowait(("feedback", {"message": {"hashid": "m1", "body": "fb"}}))
+
+        self.assertFalse(fa.apply_queued_edit("room1", "m1", "clobbered"))
+
+        items = await self.drain()
+        self.assertEqual("fb", items[0][1]["message"]["body"])

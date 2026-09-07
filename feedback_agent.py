@@ -122,7 +122,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.19.0"
+AGENT_VERSION      = "vroxy_dispatch 0.20.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -1598,6 +1598,42 @@ async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
 _current_work: tuple[str, dict] | None = None
 
 
+def apply_queued_edit(room_hashid: str, message_hashid: str, body: str) -> bool:
+    """Rewrite a queued room task whose message was edited.
+
+    Only touches items still on the queue: once a task is in flight
+    Claude is already reading the old words and there is nothing to
+    swap. Rebuilt in order — asyncio.Queue has no way to mutate an
+    item in place, and losing the ordering would reorder someone's
+    conversation."""
+    if _work_queue is None or not message_hashid:
+        return False
+
+    items: list[tuple[str, dict]] = []
+    while not _work_queue.empty():
+        try:
+            items.append(_work_queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    changed = False
+    for kind, payload in items:
+        if kind != "room":
+            continue
+        msg = payload.get("message") or {}
+        if msg.get("hashid") != message_hashid:
+            continue
+        if room_hashid and (payload.get("room") or {}).get("hashid") != room_hashid:
+            continue
+        msg["body"] = body
+        payload["message"] = msg
+        changed = True
+
+    for item in items:
+        _work_queue.put_nowait(item)
+    return changed
+
+
 def spool_pending_work() -> int:
     """Write the in-flight task and everything still queued to disk.
 
@@ -2527,6 +2563,12 @@ async def process_stream(link: CableLink, ws) -> None:
                 with contextlib.suppress(Exception):
                     await room_status(link, (msg.get("room") or {}).get("hashid"),
                                       (msg.get("message") or {}).get("hashid"), "queued")
+            elif msg.get("type") == "room.message.edited":
+                edited = msg.get("message") or {}
+                if apply_queued_edit((msg.get("room") or {}).get("hashid"),
+                                     edited.get("hashid"), edited.get("body") or ""):
+                    log.info("queued task updated after an edit message=%s",
+                             edited.get("hashid"))
             elif msg.get("type") == "room_reply.posted":
                 note_posted_message(msg.get("room_id"), msg.get("message_id"))
             else:
