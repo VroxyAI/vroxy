@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.14.0
+
+- **The narration between tool calls now reaches the room.** It was
+  being dropped twice: `text_delta` returned early in the room
+  handler, and whatever had accumulated was then overwritten in the
+  reply by the CLI's own `result` text. So "Now the view marker, the
+  copy-link action, and the JS" — the most readable line in a run —
+  went nowhere, and the trail was tool calls only.
+- The rule it turns on: a text block is NARRATION when more work
+  follows it and the ANSWER when nothing does, and which it is can't
+  be known until the next event arrives. So text is HELD — flushed as
+  a trail line when a tool call or a thought comes next, dropped at
+  `result`, because by then it is the reply and saying it twice helps
+  nobody. Consecutive text with no work between it is one line, not
+  two, so a multi-block answer isn't half-echoed into the trail.
+- Extracted as `ProgressTrail` rather than left in the closure, so the
+  rule is testable: 7 tests covering narration vs answer, consecutive
+  blocks, a run ending on a tool call, a one-line answer producing no
+  trail at all, and trimming.
+
 ## 0.13.0
 
 - **`install.sh`** — installs, updates and removes dispatch instances.

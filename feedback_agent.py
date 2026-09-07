@@ -119,7 +119,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.13.0"
+AGENT_VERSION      = "vroxy_dispatch 0.14.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -1018,6 +1018,55 @@ def run_claude_streamed(prompt: str, project: str, on_event,
             + (f": {_one_line(stderr_text, 300)}" if stderr_text else ""))
 
     return "".join(final_text_chunks).strip()
+
+
+class ProgressTrail:
+    """Turns a Claude event stream into the lines a room should see.
+
+    The subtle one is TEXT. A text block is narration when more work
+    follows it and the ANSWER when nothing does — and which it is
+    can't be known until the next event arrives. So text is HELD:
+    flushed as a trail line when a tool call or a thought comes next,
+    dropped when the run ends, because by then it is the reply and
+    saying it twice helps nobody.
+
+    Before this, text was dropped either way, which threw away the
+    most readable part of a run — "Now the view marker, the copy-link
+    action, and the JS" tells you more at a glance than
+    `Bash(python3 - <<PY …)`.
+    """
+
+    def __init__(self, emit, text_max: int = 400):
+        self._emit = emit
+        self._text_max = text_max
+        self._held: list[str] = []
+
+    def feed(self, event: dict) -> None:
+        etype = event.get("type")
+
+        if etype == "result":
+            self._held.clear()
+            return
+
+        if etype == "text_delta":
+            # Consecutive text with no work between it is one block of
+            # prose, not two lines.
+            if event.get("text"):
+                self._held.append(event["text"])
+            return
+
+        if etype == "tool_use":
+            self._flush()
+            self._emit("tool", _progress_line(event.get("name") or "tool", event.get("input")))
+        elif etype == "thinking":
+            self._flush()
+            self._emit("thinking", _one_line(event.get("text") or "", self._text_max))
+
+    def _flush(self) -> None:
+        joined = " ".join(self._held).strip()
+        self._held.clear()
+        if joined:
+            self._emit("text", _one_line(joined, self._text_max))
 
 
 def _one_line(text: str, limit: int) -> str:
@@ -1934,39 +1983,23 @@ async def handle_room_message(ws, payload: dict) -> None:
     steps: list[dict] = []
     result: dict = {}
 
-    def on_stream_event(event: dict) -> None:
+    def emit(kind: str, text: str) -> None:
         # Runs on the claude thread, so hop back to the loop to send.
-        # Capped: a long run can make hundreds of these and the point
-        # is a readable trail, not a transcript.
         nonlocal sent
-        if event.get("type") == "result":
-            result.update(event)
+        if not text or sent >= ROOM_PROGRESS_MAX:
             return
-        if sent >= ROOM_PROGRESS_MAX:
-            return
-        etype = event.get("type")
-        if etype == "tool_use":
-            kind = "tool"
-            text = _progress_line(event.get("name") or "tool", event.get("input"))
-        elif etype == "thinking":
-            kind = "thinking"
-            text = _one_line(event.get("text") or "", ROOM_PROGRESS_TEXT_MAX)
-        elif etype == "text_delta":
-            # The answer itself arrives here in pieces and is posted
-            # as the reply — repeating it in the trail would just be
-            # the message twice.  Only the running commentary before
-            # the final turn is worth showing.
-            return
-        else:
-            return
-        if not text:
-            return
-
         sent += 1
         steps.append({"kind": kind, "text": text})
         fut = asyncio.run_coroutine_threadsafe(
             _emit_room_progress(ws, room_id, msg.get("hashid"), kind, text), loop)
         fut.add_done_callback(_log_future_error)
+
+    trail = ProgressTrail(emit, ROOM_PROGRESS_TEXT_MAX)
+
+    def on_stream_event(event: dict) -> None:
+        if event.get("type") == "result":
+            result.update(event)
+        trail.feed(event)
 
     try:
         raw = await asyncio.to_thread(

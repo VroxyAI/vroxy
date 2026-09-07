@@ -1015,6 +1015,89 @@ class RestartIfSelfUpdatedTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCa
         self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
 
 
+class ProgressTrailTest(unittest.TestCase):
+    """Text between tool calls is the most readable part of a run —
+    "Now the view marker, the copy-link action, and the JS" says more
+    at a glance than Bash(python3 - <<PY …). It used to be dropped
+    twice: never sent to the trail, and then overwritten in the reply
+    by the CLI's own final answer."""
+
+    def run_trail(self, events):
+        got = []
+        trail = fa.ProgressTrail(lambda kind, text: got.append((kind, text)))
+        for event in events:
+            trail.feed(event)
+        return got
+
+    def test_narration_reaches_the_trail_but_the_answer_does_not(self):
+        got = self.run_trail([
+            {"type": "text_delta", "text": "Building the window first."},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "a.rb"}},
+            {"type": "text_delta", "text": "Now the JS."},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "text_delta", "text": "Shipped — 2.84.0."},
+            {"type": "result", "usage": {}},
+        ])
+
+        self.assertEqual(["text", "tool", "text", "tool"], [k for k, _ in got])
+        texts = [t for _, t in got]
+        self.assertIn("Building the window first.", texts)
+        self.assertIn("Now the JS.", texts)
+        self.assertNotIn("Shipped — 2.84.0.", texts,
+                         "the last block IS the reply — saying it twice helps nobody")
+
+    def test_consecutive_text_is_one_line_not_two(self):
+        got = self.run_trail([
+            {"type": "text_delta", "text": "First half."},
+            {"type": "text_delta", "text": "Second half."},
+            {"type": "tool_use", "name": "Read", "input": {}},
+            {"type": "result"},
+        ])
+        self.assertEqual(("text", "First half. Second half."), got[0])
+
+    def test_a_run_ending_on_a_tool_call_holds_nothing_back(self):
+        got = self.run_trail([
+            {"type": "text_delta", "text": "Checking."},
+            {"type": "tool_use", "name": "Read", "input": {}},
+            {"type": "result"},
+        ])
+        self.assertEqual(["text", "tool"], [k for k, _ in got])
+
+    def test_thinking_flushes_the_narration_before_it(self):
+        got = self.run_trail([
+            {"type": "text_delta", "text": "About to reason."},
+            {"type": "thinking", "text": "the route is workspace-scoped"},
+            {"type": "result"},
+        ])
+        self.assertEqual(["text", "thinking"], [k for k, _ in got])
+
+    def test_an_answer_with_no_tool_calls_produces_no_trail_at_all(self):
+        # A one-line answer is just a reply. A trail saying the same
+        # thing under it would be the message twice.
+        got = self.run_trail([
+            {"type": "text_delta", "text": "0.13.0."},
+            {"type": "result"},
+        ])
+        self.assertEqual([], got)
+
+    def test_blank_text_and_unknown_events_are_ignored(self):
+        got = self.run_trail([
+            {"type": "text_delta", "text": ""},
+            {"type": "something_new", "text": "?"},
+            {"type": "tool_use", "name": "Read", "input": {}},
+        ])
+        self.assertEqual([ ("tool", "Read") ], got)
+
+    def test_long_narration_is_trimmed_to_one_line(self):
+        got = self.run_trail([
+            {"type": "text_delta", "text": "line one\nline two " + ("x" * 900)},
+            {"type": "tool_use", "name": "Read", "input": {}},
+        ])
+        text = got[0][1]
+        self.assertNotIn("\n", text, "the trail is a list of lines, not prose")
+        self.assertLessEqual(len(text), 401)
+
+
 class RoomStatusTest(unittest.IsolatedAsyncioTestCase):
     """A run can sit queued behind a twenty-minute one. Silence and
     "never arrived" look identical from the room."""
