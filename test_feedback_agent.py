@@ -19,6 +19,7 @@ import asyncio
 import subprocess
 import time
 import tempfile
+import logging
 import unittest
 from pathlib import Path
 
@@ -1718,3 +1719,38 @@ class ProgressActionTest(unittest.TestCase):
             fa.ROOM_PROGRESS_MAX, 500,
             "a run of a few hundred steps must not stop reporting mid-flight")
         self.assertEqual("send", fa.progress_action(200, False))
+
+
+class TaskLabelTest(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self):
+        fa.set_task_label("")
+
+    def test_nothing_in_flight_reads_as_idle(self):
+        fa.set_task_label("")
+        self.assertEqual("idle", fa.task_label())
+
+    def test_the_label_is_one_line_and_bounded(self):
+        fa.set_task_label("#Claude fix the thing\nand then\nship it " + "x" * 200)
+        label = fa.task_label()
+        self.assertLessEqual(len(label), fa.TASK_LABEL_MAX + 1)
+        self.assertTrue(label.endswith("\u2026"))
+        self.assertNotIn("\n", label)
+
+    def test_every_record_carries_the_task(self):
+        fa.set_task_label("#Claude what is it working on")
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, "x", None, None)
+        self.assertTrue(fa._TaskFilter().filter(record))
+        self.assertEqual("#Claude what is it working on", record.task)
+
+    def test_an_idle_record_says_idle_rather_than_blank(self):
+        fa.set_task_label("")
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, "x", None, None)
+        fa._TaskFilter().filter(record)
+        self.assertEqual("idle", record.task)
+
+    async def test_the_label_reaches_the_claude_worker_thread(self):
+        fa.set_task_label("#Claude tail the log")
+        seen = await asyncio.to_thread(fa.task_label)
+        self.assertEqual("#Claude tail the log", seen,
+                         "tool_use lines are logged off the event loop; "
+                         "an unpropagated context would leave them unlabelled")

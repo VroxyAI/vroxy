@@ -52,6 +52,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import contextvars
 import logging
 import os
 import re
@@ -121,7 +122,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.17.0"
+AGENT_VERSION      = "vroxy_dispatch 0.18.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -149,15 +150,36 @@ LOG_MAX_BYTES    = int(os.environ.get("LOG_MAX_BYTES", 10 * 1024 * 1024))
 LOG_BACKUP_COUNT = int(os.environ.get("LOG_BACKUP_COUNT", 5))
 
 
+TASK_LABEL_MAX = 56
+
+_task_label: contextvars.ContextVar[str] = contextvars.ContextVar("task_label", default="")
+
+
+def set_task_label(label: str) -> None:
+    _task_label.set(_one_line(label, TASK_LABEL_MAX) if label else "")
+
+
+def task_label() -> str:
+    return _task_label.get() or "idle"
+
+
+class _TaskFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.task = task_label()
+        return True
+
+
 def _setup_logging() -> logging.Logger:
-    fmt   = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    fmt   = logging.Formatter("%(asctime)s %(levelname)s [%(task)s] %(message)s")
     level = os.environ.get("LOG_LEVEL", "INFO").upper()
 
     root = logging.getLogger()
     root.setLevel(level)
+    root.addFilter(_TaskFilter())
 
     stream = logging.StreamHandler()
     stream.setFormatter(fmt)
+    stream.addFilter(_TaskFilter())
     root.addHandler(stream)
 
     if LOG_FILE:
@@ -168,6 +190,7 @@ def _setup_logging() -> logging.Logger:
                 path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
                 encoding="utf-8")
             rotating.setFormatter(fmt)
+            rotating.addFilter(_TaskFilter())
             root.addHandler(rotating)
         except OSError as e:
             # An unwritable log path must never stop dispatch from
@@ -2058,6 +2081,7 @@ async def handle_feedback(ws, payload: dict) -> None:
         return
 
     prompt = build_prompt(payload)
+    set_task_label(f"feedback {fb.get('hashid') or ''} {fb.get('note') or ''}")
     log.info("Handling feedback id=%s chat=%s note=%.80s",
              fb.get("hashid"), chat_id, fb.get("note"))
 
@@ -2288,6 +2312,7 @@ async def handle_room_message(ws, payload: dict) -> None:
         return
 
     body = (msg.get("body") or "").strip()
+    set_task_label(f"#{room.get('name') or room_id} {body}")
     log.info("Handling room message room=%s (#%s) from=%s body=%s",
              room_id, room.get("name"), sender.get("name"),
              _one_line(body, ROOM_LOG_BODY_MAX))
@@ -2432,6 +2457,7 @@ async def worker_loop(link: CableLink) -> None:
         finally:
             _current_status = "idle"
             _current_work = None
+            set_task_label("")
             _work_queue.task_done()
 
         # Outside the try so a task's own failure doesn't mask it,

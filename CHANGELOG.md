@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.18.0
+
+### Added
+
+- **Every log line now says which request it belongs to.** Tailing
+  `log/dispatch.log` showed a wall of `→ tool_use` lines with no way to
+  tell what was being worked on — the "Handling room message" header
+  scrolls away in seconds and never comes back. Lines now carry a task
+  tag: `[#Claude is there a limit on the web working log] → tool_use
+  Bash(...)`, and `[idle]` when nothing is in flight.
+- The tag is a `contextvars` value set when a task starts and cleared in
+  the worker's `finally`, so it survives `asyncio.to_thread` — which is
+  where the tool_use lines are actually logged from. A tag that did not
+  propagate across that boundary would leave exactly the lines you want
+  labelled as the only unlabelled ones, so there is a test for it.
+
 ## 0.17.0
 
 ### Fixed
