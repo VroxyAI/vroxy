@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.17.0
+
+### Fixed
+
+- **The room stopped showing the working log after 120 lines.** `emit`
+  returned early once `sent` hit `ROOM_PROGRESS_MAX`, so a longer run
+  went silent in the web and mobile trail while the terminal log kept
+  scrolling — indistinguishable from a wedged run. The live ceiling is
+  now 1000, and hitting it posts one line saying the trail was
+  truncated instead of just stopping. Everything downstream already
+  trims oldest-first (300 in Redis, 300 in both clients), so the newest
+  activity is what survives.
+- The saved run document no longer inherits the live cap: `steps` fills
+  to `ROOM_RUN_STEPS_MAX` (500) on its own, where before it stopped at
+  120 alongside the emit and made that constant dead.
+
 ## 0.16.0
 
 - **Nothing waits on a response for more than 90 seconds.** The

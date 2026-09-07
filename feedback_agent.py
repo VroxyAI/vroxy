@@ -121,7 +121,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.16.0"
+AGENT_VERSION      = "vroxy_dispatch 0.17.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -1914,7 +1914,13 @@ def _ensure_on_base(project_dir: Path, base: str) -> tuple[bool, str]:
     return rc == 0, err
 
 
-ROOM_PROGRESS_MAX = 120
+ROOM_PROGRESS_MAX = 1000
+
+
+def progress_action(sent: int, truncated: bool) -> str:
+    if sent < ROOM_PROGRESS_MAX:
+        return "send"
+    return "drop" if truncated else "notice"
 ROOM_RUN_STEPS_MAX = 500
 ROOM_PROGRESS_TEXT_MAX = 400
 
@@ -2302,21 +2308,34 @@ async def handle_room_message(ws, payload: dict) -> None:
     typing_task = asyncio.create_task(room_typing_forever(ws, room_id))
     loop = asyncio.get_running_loop()
     sent = 0
+    truncated = False
     # Kept alongside the live sends so the finished run can be saved
     # as one document, with the tokens and cost the CLI reports.
     steps: list[dict] = []
     result: dict = {}
 
-    def emit(kind: str, text: str) -> None:
-        # Runs on the claude thread, so hop back to the loop to send.
-        nonlocal sent
-        if not text or sent >= ROOM_PROGRESS_MAX:
-            return
-        sent += 1
-        steps.append({"kind": kind, "text": text})
+    def send_line(kind: str, text: str) -> None:
         fut = asyncio.run_coroutine_threadsafe(
             _emit_room_progress(ws, room_id, msg.get("hashid"), kind, text), loop)
         fut.add_done_callback(_log_future_error)
+
+    def emit(kind: str, text: str) -> None:
+        # Runs on the claude thread, so hop back to the loop to send.
+        nonlocal sent, truncated
+        if not text:
+            return
+        if len(steps) < ROOM_RUN_STEPS_MAX:
+            steps.append({"kind": kind, "text": text})
+        action = progress_action(sent, truncated)
+        if action == "drop":
+            return
+        if action == "notice":
+            truncated = True
+            send_line("text", f"Working log truncated after {ROOM_PROGRESS_MAX} lines "
+                              "— the run is still going; tail the dispatch log for the rest.")
+            return
+        sent += 1
+        send_line(kind, text)
 
     trail = ProgressTrail(emit, ROOM_PROGRESS_TEXT_MAX)
 

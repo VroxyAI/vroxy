@@ -1691,3 +1691,30 @@ class StallTrailTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProgressActionTest(unittest.TestCase):
+    def test_ordinary_lines_are_sent(self):
+        self.assertEqual("send", fa.progress_action(0, False))
+        self.assertEqual(
+            "send",
+            fa.progress_action(fa.ROOM_PROGRESS_MAX - 1, False))
+
+    def test_the_cap_says_so_once_instead_of_going_silent(self):
+        self.assertEqual(
+            "notice",
+            fa.progress_action(fa.ROOM_PROGRESS_MAX, False))
+
+    def test_after_the_notice_further_lines_drop_quietly(self):
+        self.assertEqual(
+            "drop",
+            fa.progress_action(fa.ROOM_PROGRESS_MAX, True))
+        self.assertEqual(
+            "drop",
+            fa.progress_action(fa.ROOM_PROGRESS_MAX + 500, True))
+
+    def test_the_live_cap_clears_the_old_silent_120(self):
+        self.assertGreater(
+            fa.ROOM_PROGRESS_MAX, 500,
+            "a run of a few hundred steps must not stop reporting mid-flight")
+        self.assertEqual("send", fa.progress_action(200, False))
