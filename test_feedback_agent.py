@@ -1324,19 +1324,28 @@ class RestartIfSelfUpdatedTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCa
         self.assertEqual("room1234", notice["room_id"])
         self.assertEqual("msg5678", notice["reply_to"])
 
-    async def test_it_waits_for_the_queue_to_drain(self):
-        # The work queue is in memory.  Restarting on top of it
-        # swallows every message still on it, silently.
+    async def test_a_queue_with_work_on_it_no_longer_blocks_the_restart(self):
+        # It used to wait for an empty queue, which on a busy agent
+        # meant never — a shipped fix could sit un-run for hours while
+        # every check logged "holding the restart".  spool_pending_work
+        # writes the queue to disk on shutdown and the next process
+        # replays it, so this costs a delay, not a message.
         self.edit_source()
         await fa._work_queue.put(("room", {}))
         link = fa.CableLink()
-        await fa.restart_if_self_updated(link, "room", self.ROOM)
-        self.assertEqual([], self.scheduled)
-        self.assertEqual([], sent_bodies(link))
 
-        fa._work_queue.get_nowait()
         await fa.restart_if_self_updated(link, "room", self.ROOM)
+
         self.assertEqual([1], self.scheduled)
+
+    async def test_the_queued_work_is_spooled_so_the_restart_cannot_lose_it(self):
+        self.edit_source()
+        await fa._work_queue.put(("room", {"message": {"hashid": "keepme"}}))
+
+        spooled = fa.spool_pending_work()
+
+        self.assertEqual(1, spooled)
+        self.assertIn("keepme", fa.WORK_SPOOL_PATH.read_text())
 
     async def test_it_refuses_to_restart_into_a_build_that_will_not_compile(self):
         self.edit_source("def broken(:\n")

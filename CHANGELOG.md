@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.19.0
+
+### Fixed
+
+- **A busy agent never updated itself.** `restart_if_self_updated`
+  waited for the work queue to drain before restarting, and on an
+  agent that keeps being asked things the queue never drains — every
+  check logged "holding the restart" while more work arrived. 0.17.0
+  and 0.18.0 were both committed, pushed, and still not running hours
+  later for exactly this reason.
+- It now restarts between tasks regardless of what is queued.
+  `spool_pending_work` already writes the in-flight task and the whole
+  queue to disk on shutdown, and the next process replays them, so a
+  mid-queue restart costs a short delay rather than a lost message —
+  which is what the drain guard was written to prevent before the
+  spool existed.
+
 ## 0.18.0
 
 ### Added

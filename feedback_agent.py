@@ -122,7 +122,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.18.0"
+AGENT_VERSION      = "vroxy_dispatch 0.19.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -1520,9 +1520,16 @@ def _exit_and_let_systemd_restart(reason: str) -> tuple[bool, str]:
 
 
 async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
-    """Called after each finished task.  Restarts only once the queue
-    is drained — the work queue lives in memory, so restarting with
-    messages still on it would swallow them silently."""
+    """Called after each finished task, once its answer is already
+    posted.
+
+    It does NOT wait for the queue to drain.  It used to, and on a
+    busy agent that meant never: every held restart logged
+    "holding the restart" while more work arrived, so a shipped fix
+    could sit un-run for hours.  `spool_pending_work` writes the
+    in-flight task AND the whole queue to disk on shutdown and the
+    next process replays them, so restarting mid-queue costs a short
+    delay rather than a lost message."""
     global _restart_pending, _restart_scheduled
     if _restart_scheduled:
         return
@@ -1537,9 +1544,9 @@ async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
         }
         log.info("source on disk no longer matches this process — restart pending")
 
-    if _work_queue is not None and not _work_queue.empty():
-        log.info("holding the restart — %d task(s) still queued", _work_queue.qsize())
-        return
+    queued = _work_queue.qsize() if _work_queue is not None else 0
+    if queued:
+        log.info("restarting with %d task(s) queued — the spool carries them over", queued)
 
     room_id    = _restart_pending.get("room_id")
     reply_to   = _restart_pending.get("reply_to")
