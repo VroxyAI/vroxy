@@ -50,12 +50,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 import uuid
@@ -84,8 +86,22 @@ CLAUDE_CHAT_BIN = os.environ.get(
 )
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 
+# Self-update: dispatch edits its own checkout often enough that a
+# run can leave the process running code that no longer exists on
+# disk.  The unit name is what a restart targets; the state dir is
+# how a notice survives the process that wrote it.
+SERVICE_UNIT    = os.environ.get("VROXY_DISPATCH_UNIT",
+                                 "vroxy-dispatch-feedback-agent.service")
+RESTART_DELAY_SECONDS = int(os.environ.get("VROXY_DISPATCH_RESTART_DELAY", "5"))
+STATE_DIR       = Path(os.environ.get("VROXY_DISPATCH_STATE_DIR",
+                                      str(Path.home() / ".cache" / "vroxy-dispatch")))
+RESTART_NOTICE_PATH = STATE_DIR / "restart-notice.json"
+# A notice older than this belongs to a restart nobody is still
+# waiting on — announcing it would be confusing, not informative.
+RESTART_NOTICE_MAX_AGE_SECONDS = 900
+
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.9.0"
+AGENT_VERSION      = "vroxy_dispatch 0.10.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Must stay under the 4 s the room UI holds a typing state for
 # (workspace_rooms.js `noteTyping`), or the indicator flickers.
@@ -1036,6 +1052,229 @@ def parse_proposal(raw: str) -> tuple[str, dict | None]:
     return body, proposal
 
 
+# ── Self-update ───────────────────────────────────────────────────
+# A run that edits this checkout leaves the process running code that
+# is no longer on disk — every later answer comes from the old build
+# while the heartbeat reports the new version number.  Dispatch
+# notices and restarts itself.
+
+# The files systemd actually executes.  Hashing them, rather than
+# reading a version constant, catches a fix that landed without a
+# version bump and an edit that was never committed.
+_SELF_FILES = (Path(__file__).resolve(), Path(CLAUDE_CHAT_BIN))
+
+_AGENT_VERSION_RE = re.compile(r'^AGENT_VERSION\s*=\s*"([^"]+)"', re.M)
+
+_restart_pending: dict | None = None
+_restart_scheduled = False
+
+
+def source_fingerprint() -> str:
+    h = hashlib.sha256()
+    for path in _SELF_FILES:
+        try:
+            h.update(Path(path).read_bytes())
+        except OSError:
+            h.update(b"<unreadable>")
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+_BOOT_FINGERPRINT = source_fingerprint()
+
+
+def self_updated() -> bool:
+    return source_fingerprint() != _BOOT_FINGERPRINT
+
+
+def disk_agent_version() -> str:
+    """AGENT_VERSION as it reads on disk, which stops being
+    `AGENT_VERSION` the moment a run edits this file."""
+    try:
+        text = _SELF_FILES[0].read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    found = _AGENT_VERSION_RE.search(text)
+    return found.group(1) if found else ""
+
+
+def self_compiles() -> tuple[bool, str]:
+    """Byte-compile what's on disk before restarting into it.
+
+    A restart into a SyntaxError is a crash loop: systemd restarts
+    on failure, gives up after the start limit, and dispatch is off
+    until a human notices.  Staying on the old build and saying so is
+    strictly better than that."""
+    proc = subprocess.run(
+        [sys.executable, "-m", "py_compile", str(_SELF_FILES[0])],
+        capture_output=True, text=True, timeout=60)
+    return proc.returncode == 0, (proc.stderr or proc.stdout or "").strip()
+
+
+def write_restart_notice(room_id: str | None, reply_to: str | None,
+                         to_version: str) -> None:
+    """What the NEXT process needs to know to report back.  In-memory
+    state does not survive the restart it describes."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        RESTART_NOTICE_PATH.write_text(json.dumps({
+            "room_id":      room_id,
+            "reply_to":     reply_to,
+            "from_version": AGENT_VERSION,
+            "to_version":   to_version,
+            "at":           time.time(),
+        }), encoding="utf-8")
+    except OSError as e:
+        log.warning("could not write the restart notice: %s", e)
+
+
+def take_restart_notice() -> dict | None:
+    """Read and DELETE.  Unlinked before the announcement is
+    attempted, deliberately: every reconnect confirms the
+    subscription again, and a notice that outlived one post would be
+    re-announced on each of them."""
+    try:
+        raw = RESTART_NOTICE_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    with contextlib.suppress(OSError):
+        RESTART_NOTICE_PATH.unlink()
+    try:
+        notice = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(notice, dict) or not notice.get("room_id"):
+        return None
+    age = time.time() - float(notice.get("at") or 0)
+    if age > RESTART_NOTICE_MAX_AGE_SECONDS:
+        log.warning("dropping a restart notice %.0fs old — nobody is still waiting", age)
+        return None
+    return notice
+
+
+def schedule_restart() -> tuple[bool, str]:
+    """Restart the unit from OUTSIDE our own cgroup.
+
+    `systemctl restart` called from in here would work, but systemd
+    stops the unit by killing its whole cgroup — including any Claude
+    process still finishing, and including the shell that issued the
+    command.  A transient timer owns it instead, so the restart
+    survives us dying."""
+    unit = f"vroxy-dispatch-self-restart-{uuid.uuid4().hex[:8]}"
+    cmd = ["systemd-run", f"--on-active={RESTART_DELAY_SECONDS}s",
+           f"--unit={unit}", "--collect",
+           "systemctl", "restart", SERVICE_UNIT]
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n"] + cmd
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    if proc.returncode == 0:
+        return True, unit
+    detail = (proc.stderr or proc.stdout or "").strip()
+    log.warning("systemd-run failed (%s) — falling back to exiting", detail)
+    return _exit_and_let_systemd_restart(detail)
+
+
+def _exit_and_let_systemd_restart(reason: str) -> tuple[bool, str]:
+    """Fallback: die non-zero and let the unit's own Restart= policy
+    bring us back.  Only when that policy actually restarts on
+    failure — exiting under `Restart=no` would take dispatch off the
+    air until someone noticed, which is worse than running stale."""
+    try:
+        shown = subprocess.run(
+            ["systemctl", "show", "-p", "Restart", "--value", SERVICE_UNIT],
+            capture_output=True, text=True, timeout=10)
+        policy = (shown.stdout or "").strip()
+    except Exception:
+        policy = ""
+    if policy not in ("always", "on-failure", "on-abnormal", "on-abort"):
+        return False, f"{reason} (and Restart={policy or 'unknown'}, so exiting would stay down)"
+    log.warning("exiting non-zero so systemd (Restart=%s) restarts us", policy)
+    # Runs on a worker thread, so this sleep costs the loop nothing
+    # and gives the frames already sent time to reach the wire.
+    time.sleep(1)
+    os._exit(70)
+
+
+async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
+    """Called after each finished task.  Restarts only once the queue
+    is drained — the work queue lives in memory, so restarting with
+    messages still on it would swallow them silently."""
+    global _restart_pending, _restart_scheduled
+    if _restart_scheduled:
+        return
+
+    if _restart_pending is None:
+        if not self_updated():
+            return
+        room = payload.get("room") or {}
+        _restart_pending = {
+            "room_id":  room.get("hashid") if kind == "room" else None,
+            "reply_to": (payload.get("message") or {}).get("hashid") if kind == "room" else None,
+        }
+        log.info("source on disk no longer matches this process — restart pending")
+
+    if _work_queue is not None and not _work_queue.empty():
+        log.info("holding the restart — %d task(s) still queued", _work_queue.qsize())
+        return
+
+    room_id    = _restart_pending.get("room_id")
+    reply_to   = _restart_pending.get("reply_to")
+    to_version = disk_agent_version() or "a newer build"
+    sha        = head_sha(_SELF_FILES[0].parent)[:7]
+    stamp      = f"{to_version}{f' ({sha})' if sha else ''}"
+
+    ok, detail = await asyncio.to_thread(self_compiles)
+    if not ok:
+        _restart_scheduled = True  # don't retry a broken build every task
+        log.error("refusing to restart into a build that will not compile: %s", detail)
+        if room_id:
+            await room_reply(link, room_id,
+                             f"⚠️ I updated myself to {stamp} but it doesn't compile, so I'm "
+                             f"staying on {AGENT_VERSION}. First error:\n\n"
+                             f"```\n{_one_line(detail, 400)}\n```", reply_to)
+        return
+
+    # No room means nobody asked and nobody is waiting — restart, but
+    # don't leave a notice for the next process to announce into a
+    # room it would have to guess at.
+    if room_id:
+        await room_reply(link, room_id,
+                         f"🔄 I updated myself to {stamp} — restarting, back in a few seconds.",
+                         reply_to)
+        write_restart_notice(room_id, reply_to, to_version)
+
+    _restart_scheduled = True
+    ok, detail = await asyncio.to_thread(schedule_restart)
+    if ok:
+        log.info("restart scheduled in %ss (%s)", RESTART_DELAY_SECONDS, detail)
+        return
+
+    log.error("could not schedule a restart: %s", detail)
+    with contextlib.suppress(OSError):
+        RESTART_NOTICE_PATH.unlink()
+    if room_id:
+        await room_reply(link, room_id,
+                         f"⚠️ I updated myself to {stamp} but couldn't restart "
+                         f"({detail}). I'm still answering from {AGENT_VERSION} — "
+                         f"`sudo systemctl restart {SERVICE_UNIT}` when you get a chance.",
+                         reply_to)
+
+
+async def announce_restart(link) -> None:
+    """The other half: the process that came back says so."""
+    notice = take_restart_notice()
+    if not notice:
+        return
+    was = notice.get("from_version") or "an earlier build"
+    sha = head_sha(_SELF_FILES[0].parent)[:7]
+    now = f"{AGENT_VERSION}{f' ({sha})' if sha else ''}"
+    await room_reply(link, notice["room_id"],
+                     f"✅ Back up on {now} — was {was}.", notice.get("reply_to"))
+
+
 # ── Main event loop ───────────────────────────────────────────────
 async def handle_approve(ws, payload: dict) -> None:
     """Operator clicked "Ship it" (or "Open PR") on a code-proposal
@@ -1680,6 +1919,14 @@ async def worker_loop(link: CableLink) -> None:
             _current_status = "idle"
             _work_queue.task_done()
 
+        # Outside the try so a task's own failure doesn't mask it,
+        # and guarded so a bug in here can't take the worker down and
+        # leave dispatch connected but deaf.
+        try:
+            await restart_if_self_updated(link, kind, payload)
+        except Exception:
+            log.exception("self-update check failed")
+
 
 async def process_stream(link: CableLink, ws) -> None:
     """Read one connection's frames onto the shared work queue.
@@ -1705,6 +1952,10 @@ async def process_stream(link: CableLink, ws) -> None:
                 # Anything that finished while the cable was down goes
                 # out now that the channel will accept it.
                 await link.flush()
+                try:
+                    await announce_restart(link)
+                except Exception:
+                    log.exception("could not announce the restart")
                 continue
             if frame_type in ("ping", "disconnect", "reject_subscription"):
                 if frame_type == "reject_subscription":

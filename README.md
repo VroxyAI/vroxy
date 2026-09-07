@@ -249,6 +249,9 @@ attached to a User instead of a Tenant.
 | `LOG_FILE`              | `./log/dispatch.log` (`""` disables)|
 | `LOG_MAX_BYTES`         | `10485760` (10 MB before rotating)  |
 | `LOG_BACKUP_COUNT`      | `5`                                 |
+| `VROXY_DISPATCH_UNIT`   | `vroxy-dispatch-feedback-agent.service` |
+| `VROXY_DISPATCH_RESTART_DELAY` | `5` (seconds before a self-restart fires) |
+| `VROXY_DISPATCH_STATE_DIR` | `~/.cache/vroxy-dispatch`        |
 
 ## Watching what it's doing
 
@@ -397,6 +400,55 @@ tail -f /home/ubuntu/code/vroxy/vroxy_dispatch/log/dispatch.log
 There is no `server.py` in this repo — if you find a
 `vroxy-dispatch-server.service` on a host, it is a leftover pointing
 at code that no longer exists and should be removed.
+
+## Self-update
+
+Dispatch edits its own checkout often — "@Dispatch ship a fix to
+yourself" is a normal Tuesday. The process that runs the fix is
+still running the OLD code, and keeps answering from it while the
+heartbeat reports the new version number. So after every finished
+task it hashes the files systemd actually executes
+(`feedback_agent.py` + `bin/claude-chat`) and compares them to what
+it booted with. Hashing bytes rather than reading `AGENT_VERSION`
+catches a fix that shipped without a version bump, and an edit that
+was never committed.
+
+When they differ:
+
+1. **Wait for the work queue to drain.** The queue is in memory;
+   restarting on top of it swallows the messages still on it.
+2. **Byte-compile what's on disk.** A restart into a `SyntaxError`
+   is a crash loop — systemd restarts on failure, hits the start
+   limit, and dispatch is off the air until a human notices. If it
+   won't compile, dispatch says so in the room and stays on the old
+   build.
+3. **Say it's going.** One line in the room that asked, so the gap
+   doesn't read as dispatch having died.
+4. **Write a restart notice** to `$VROXY_DISPATCH_STATE_DIR` — the
+   room, the message to thread under, and the version it's leaving.
+   In-memory state does not survive the restart it describes.
+5. **Schedule the restart from outside its own cgroup**, with
+   `systemd-run --on-active=5s --collect systemctl restart <unit>`.
+   `systemctl restart` from inside would work, but systemd stops a
+   unit by killing its whole cgroup — including any Claude process
+   still finishing and the shell that issued the command. If
+   `systemd-run` isn't available, it falls back to exiting non-zero,
+   and only when the unit's `Restart=` policy actually restarts on
+   failure. Neither working means it reports that in the room and
+   keeps serving stale rather than going dark.
+
+The next process reads the notice on `confirm_subscription`, posts
+"✅ Back up on X — was Y", and deletes it. The notice is deleted on
+READ, before the post is attempted: every reconnect confirms the
+subscription again, and a notice that survived one read would be
+re-announced on each of them.
+
+A task with no room behind it (an approved proposal, say) restarts
+without announcing — there is no room to speak in, and picking one
+would be a guess.
+
+Requires passwordless `sudo systemd-run` for the service user, or
+`Restart=on-failure` on the unit (the unit above has it).
 
 ## One tenant per process
 

@@ -8,6 +8,7 @@ at a real vroxy_web instance.
 import json
 import asyncio
 import subprocess
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -774,6 +775,274 @@ class CableSendTest(unittest.IsolatedAsyncioTestCase):
         link = fa.CableLink()
         await fa.heartbeat(link)
         self.assertEqual([], link.outbox, "a stale heartbeat must not be replayed")
+
+
+def sent_bodies(link) -> list[str]:
+    """The room_reply bodies a link recorded, unwrapped from the
+    ActionCable envelope."""
+    bodies = []
+    for frame in link.outbox:
+        data = json.loads(json.loads(frame)["data"])
+        if data.get("action") == "room_reply":
+            bodies.append(data["body"])
+    return bodies
+
+
+class SelfUpdateSandbox:
+    """Points the agent's idea of "my own source" at a scratch copy so
+    a test can edit it without touching the real checkout.
+
+    A plain mixin, not a TestCase: IsolatedAsyncioTestCase calls
+    `setUp` itself, so a shared base class would run the sandbox
+    twice and tear it down onto already-patched globals."""
+
+    def start_sandbox(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.source = root / "feedback_agent.py"
+        self.source.write_text('AGENT_VERSION = "vroxy_dispatch 9.9.9"\n', encoding="utf-8")
+        self.helper = root / "claude-chat"
+        self.helper.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+        self._saved = (fa._SELF_FILES, fa._BOOT_FINGERPRINT, fa.STATE_DIR,
+                       fa.RESTART_NOTICE_PATH, fa._restart_pending,
+                       fa._restart_scheduled)
+        fa._SELF_FILES = (self.source, self.helper)
+        fa._BOOT_FINGERPRINT = fa.source_fingerprint()
+        fa.STATE_DIR = root / "state"
+        fa.RESTART_NOTICE_PATH = fa.STATE_DIR / "restart-notice.json"
+        fa._restart_pending = None
+        fa._restart_scheduled = False
+
+    def stop_sandbox(self):
+        (fa._SELF_FILES, fa._BOOT_FINGERPRINT, fa.STATE_DIR,
+         fa.RESTART_NOTICE_PATH, fa._restart_pending,
+         fa._restart_scheduled) = self._saved
+        self.tmp.cleanup()
+
+    def edit_source(self, body="AGENT_VERSION = \"vroxy_dispatch 9.9.10\"\n"):
+        self.source.write_text(body, encoding="utf-8")
+
+
+class SelfUpdateStateTestCase(SelfUpdateSandbox, unittest.TestCase):
+    def setUp(self):
+        self.start_sandbox()
+
+    def tearDown(self):
+        self.stop_sandbox()
+
+
+class SourceFingerprintTest(SelfUpdateStateTestCase):
+    def test_an_untouched_checkout_is_not_an_update(self):
+        self.assertFalse(fa.self_updated())
+
+    def test_editing_the_agent_is_an_update(self):
+        self.edit_source()
+        self.assertTrue(fa.self_updated())
+
+    def test_editing_the_helper_script_counts_too(self):
+        self.helper.write_text("#!/usr/bin/env bash\necho hi\n", encoding="utf-8")
+        self.assertTrue(fa.self_updated())
+
+    def test_a_commit_with_no_version_bump_is_still_an_update(self):
+        # Hashing the bytes, rather than reading AGENT_VERSION, is
+        # what makes a bug fix shipped without a bump detectable.
+        self.edit_source('AGENT_VERSION = "vroxy_dispatch 9.9.9"\n# fixed a bug\n')
+        self.assertTrue(fa.self_updated())
+        self.assertEqual("vroxy_dispatch 9.9.9", fa.disk_agent_version())
+
+    def test_a_deleted_source_does_not_raise(self):
+        self.source.unlink()
+        self.assertTrue(fa.self_updated())
+        self.assertEqual("", fa.disk_agent_version())
+
+
+class DiskAgentVersionTest(SelfUpdateStateTestCase):
+    def test_reads_the_version_that_is_on_disk_now(self):
+        self.edit_source('AGENT_VERSION = "vroxy_dispatch 1.0.0"\n')
+        self.assertEqual("vroxy_dispatch 1.0.0", fa.disk_agent_version())
+
+    def test_a_file_without_the_constant_yields_empty(self):
+        self.edit_source("print('hi')\n")
+        self.assertEqual("", fa.disk_agent_version())
+
+
+class SelfCompilesTest(SelfUpdateStateTestCase):
+    def test_valid_python_compiles(self):
+        ok, _ = fa.self_compiles()
+        self.assertTrue(ok)
+
+    def test_a_syntax_error_is_caught_before_it_becomes_a_crash_loop(self):
+        self.edit_source("def broken(:\n")
+        ok, detail = fa.self_compiles()
+        self.assertFalse(ok)
+        self.assertTrue(detail, "the operator needs to see what broke")
+
+
+class RestartNoticeTest(SelfUpdateStateTestCase):
+    def test_round_trips_what_the_next_process_needs(self):
+        fa.write_restart_notice("room1234", "msg5678", "vroxy_dispatch 1.0.0")
+        notice = fa.take_restart_notice()
+        self.assertEqual("room1234", notice["room_id"])
+        self.assertEqual("msg5678", notice["reply_to"])
+        self.assertEqual(fa.AGENT_VERSION, notice["from_version"])
+
+    def test_taking_a_notice_deletes_it(self):
+        # Every reconnect confirms the subscription again; a notice
+        # that survived one read would be announced on each of them.
+        fa.write_restart_notice("room1234", None, "vroxy_dispatch 1.0.0")
+        self.assertIsNotNone(fa.take_restart_notice())
+        self.assertIsNone(fa.take_restart_notice())
+        self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
+
+    def test_no_notice_is_not_an_error(self):
+        self.assertIsNone(fa.take_restart_notice())
+
+    def test_a_stale_notice_is_dropped(self):
+        fa.write_restart_notice("room1234", None, "vroxy_dispatch 1.0.0")
+        stale = json.loads(fa.RESTART_NOTICE_PATH.read_text())
+        stale["at"] = stale["at"] - fa.RESTART_NOTICE_MAX_AGE_SECONDS - 60
+        fa.RESTART_NOTICE_PATH.write_text(json.dumps(stale), encoding="utf-8")
+        self.assertIsNone(fa.take_restart_notice())
+
+    def test_a_corrupt_notice_is_dropped_not_raised(self):
+        fa.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        fa.RESTART_NOTICE_PATH.write_text("{not json", encoding="utf-8")
+        self.assertIsNone(fa.take_restart_notice())
+
+    def test_a_notice_with_no_room_is_dropped(self):
+        fa.write_restart_notice(None, None, "vroxy_dispatch 1.0.0")
+        self.assertIsNone(fa.take_restart_notice())
+
+
+class RestartIfSelfUpdatedTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCase):
+    """The whole point: a run that edits dispatch leaves the process
+    answering from code that no longer exists."""
+
+    ROOM = {"room": {"hashid": "room1234"}, "message": {"hashid": "msg5678"}}
+
+    async def asyncSetUp(self):
+        self.start_sandbox()
+        self.scheduled = []
+        self._saved_schedule = fa.schedule_restart
+        fa.schedule_restart = lambda: (self.scheduled.append(1), (True, "unit-test"))[1]
+        self._saved_queue = fa._work_queue
+        fa._work_queue = asyncio.Queue()
+
+    async def asyncTearDown(self):
+        fa.schedule_restart = self._saved_schedule
+        fa._work_queue = self._saved_queue
+        self.stop_sandbox()
+
+    async def test_an_unchanged_checkout_does_nothing(self):
+        link = fa.CableLink()
+        await fa.restart_if_self_updated(link, "room", self.ROOM)
+        self.assertEqual([], self.scheduled)
+        self.assertEqual([], sent_bodies(link))
+
+    async def test_an_update_announces_then_restarts(self):
+        self.edit_source('AGENT_VERSION = "vroxy_dispatch 9.9.10"\n')
+        link = fa.CableLink()
+        await fa.restart_if_self_updated(link, "room", self.ROOM)
+
+        self.assertEqual([1], self.scheduled)
+        bodies = sent_bodies(link)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("9.9.10", bodies[0])
+        notice = json.loads(fa.RESTART_NOTICE_PATH.read_text())
+        self.assertEqual("room1234", notice["room_id"])
+        self.assertEqual("msg5678", notice["reply_to"])
+
+    async def test_it_waits_for_the_queue_to_drain(self):
+        # The work queue is in memory.  Restarting on top of it
+        # swallows every message still on it, silently.
+        self.edit_source()
+        await fa._work_queue.put(("room", {}))
+        link = fa.CableLink()
+        await fa.restart_if_self_updated(link, "room", self.ROOM)
+        self.assertEqual([], self.scheduled)
+        self.assertEqual([], sent_bodies(link))
+
+        fa._work_queue.get_nowait()
+        await fa.restart_if_self_updated(link, "room", self.ROOM)
+        self.assertEqual([1], self.scheduled)
+
+    async def test_it_refuses_to_restart_into_a_build_that_will_not_compile(self):
+        self.edit_source("def broken(:\n")
+        link = fa.CableLink()
+        await fa.restart_if_self_updated(link, "room", self.ROOM)
+
+        self.assertEqual([], self.scheduled, "a syntax error restarts into a crash loop")
+        self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
+        self.assertIn("doesn't compile", sent_bodies(link)[0])
+
+    async def test_it_only_fires_once(self):
+        self.edit_source()
+        link = fa.CableLink()
+        await fa.restart_if_self_updated(link, "room", self.ROOM)
+        await fa.restart_if_self_updated(link, "room", self.ROOM)
+        self.assertEqual([1], self.scheduled)
+
+    async def test_a_failed_schedule_says_so_and_leaves_no_notice(self):
+        # Reporting a restart that never happened is worse than
+        # reporting the failure — the next boot would announce a
+        # version change nobody made.
+        self.edit_source()
+        fa.schedule_restart = lambda: (False, "sudo: a password is required")
+        link = fa.CableLink()
+        await fa.restart_if_self_updated(link, "room", self.ROOM)
+
+        self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
+        self.assertIn("couldn't restart", sent_bodies(link)[-1])
+        self.assertIn("systemctl restart", sent_bodies(link)[-1])
+
+    async def test_a_non_room_update_restarts_without_announcing(self):
+        # An approved proposal can update dispatch too; there's no
+        # room to speak in, and guessing one would be worse.
+        self.edit_source()
+        link = fa.CableLink()
+        await fa.restart_if_self_updated(link, "approve", {"feedback_id": "abc"})
+        self.assertEqual([1], self.scheduled)
+        self.assertEqual([], sent_bodies(link))
+        self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
+
+
+class AnnounceRestartTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.start_sandbox()
+
+    async def asyncTearDown(self):
+        self.stop_sandbox()
+
+    def write_notice(self, from_version):
+        fa.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        fa.RESTART_NOTICE_PATH.write_text(json.dumps({
+            "room_id": "room1234", "reply_to": "msg5678",
+            "from_version": from_version, "to_version": fa.AGENT_VERSION,
+            "at": time.time(),
+        }), encoding="utf-8")
+
+    async def test_the_process_that_came_back_reports_its_version(self):
+        self.write_notice("vroxy_dispatch 0.0.1")
+        link = fa.CableLink()
+        await fa.announce_restart(link)
+
+        bodies = sent_bodies(link)
+        self.assertEqual(1, len(bodies))
+        self.assertIn(fa.AGENT_VERSION, bodies[0])
+        self.assertIn("0.0.1", bodies[0], "the version it came from is the interesting half")
+
+    async def test_nothing_is_said_when_no_restart_happened(self):
+        link = fa.CableLink()
+        await fa.announce_restart(link)
+        self.assertEqual([], sent_bodies(link))
+
+    async def test_a_reconnect_does_not_re_announce(self):
+        fa.write_restart_notice("room1234", None, "vroxy_dispatch 9.9.10")
+        link = fa.CableLink()
+        await fa.announce_restart(link)
+        await fa.announce_restart(link)
+        self.assertEqual(1, len(sent_bodies(link)))
 
 
 if __name__ == "__main__":

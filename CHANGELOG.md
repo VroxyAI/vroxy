@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.10.0
+
+- **Dispatch restarts itself when a run edits its own checkout.**
+  "@Dispatch ship a fix to yourself" left the process running the OLD
+  code while the heartbeat reported the new version number. After every
+  finished task it hashes the files systemd actually executes
+  (`feedback_agent.py` + `bin/claude-chat`) against what it booted with
+  — hashing bytes rather than reading `AGENT_VERSION` catches a fix
+  shipped without a version bump, and an edit never committed.
+- Four guards before it goes. It **waits for the work queue to drain**
+  (that queue is in memory; restarting on top of it swallows the
+  messages still on it), **byte-compiles what's on disk** (a restart
+  into a SyntaxError is a crash loop — systemd hits the start limit and
+  dispatch is off the air until a human notices; it says so in the room
+  and stays on the old build instead), says one line that it's going so
+  the gap doesn't read as having died, and writes a restart notice to
+  `~/.cache/vroxy-dispatch/` because in-memory state can't survive the
+  restart it describes.
+- The restart is scheduled from OUTSIDE its own cgroup, with
+  `systemd-run --on-active=5s --collect systemctl restart <unit>`.
+  `systemctl restart` from inside would work, but systemd stops a unit
+  by killing its whole cgroup — including any Claude still finishing.
+  Falls back to exiting non-zero, and only when the unit's `Restart=`
+  policy actually restarts on failure; under `Restart=no` that would
+  take dispatch dark, so it reports the failure and keeps serving.
+- The new process announces at boot, on `confirm_subscription` — the
+  first moment the cable will accept a post: `✅ Back up on
+  vroxy_dispatch 0.10.0 (abc1234) — was 0.9.0`, threaded under the
+  message that asked. The notice is deleted on READ, before the post is
+  attempted: every reconnect confirms the subscription again, and one
+  that survived a read would be re-announced on each of them. Notices
+  older than 15 minutes are dropped. A task with no room behind it
+  restarts without announcing rather than guessing at one.
+- 25 new tests, including that the queue-drain and compile guards
+  actually bite.
+
 ## 0.9.0
 
 - **Every run reports what it cost.** The CLI's `result` event carries
