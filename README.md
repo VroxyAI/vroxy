@@ -333,6 +333,18 @@ own. An unrecognised value raises at the first run rather than
 falling back, because a typo that silently ran the other model is
 worse than a loud failure.
 
+The engine is reported in the heartbeat as `meta.engine`, and the
+server registers this install as a `claude_code` or `codex`
+DispatchAgent accordingly — which is what makes it @-mentionable
+under its own name. Flipping `DISPATCH_ENGINE` on an existing install
+MOVES that agent rather than creating a second one, so the room and
+its history follow.
+
+Every local agent in a workspace subscribes to the same tenant
+channel, so a box running both engines sees each room message twice.
+The broadcast names the agent it was routed to and each instance
+ignores the other's work; without that they would both answer.
+
 Both engines produce the SAME event vocabulary — `tool_use`,
 `text_delta`, `thinking`, `result`, `stalled` — so the progress
 trail, the room reply, the proposal flow and the stall kill are

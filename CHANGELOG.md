@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.23.0
+
+### Added
+
+- **The heartbeat reports `meta.engine`.** The server keys the agent
+  row on it, so a `DISPATCH_ENGINE=codex` instance registers as a
+  `codex` DispatchAgent rather than as Claude Code — that is what
+  makes it @-mentionable under its own name in a room.
+- **Work addressed to another engine is left alone.** Every local
+  agent in a workspace subscribes to the same tenant channel, so a
+  box running one Claude instance and one Codex instance sees each
+  room message twice and, before this, both would have answered. The
+  server already named the agent it routed to; `_is_ours` reads that
+  kind and returns early when it is not this engine's.
+- A frame carrying no agent block is still answered, so an older
+  server does not go silent against a newer dispatch.
+
 ## 0.22.0
 
 ### Added

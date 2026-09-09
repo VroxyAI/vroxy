@@ -126,7 +126,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.22.0"
+AGENT_VERSION      = "vroxy_dispatch 0.23.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -291,7 +291,8 @@ async def heartbeat(ws) -> None:
     """Heartbeat frame.  AdminFeedbackChannel#heartbeat writes it
     into Rails.cache under a tenant-scoped key with a 60 s TTL —
     the admin index card polls that key to show 🟢/🔴 + version."""
-    meta = {"status": _current_status, "project": PROJECT}
+    meta = {"status": _current_status, "project": PROJECT,
+            "engine": DISPATCH_ENGINE}
     # Only sent when configured — an install that predates install.sh
     # keeps the old single-agent resolution rather than registering a
     # duplicate under a name nobody chose.
@@ -2605,6 +2606,35 @@ def ask_fallback(body: str, ask: dict) -> str:
     return f"{body}\n\n{tail}" if body else tail
 
 
+
+# Which DispatchAgent kind this process answers as.  The server keys
+# an agent row on the engine it reports, so the two must agree or a
+# codex instance registers itself as Claude Code.
+ENGINE_AGENT_KINDS = {"claude": "claude_code", "codex": "codex"}
+
+
+def _is_ours(payload: dict) -> bool:
+    """Whether work addressed to an agent belongs to THIS instance.
+
+    Local agents all subscribe to the same tenant channel, so a
+    workspace running one Claude instance and one Codex instance
+    sees every room message twice.  The server names the agent it
+    routed to; anything addressed to another engine is somebody
+    else's turn.
+
+    A frame with no agent block predates this and is answered as
+    before — an older server must not go silent against a newer
+    dispatch.
+    """
+    agent = payload.get("agent")
+    if not isinstance(agent, dict):
+        return True
+    kind = (agent.get("kind") or "").strip()
+    if not kind:
+        return True
+    return kind == ENGINE_AGENT_KINDS.get(DISPATCH_ENGINE, "claude_code")
+
+
 async def handle_room_message(ws, payload: dict) -> None:
     """`room.message` handler — dispatch's turn in a workspace room.
 
@@ -2617,6 +2647,12 @@ async def handle_room_message(ws, payload: dict) -> None:
     room_id = room.get("hashid")
     if not room_id:
         log.warning("room.message without room.hashid: %s", payload)
+        return
+
+    if not _is_ours(payload):
+        agent = payload.get("agent") or {}
+        log.info("room.message for %s (%s) — not this engine (%s), leaving it",
+                 agent.get("name"), agent.get("kind"), DISPATCH_ENGINE)
         return
 
     body = (msg.get("body") or "").strip()

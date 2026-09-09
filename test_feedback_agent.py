@@ -1863,6 +1863,56 @@ class EngineSelectorTest(unittest.TestCase):
             fa.run_agent_streamed("p", "vroxy_web", lambda e: None)
 
 
+
+class EngineAddressingTest(unittest.TestCase):
+    """One workspace can run a Claude instance and a Codex instance;
+    both see every room message on the tenant channel, so each must
+    answer only what was routed to it."""
+
+    def setUp(self):
+        self._engine = fa.DISPATCH_ENGINE
+
+    def tearDown(self):
+        fa.DISPATCH_ENGINE = self._engine
+
+    def test_claude_answers_a_claude_code_agent(self):
+        fa.DISPATCH_ENGINE = "claude"
+        self.assertTrue(fa._is_ours({"agent": {"kind": "claude_code"}}))
+
+    def test_claude_leaves_codex_work_alone(self):
+        fa.DISPATCH_ENGINE = "claude"
+        self.assertFalse(fa._is_ours({"agent": {"kind": "codex"}}))
+
+    def test_codex_answers_a_codex_agent(self):
+        fa.DISPATCH_ENGINE = "codex"
+        self.assertTrue(fa._is_ours({"agent": {"kind": "codex"}}))
+
+    def test_codex_leaves_claude_work_alone(self):
+        fa.DISPATCH_ENGINE = "codex"
+        self.assertFalse(fa._is_ours({"agent": {"kind": "claude_code"}}))
+
+    def test_a_frame_with_no_agent_is_still_answered(self):
+        fa.DISPATCH_ENGINE = "codex"
+        self.assertTrue(fa._is_ours({"room": {"hashid": "r1"}}))
+        self.assertTrue(fa._is_ours({"agent": None}))
+        self.assertTrue(fa._is_ours({"agent": {"name": "Dispatch"}}))
+
+    def test_the_heartbeat_names_the_engine(self):
+        sent = {}
+
+        async def fake_send(ws, kind, payload, buffer=True):
+            sent.update(payload)
+
+        real = fa.cable_send
+        fa.cable_send = fake_send
+        fa.DISPATCH_ENGINE = "codex"
+        try:
+            asyncio.run(fa.heartbeat(None))
+        finally:
+            fa.cable_send = real
+        self.assertEqual(sent["meta"]["engine"], "codex")
+
+
 if __name__ == "__main__":
     unittest.main()
 
