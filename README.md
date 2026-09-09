@@ -374,6 +374,29 @@ What differs, deliberately:
   bypass every shell call returns "Operation not permitted" and the
   model reports failure instead of working.
 
+## Harness inventory
+
+Every heartbeat carries `meta.harnesses` — which coding CLIs this box
+has, with versions:
+
+```json
+[{"id": "claude", "label": "Claude Code", "version": "2.1.233 (Claude Code)",
+  "engine": "claude", "active": true},
+ {"id": "codex", "label": "OpenAI Codex", "version": "codex-cli 0.153.4",
+  "engine": "codex", "active": false}]
+```
+
+`engine` is the `DISPATCH_ENGINE` value that drives it, absent for one
+we can only report on — knowing Gemini is installed is useful before
+we can run it. `active` marks the one this instance is running. The
+server stores the list on the agent row and shows it at
+`/admin/mgmt/dispatch_agents/:id`.
+
+Probed at startup and refreshed every 15 minutes, in a thread, so
+installing a CLI does not need a restart and a slow `--version` cannot
+stall the socket. Add one to `KNOWN_HARNESSES`; `<ID>_BIN` overrides
+PATH the same way `CLAUDE_BIN` and `CODEX_BIN` do.
+
 ## Watching what it's doing
 
 Every run logs to the terminal **and** to a rotating file, so a

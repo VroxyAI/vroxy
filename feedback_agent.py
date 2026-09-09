@@ -126,7 +126,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.23.0"
+AGENT_VERSION      = "vroxy_dispatch 0.24.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -287,12 +287,98 @@ async def subscribe(ws) -> None:
     await cable_send(ws, "subscribe", buffer=False)
 
 
+# Every coding CLI this dispatch knows how to look for.  `engine` is
+# the DISPATCH_ENGINE value that runs it, or None for one we can only
+# report on — knowing Gemini is installed is useful to an operator
+# deciding what to configure even before we can drive it.
+KNOWN_HARNESSES = (
+    {"id": "claude", "label": "Claude Code",   "bin": "claude",       "engine": "claude"},
+    {"id": "codex",  "label": "OpenAI Codex",  "bin": "codex",        "engine": "codex"},
+    {"id": "gemini", "label": "Gemini CLI",    "bin": "gemini",       "engine": None},
+    {"id": "copilot", "label": "GitHub Copilot CLI", "bin": "copilot", "engine": None},
+    {"id": "aider",  "label": "Aider",         "bin": "aider",        "engine": None},
+    {"id": "opencode", "label": "OpenCode",    "bin": "opencode",     "engine": None},
+    {"id": "cursor", "label": "Cursor Agent",  "bin": "cursor-agent", "engine": None},
+    {"id": "amp",    "label": "Amp",           "bin": "amp",          "engine": None},
+    {"id": "goose",  "label": "Goose",         "bin": "goose",        "engine": None},
+)
+
+# A `--version` that hangs must not hold the heartbeat open, and the
+# whole sweep has to stay far under STALL_SECONDS — nine probes at
+# five seconds is the worst case and it is still well inside it.
+HARNESS_PROBE_TIMEOUT  = 5
+HARNESS_REPROBE_SECONDS = 900
+
+_harness_cache: tuple[float, list] | None = None
+
+
+def _harness_version(path: str) -> str | None:
+    """`<bin> --version`, first line, or None if it won't answer."""
+    try:
+        out = subprocess.run(
+            [path, "--version"], capture_output=True, text=True,
+            timeout=HARNESS_PROBE_TIMEOUT,
+        )
+    except Exception:
+        return None
+    text = (out.stdout or out.stderr or "").strip()
+    if not text:
+        return None
+    return _one_line(text.splitlines()[0], 60)
+
+
+def probe_harnesses() -> list[dict]:
+    """Which coding CLIs are installed on this box.
+
+    Reported so an operator can see what a checkout could be driven
+    with without shelling into it.  An entry that resolves but won't
+    report a version is still listed — installed-but-broken is a
+    different problem from not installed, and flattening the two into
+    "absent" hides the one worth fixing.
+    """
+    from shutil import which
+    found = []
+    for h in KNOWN_HARNESSES:
+        override = os.environ.get(f"{h['id'].upper()}_BIN")
+        path = override if override and Path(override).exists() else which(h["bin"])
+        if not path:
+            continue
+        entry = {"id": h["id"], "label": h["label"]}
+        version = _harness_version(path)
+        if version:
+            entry["version"] = version
+        if h["engine"]:
+            entry["engine"] = h["engine"]
+        entry["active"] = h["engine"] == DISPATCH_ENGINE
+        found.append(entry)
+    return found
+
+
+def harnesses(now: float | None = None) -> list[dict]:
+    """Cached [probe_harnesses], refreshed every
+    HARNESS_REPROBE_SECONDS so a CLI installed while dispatch runs
+    turns up without a restart, without spawning nine subprocesses on
+    every 20-second heartbeat."""
+    global _harness_cache
+    now = time.monotonic() if now is None else now
+    if _harness_cache and (now - _harness_cache[0]) < HARNESS_REPROBE_SECONDS:
+        return _harness_cache[1]
+    found = probe_harnesses()
+    _harness_cache = (now, found)
+    log.info("harnesses on this box: %s",
+             ", ".join(f"{h['id']}={h.get('version', '?')}" for h in found) or "none")
+    return found
+
+
 async def heartbeat(ws) -> None:
     """Heartbeat frame.  AdminFeedbackChannel#heartbeat writes it
     into Rails.cache under a tenant-scoped key with a 60 s TTL —
     the admin index card polls that key to show 🟢/🔴 + version."""
     meta = {"status": _current_status, "project": PROJECT,
-            "engine": DISPATCH_ENGINE}
+            "engine": DISPATCH_ENGINE,
+            # Probing blocks on subprocesses, so it never runs on the
+            # event loop — a slow `--version` would stall the socket.
+            "harnesses": await asyncio.to_thread(harnesses)}
     # Only sent when configured — an install that predates install.sh
     # keeps the old single-agent resolution rather than registering a
     # duplicate under a name nobody chose.

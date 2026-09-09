@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.24.0
+
+### Added
+
+- **Reports which coding CLIs are installed on this box.** The
+  heartbeat carries `meta.harnesses`: Claude Code, Codex, Gemini,
+  GitHub Copilot CLI, Aider, OpenCode, Cursor Agent, Amp and Goose,
+  each with its `--version` and a flag for the one this instance
+  actually runs. The server stores it on the agent row, so
+  "what could this checkout be driven with?" is answerable from
+  `/admin/mgmt` without shelling in.
+- A CLI that resolves but will not report a version is still listed
+  without one — installed-but-broken is a different problem from not
+  installed, and flattening the two into "absent" hides the one worth
+  fixing.
+- The probe is cached for 15 minutes rather than run on every 20s
+  heartbeat, and refreshes on that timer so a CLI installed while
+  dispatch is running turns up without a restart. It runs in a thread:
+  a slow `--version` must never stall the socket, and a full sweep of
+  every known harness stays well inside `STALL_SECONDS` — asserted by
+  a test rather than assumed.
+- `<ID>_BIN` overrides are honoured, so a CLI installed off PATH is
+  found the same way `CLAUDE_BIN` and `CODEX_BIN` already work.
+
 ## 0.23.0
 
 ### Added

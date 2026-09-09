@@ -1913,6 +1913,109 @@ class EngineAddressingTest(unittest.TestCase):
         self.assertEqual(sent["meta"]["engine"], "codex")
 
 
+
+class HarnessProbeTest(unittest.TestCase):
+    """What coding CLIs this box has, reported so an operator does not
+    have to shell in to find out."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._path = os.environ.get("PATH", "")
+        self._engine = fa.DISPATCH_ENGINE
+        os.environ["PATH"] = self.tmp
+        fa._harness_cache = None
+
+    def tearDown(self):
+        os.environ["PATH"] = self._path
+        fa.DISPATCH_ENGINE = self._engine
+        fa._harness_cache = None
+        for var in ("CLAUDE_BIN", "CODEX_BIN", "GEMINI_BIN"):
+            os.environ.pop(var, None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _install(self, name, version_output="9.9.9", exit_code=0):
+        path = Path(self.tmp) / name
+        path.write_text(f'#!/bin/sh\necho "{version_output}"\nexit {exit_code}\n')
+        path.chmod(0o755)
+        return path
+
+    def test_only_what_is_installed_is_reported(self):
+        self._install("codex", "codex-cli 0.153.4")
+        found = fa.probe_harnesses()
+        self.assertEqual([h["id"] for h in found], ["codex"])
+        self.assertEqual(found[0]["version"], "codex-cli 0.153.4")
+
+    def test_nothing_installed_reports_an_empty_list_not_an_error(self):
+        self.assertEqual(fa.probe_harnesses(), [])
+
+    def test_a_cli_that_will_not_report_a_version_is_still_listed(self):
+        self._install("aider", "", exit_code=1)
+        found = fa.probe_harnesses()
+        self.assertEqual([h["id"] for h in found], ["aider"])
+        self.assertNotIn("version", found[0],
+                         "installed-but-broken must not read as absent")
+
+    def test_the_running_engine_is_flagged_active(self):
+        self._install("claude")
+        self._install("codex")
+        fa.DISPATCH_ENGINE = "codex"
+        found = {h["id"]: h for h in fa.probe_harnesses()}
+        self.assertTrue(found["codex"]["active"])
+        self.assertFalse(found["claude"]["active"])
+
+    def test_a_harness_we_cannot_drive_is_reported_without_an_engine(self):
+        self._install("gemini")
+        found = fa.probe_harnesses()
+        self.assertEqual(found[0]["id"], "gemini")
+        self.assertNotIn("engine", found[0])
+
+    def test_an_explicit_bin_override_wins_over_path(self):
+        outside = Path(self.tmp) / "elsewhere"
+        outside.mkdir()
+        binary = outside / "codex-real"
+        binary.write_text('#!/bin/sh\necho "codex-cli 1.2.3"\n')
+        binary.chmod(0o755)
+        os.environ["CODEX_BIN"] = str(binary)
+        found = {h["id"]: h for h in fa.probe_harnesses()}
+        self.assertEqual(found["codex"]["version"], "codex-cli 1.2.3")
+
+    def test_the_probe_is_cached_rather_than_run_every_heartbeat(self):
+        self._install("codex")
+        calls = []
+        real = fa.probe_harnesses
+        fa.probe_harnesses = lambda: calls.append(1) or [{"id": "codex"}]
+        try:
+            fa.harnesses(now=1000.0)
+            fa.harnesses(now=1000.0 + fa.HARNESS_REPROBE_SECONDS - 1)
+            self.assertEqual(len(calls), 1)
+            fa.harnesses(now=1000.0 + fa.HARNESS_REPROBE_SECONDS + 1)
+            self.assertEqual(len(calls), 2,
+                             "a CLI installed while dispatch runs should turn "
+                             "up without a restart")
+        finally:
+            fa.probe_harnesses = real
+
+    def test_every_probe_timeout_stays_under_the_stall_ceiling(self):
+        worst_case = fa.HARNESS_PROBE_TIMEOUT * len(fa.KNOWN_HARNESSES)
+        self.assertLess(worst_case, fa.STALL_SECONDS,
+                        "a full sweep must not outlast the stall window")
+
+    def test_the_heartbeat_carries_the_harness_list(self):
+        self._install("codex")
+        sent = {}
+
+        async def fake_send(ws, kind, payload, buffer=True):
+            sent.update(payload)
+
+        real = fa.cable_send
+        fa.cable_send = fake_send
+        try:
+            asyncio.run(fa.heartbeat(None))
+        finally:
+            fa.cable_send = real
+        self.assertEqual([h["id"] for h in sent["meta"]["harnesses"]], ["codex"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
