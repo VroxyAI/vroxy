@@ -89,6 +89,10 @@ CLAUDE_CHAT_BIN = os.environ.get(
     str(Path(__file__).resolve().parent / "bin" / "claude-chat"),
 )
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
+# Which CLI actually does the work.  `claude` or `codex`; anything
+# else is refused at startup rather than silently falling back, so a
+# typo in the unit file can't quietly run the wrong model.
+DISPATCH_ENGINE = os.environ.get("DISPATCH_ENGINE", "claude").strip().lower()
 
 # Self-update: dispatch edits its own checkout often enough that a
 # run can leave the process running code that no longer exists on
@@ -122,7 +126,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.21.0"
+AGENT_VERSION      = "vroxy_dispatch 0.22.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -963,6 +967,24 @@ def _resolve_claude_bin() -> str:
     raise FileNotFoundError("`claude` binary not found. Set CLAUDE_BIN or put it on PATH.")
 
 
+
+def _resolve_codex_bin() -> str:
+    """$CODEX_BIN → PATH → ~/.local/bin/codex → /usr/local/bin/codex.
+    Fail-loud for the same reason `claude` does: a missing binary must
+    not read as an agent that had nothing to say."""
+    override = os.environ.get("CODEX_BIN")
+    if override:
+        return override
+    from shutil import which
+    on_path = which("codex")
+    if on_path:
+        return on_path
+    for guess in (Path.home() / ".local/bin/codex", Path("/usr/local/bin/codex")):
+        if guess.is_file() and os.access(guess, os.X_OK):
+            return str(guess)
+    raise FileNotFoundError("`codex` binary not found. Set CODEX_BIN or put it on PATH.")
+
+
 _STALLED = object()
 
 
@@ -1224,6 +1246,268 @@ def run_claude_streamed(prompt: str, project: str, on_event,
             + (f": {_one_line(stderr_text, 300)}" if stderr_text else ""))
 
     return "".join(final_text_chunks).strip()
+
+
+def run_codex_streamed(prompt: str, project: str, on_event,
+                       allow_resume: bool = True,
+                       session_key: str | None = None,
+                       work_dir_override: Path | None = None) -> str:
+    """`codex exec --json` variant of [run_claude_streamed].
+
+    Same contract on purpose: same signature, the same normalised
+    event vocabulary out of `on_event` (`tool_use` / `text_delta` /
+    `thinking` / `result` / `stalled`), the same stall kill, the same
+    stale-session retry, the same return of the final answer text.
+    Everything downstream — ProgressTrail, the room reply, the
+    proposal flow — is engine-agnostic because of that and needs no
+    branch of its own.
+
+    Codex speaks a different stream: `thread.started` carries the id
+    to resume, work arrives as `item.started` / `item.completed` with
+    an `item.type`, and the turn closes with `turn.completed`."""
+    work_dir = str(work_dir_override or (CODE_ROOT / project))
+    if not Path(work_dir).is_dir():
+        raise FileNotFoundError(
+            f"CODE_ROOT/{project} not found at {work_dir!r}. "
+            f"Set CODE_ROOT and/or PROJECT env vars — CODE_ROOT currently = {CODE_ROOT!r}"
+        )
+    codex_bin = _resolve_codex_bin()
+    sid_file = _streamed_sid_file(f"codex_{session_key or project}")
+    sid_file.parent.mkdir(parents=True, exist_ok=True)
+
+    stored_sid = sid_file.read_text().strip() if sid_file.exists() else ""
+    resumed = bool(allow_resume and stored_sid)
+
+    # The worktree this runs in is already disposable and already the
+    # trust boundary, exactly as it is for claude's
+    # --dangerously-skip-permissions.  Codex additionally cannot nest
+    # its own sandbox inside the one this box already runs under, so
+    # without the bypass every shell call comes back "Operation not
+    # permitted" and the model reports failure instead of working.
+    flags = ["--json", "--skip-git-repo-check",
+             "--dangerously-bypass-approvals-and-sandbox",
+             "-C", work_dir]
+    if resumed:
+        argv = [codex_bin, "exec", "resume", stored_sid] + flags + [prompt]
+    else:
+        argv = [codex_bin, "exec"] + flags + [prompt]
+
+    log.info("Running streamed codex in %s (session=%s, resume=%s)",
+             work_dir, sid_file, resumed)
+    proc = subprocess.Popen(
+        argv, cwd=work_dir, env=os.environ.copy(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+        start_new_session=True,
+    )
+
+    messages: list[str] = []
+    new_sid: str | None = None
+    usage: dict = {}
+    turn_failed = False
+    tool_calls = 0
+    text_chars = 0
+    thinking_chars = 0
+    stalled_windows = 0
+    killed_for_stall = False
+
+    try:
+        for raw in _stream_lines(proc):
+            if raw is _STALLED:
+                stalled_windows += 1
+                waited = stalled_windows * STALL_SECONDS
+                log.warning("codex produced nothing for %ss (window %s/%s)",
+                            waited, stalled_windows, STALL_WINDOWS_BEFORE_KILL)
+                try:
+                    on_event({"type": "stalled", "seconds": waited,
+                              "window": stalled_windows,
+                              "max_windows": STALL_WINDOWS_BEFORE_KILL})
+                except Exception:
+                    log.exception("on_event stalled raised")
+                if stalled_windows >= STALL_WINDOWS_BEFORE_KILL:
+                    killed_for_stall = True
+                    log.error("killing wedged codex run after %ss of silence", waited)
+                    _kill_process_tree(proc)
+                    break
+                continue
+            stalled_windows = 0
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            etype = event.get("type")
+
+            if etype == "thread.started":
+                tid = event.get("thread_id")
+                if tid:
+                    new_sid = str(tid)
+                continue
+
+            if etype in ("item.started", "item.completed"):
+                item = event.get("item") or {}
+                itype = item.get("type")
+
+                if itype == "command_execution":
+                    # Announced on start, matching claude's tool_use
+                    # timing — the room should see the command as it
+                    # runs, not once it has already finished.
+                    if etype == "item.started":
+                        tool_calls += 1
+                        command = item.get("command") or ""
+                        log.info("  → command %s", _one_line(command, 200))
+                        try:
+                            on_event({"type": "tool_use", "name": "Bash",
+                                      "input": {"command": command}})
+                        except Exception:
+                            log.exception("on_event tool_use raised")
+                    else:
+                        exit_code = item.get("exit_code")
+                        marker = "ok" if exit_code == 0 else f"⚠️ exit {exit_code}"
+                        log.info("  ← command %s %s", marker,
+                                 _one_line(item.get("aggregated_output") or "", 160))
+                    continue
+
+                if etype != "item.completed":
+                    continue
+
+                if itype == "agent_message":
+                    text = item.get("text") or ""
+                    if text:
+                        text_chars += len(text)
+                        messages.append(text)
+                        log.info("  → text %s", _one_line(text, 200))
+                        try:
+                            on_event({"type": "text_delta", "text": text})
+                        except Exception:
+                            log.exception("on_event text raised")
+                    continue
+
+                if itype == "reasoning":
+                    thought = item.get("text") or item.get("summary") or ""
+                    if thought:
+                        thinking_chars += len(thought)
+                        log.info("  · thinking %s", _one_line(thought, 200))
+                        try:
+                            on_event({"type": "thinking", "text": thought})
+                        except Exception:
+                            log.exception("on_event thinking raised")
+                    continue
+
+                # Any other item kind (file_change, mcp_tool_call,
+                # web_search, …) still reads as work happening, which
+                # is what the trail is for.  Reporting it by its own
+                # name beats dropping it because this build predates
+                # it.
+                if itype:
+                    tool_calls += 1
+                    try:
+                        on_event({"type": "tool_use", "name": str(itype),
+                                  "input": {k: v for k, v in item.items()
+                                            if k not in ("id", "type")}})
+                    except Exception:
+                        log.exception("on_event tool_use raised")
+                continue
+
+            if etype in ("turn.completed", "turn.failed"):
+                turn_failed = turn_failed or etype == "turn.failed"
+                usage = event.get("usage") or usage
+                if usage:
+                    log.info("  · usage %s", usage)
+                try:
+                    on_event({
+                        "type":        "result",
+                        "usage":       usage,
+                        # Codex bills against the signed-in plan and
+                        # reports no per-run price, so this is null
+                        # rather than a number we made up.
+                        "cost_usd":    None,
+                        "duration_ms": None,
+                        "num_turns":   None,
+                        "is_error":    turn_failed,
+                    })
+                except Exception:
+                    log.exception("on_event result raised")
+
+        try:
+            proc.wait(timeout=STALL_SECONDS)
+        except subprocess.TimeoutExpired:
+            log.error("codex closed stdout but would not exit — killing")
+            _kill_process_tree(proc)
+    finally:
+        if proc.stdout: proc.stdout.close()
+        stderr_text = ""
+        if proc.stderr:
+            if proc.poll() is None:
+                _kill_process_tree(proc)
+            stderr_text = proc.stderr.read() or ""
+            if stderr_text:
+                log.info("codex stderr: %s", stderr_text[:400])
+            proc.stderr.close()
+
+    failed = turn_failed or proc.returncode not in (0, None)
+    if failed:
+        log.warning("streamed codex rc=%s turn_failed=%s", proc.returncode, turn_failed)
+
+    # The LAST agent message is the answer; the ones before it are
+    # narration the trail has already shown.  Joining them all would
+    # repeat the commentary inside the reply.
+    final_text = messages[-1].strip() if messages else ""
+    produced_nothing = not final_text and tool_calls == 0
+
+    if killed_for_stall:
+        waited = STALL_SECONDS * STALL_WINDOWS_BEFORE_KILL
+        reason = (f"the run produced nothing for {waited}s, so I killed it as "
+                  f"wedged rather than leave you waiting")
+        if produced_nothing:
+            raise RuntimeError(reason)
+        log.warning("returning partial output from a stalled codex run")
+        return f"{final_text}\n\n⚠️ Cut short — {reason}.".strip()
+
+    if resumed and failed and produced_nothing:
+        log.warning("codex resume produced nothing (rc=%s) — dropping stale "
+                    "thread id and retrying fresh", proc.returncode)
+        try: sid_file.unlink(missing_ok=True)
+        except Exception: log.exception("clearing thread id failed")
+        return run_codex_streamed(prompt, project, on_event,
+                                  allow_resume=False, session_key=session_key,
+                                  work_dir_override=work_dir_override)
+
+    if new_sid and not failed:
+        try: sid_file.write_text(new_sid)
+        except Exception: log.exception("saving thread id failed")
+
+    log.info("streamed codex done — tool_calls=%d text_chars=%d thinking_chars=%d",
+             tool_calls, text_chars, thinking_chars)
+
+    if failed and produced_nothing:
+        raise RuntimeError(
+            f"codex exited {proc.returncode} with no output"
+            + (f": {_one_line(stderr_text, 300)}" if stderr_text else ""))
+
+    return final_text
+
+
+def run_agent_streamed(prompt: str, project: str, on_event,
+                       allow_resume: bool = True,
+                       session_key: str | None = None,
+                       work_dir_override: Path | None = None) -> str:
+    """Run whichever engine `DISPATCH_ENGINE` selects.
+
+    The only place in the process that knows there is more than one."""
+    if DISPATCH_ENGINE == "codex":
+        runner = run_codex_streamed
+    elif DISPATCH_ENGINE == "claude":
+        runner = run_claude_streamed
+    else:
+        raise ValueError(
+            f"DISPATCH_ENGINE={DISPATCH_ENGINE!r} is not a known engine "
+            f"(expected 'claude' or 'codex')")
+    return runner(prompt, project, on_event, allow_resume, session_key,
+                  work_dir_override)
 
 
 class ProgressTrail:
@@ -2175,7 +2459,7 @@ async def _run_proposal(ws, chat_id, prompt, worktree, on_stream_event):
     if STREAM_ENABLED:
         try:
             raw = await asyncio.to_thread(
-                run_claude_streamed, prompt, PROJECT, on_stream_event,
+                run_agent_streamed, prompt, PROJECT, on_stream_event,
                 True, None, worktree)
         except FileNotFoundError:
             raise
@@ -2394,7 +2678,7 @@ async def handle_room_message(ws, payload: dict) -> None:
 
     try:
         raw = await asyncio.to_thread(
-            run_claude_streamed, prompt, PROJECT, on_stream_event,
+            run_agent_streamed, prompt, PROJECT, on_stream_event,
             True, _room_session_key(room_id))
     except subprocess.TimeoutExpired:
         await room_reply(ws, room_id, "⚠️ I timed out after 30 minutes.", msg.get("hashid"))

@@ -311,7 +311,9 @@ attached to a User instead of a Tenant.
 | `VROXY_SERVICE_TOKEN` | *(required)*                        |
 | `CODE_ROOT`             | parent of this checkout             |
 | `PROJECT`               | `vroxy_web`                       |
+| `DISPATCH_ENGINE`       | `claude` (or `codex`)               |
 | `CLAUDE_CHAT_BIN`       | `./bin/claude-chat`                 |
+| `CODEX_BIN`             | `codex` on PATH                     |
 | `CLAUDE_STREAM`         | `1` (set `0` to skip streamed path) |
 | `LOG_LEVEL`             | `INFO`                              |
 | `LOG_FILE`              | `./log/dispatch.log` (`""` disables)|
@@ -320,6 +322,45 @@ attached to a User instead of a Tenant.
 | `VROXY_DISPATCH_UNIT`   | `vroxy-dispatch-feedback-agent.service` |
 | `VROXY_DISPATCH_RESTART_DELAY` | `5` (seconds before a self-restart fires) |
 | `VROXY_DISPATCH_STATE_DIR` | `~/.cache/vroxy-dispatch`        |
+
+## Which CLI does the work
+
+`DISPATCH_ENGINE` picks the engine for the whole process: `claude`
+(the default) or `codex` for OpenAI's Codex CLI. One instance runs
+one engine — to have both, install a second systemd instance with
+its own `DISPATCH_ENGINE`, the same way a second project gets its
+own. An unrecognised value raises at the first run rather than
+falling back, because a typo that silently ran the other model is
+worse than a loud failure.
+
+Both engines produce the SAME event vocabulary — `tool_use`,
+`text_delta`, `thinking`, `result`, `stalled` — so the progress
+trail, the room reply, the proposal flow and the stall kill are
+shared and know nothing about which CLI is behind them. Adding a
+third means one runner and one branch in `run_agent_streamed`.
+
+What differs, deliberately:
+
+- **Session resume.** Claude stores a session id and resumes with
+  `--resume`; Codex stores a `thread_id` and resumes with
+  `codex exec resume <id>`. Both keep it in the same `SID_DIR`, and
+  Codex's is prefixed `codex_` so switching engines can't hand a
+  thread id to the wrong CLI.
+- **The answer.** Claude's `result` event carries the final text.
+  Codex has no such event: the LAST `agent_message` is the answer and
+  the ones before it are narration the trail has already shown, so
+  joining them all would repeat the commentary inside the reply.
+- **Cost.** Claude reports `total_cost_usd` per run. Codex bills
+  against the signed-in plan and reports no price, so `cost_usd` is
+  null rather than a number we invented. Token usage is reported by
+  both.
+- **Sandboxing.** Codex runs with
+  `--dangerously-bypass-approvals-and-sandbox`, the counterpart of
+  claude's `--dangerously-skip-permissions`. The disposable worktree
+  is the trust boundary in both cases, and Codex cannot nest its own
+  sandbox inside the one this box already runs under — without the
+  bypass every shell call returns "Operation not permitted" and the
+  model reports failure instead of working.
 
 ## Watching what it's doing
 

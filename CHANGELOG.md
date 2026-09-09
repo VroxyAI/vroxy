@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.22.0
+
+### Added
+
+- **OpenAI's Codex CLI as a second engine.** `DISPATCH_ENGINE=codex`
+  runs `codex exec --json` instead of `claude -p`; `claude` stays the
+  default and nothing changes for an existing install. An
+  unrecognised value raises rather than falling back, so a typo can't
+  quietly run the other model.
+- `run_codex_streamed` mirrors `run_claude_streamed` exactly — same
+  signature, same normalised events (`tool_use` / `text_delta` /
+  `thinking` / `result` / `stalled`), same `STALL_SECONDS` kill, same
+  stale-session retry, same return of the final answer. The progress
+  trail, room reply and proposal flow needed no branch; the only
+  place that knows there are two engines is `run_agent_streamed`.
+- Codex's stream is mapped from what it actually emits, verified
+  against real runs: `thread.started` carries the resumable
+  `thread_id`, `item.started`/`item.completed` carry an `item.type`
+  (`command_execution` announced on START so the room sees a command
+  as it runs, `agent_message`, `reasoning`), and `turn.completed`
+  carries usage. An item kind this build predates is reported under
+  its own name rather than dropped.
+- The LAST `agent_message` is the answer — Codex has no `result`
+  event, and joining every message would repeat the narration the
+  trail already showed.
+- `cost_usd` is null for Codex: it bills the signed-in plan and
+  reports no per-run price, so there is nothing honest to put there.
+- stdin is `DEVNULL` for Codex runs — it reads stdin when it is
+  attached, which under a service manager is a way to hang.
+
 ## 0.21.0
 
 ### Removed

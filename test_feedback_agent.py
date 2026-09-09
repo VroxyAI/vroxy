@@ -19,6 +19,7 @@ import asyncio
 import subprocess
 import time
 import tempfile
+import shutil
 import logging
 import unittest
 from pathlib import Path
@@ -1697,6 +1698,169 @@ class StallTrailTest(unittest.TestCase):
         self.trail.feed({"type": "stalled", "seconds": 90,
                          "window": 1, "max_windows": 4})
         self.assertEqual(["text", "stalled"], [kind for kind, _ in self.lines])
+
+
+
+class _FakeProc:
+    """Stands in for a `codex exec --json` subprocess: stdout is the
+    canned JSONL, stderr is empty, and it has already exited."""
+
+    def __init__(self, lines, returncode=0):
+        import io
+        self.stdout = io.StringIO("".join(f"{l}\n" for l in lines))
+        self.stderr = io.StringIO("")
+        self.returncode = returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+
+class CodexStreamTest(unittest.TestCase):
+    """The codex event stream must come out of `on_event` in exactly
+    the vocabulary the claude one does — everything downstream reads
+    that and nothing else."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._sid_dir = fa.SID_DIR
+        fa.SID_DIR = Path(self.tmp) / "sids"
+        self._popen = fa.subprocess.Popen
+        self._bin = fa._resolve_codex_bin
+        fa._resolve_codex_bin = lambda: "/usr/bin/true"
+
+    def tearDown(self):
+        fa.SID_DIR = self._sid_dir
+        fa.subprocess.Popen = self._popen
+        fa._resolve_codex_bin = self._bin
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, lines, returncode=0, **kw):
+        events = []
+        fa.subprocess.Popen = lambda *a, **k: _FakeProc(lines, returncode)
+        text = fa.run_codex_streamed(
+            "do the thing", "vroxy_web", events.append,
+            work_dir_override=Path(self.tmp), **kw)
+        return text, events
+
+    def test_a_shell_call_becomes_a_tool_use_when_it_starts(self):
+        text, events = self._run([
+            json.dumps({"type": "thread.started", "thread_id": "T1"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.started", "item": {
+                "id": "i1", "type": "command_execution",
+                "command": "ls -la", "status": "in_progress"}}),
+            json.dumps({"type": "item.completed", "item": {
+                "id": "i1", "type": "command_execution",
+                "command": "ls -la", "exit_code": 0,
+                "aggregated_output": "note.txt"}}),
+            json.dumps({"type": "item.completed", "item": {
+                "id": "i2", "type": "agent_message", "text": "One file."}}),
+            json.dumps({"type": "turn.completed",
+                        "usage": {"input_tokens": 10, "output_tokens": 2}}),
+        ])
+        self.assertEqual(text, "One file.")
+        kinds = [e["type"] for e in events]
+        self.assertEqual(kinds, ["tool_use", "text_delta", "result"])
+        self.assertEqual(events[0]["name"], "Bash")
+        self.assertEqual(events[0]["input"]["command"], "ls -la")
+        self.assertFalse(events[-1]["is_error"])
+        self.assertIsNone(events[-1]["cost_usd"])
+
+    def test_the_last_message_is_the_answer_not_all_of_them(self):
+        text, events = self._run([
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": "I will look at the file."}}),
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": "It has three lines."}}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ])
+        self.assertEqual(text, "It has three lines.")
+        self.assertEqual([e["type"] for e in events],
+                         ["text_delta", "text_delta", "result"])
+
+    def test_reasoning_arrives_as_thinking(self):
+        _, events = self._run([
+            json.dumps({"type": "item.completed", "item": {
+                "type": "reasoning", "text": "Weighing two options."}}),
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": "Option B."}}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ])
+        self.assertEqual(events[0]["type"], "thinking")
+        self.assertEqual(events[0]["text"], "Weighing two options.")
+
+    def test_an_item_kind_this_build_predates_is_still_reported(self):
+        _, events = self._run([
+            json.dumps({"type": "item.completed", "item": {
+                "id": "i9", "type": "web_search", "query": "rails 8"}}),
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": "Found it."}}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ])
+        self.assertEqual(events[0]["type"], "tool_use")
+        self.assertEqual(events[0]["name"], "web_search")
+        self.assertEqual(events[0]["input"], {"query": "rails 8"})
+
+    def test_the_thread_id_is_stored_for_the_next_turn(self):
+        self._run([
+            json.dumps({"type": "thread.started", "thread_id": "T-42"}),
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": "done"}}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ], session_key="room-7")
+        sid = fa._streamed_sid_file("codex_room-7")
+        self.assertTrue(sid.exists())
+        self.assertEqual(sid.read_text(), "T-42")
+
+    def test_a_failed_turn_with_nothing_to_show_raises(self):
+        with self.assertRaises(RuntimeError):
+            self._run([json.dumps({"type": "turn.failed", "usage": {}})])
+
+    def test_a_failed_turn_that_did_work_still_answers(self):
+        text, _ = self._run([
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": "Got partway."}}),
+            json.dumps({"type": "turn.failed", "usage": {}}),
+        ])
+        self.assertEqual(text, "Got partway.")
+
+
+class EngineSelectorTest(unittest.TestCase):
+    def setUp(self):
+        self._engine = fa.DISPATCH_ENGINE
+
+    def tearDown(self):
+        fa.DISPATCH_ENGINE = self._engine
+
+    def test_the_default_engine_is_claude(self):
+        fa.DISPATCH_ENGINE = "claude"
+        seen = {}
+        real = fa.run_claude_streamed
+        fa.run_claude_streamed = lambda *a, **k: seen.setdefault("ran", "claude")
+        try:
+            fa.run_agent_streamed("p", "vroxy_web", lambda e: None)
+        finally:
+            fa.run_claude_streamed = real
+        self.assertEqual(seen["ran"], "claude")
+
+    def test_codex_selects_the_codex_runner(self):
+        fa.DISPATCH_ENGINE = "codex"
+        seen = {}
+        real = fa.run_codex_streamed
+        fa.run_codex_streamed = lambda *a, **k: seen.setdefault("ran", "codex")
+        try:
+            fa.run_agent_streamed("p", "vroxy_web", lambda e: None)
+        finally:
+            fa.run_codex_streamed = real
+        self.assertEqual(seen["ran"], "codex")
+
+    def test_a_typo_is_refused_rather_than_silently_run(self):
+        fa.DISPATCH_ENGINE = "cldue"
+        with self.assertRaises(ValueError):
+            fa.run_agent_streamed("p", "vroxy_web", lambda e: None)
 
 
 if __name__ == "__main__":
