@@ -133,7 +133,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.27.0"
+AGENT_VERSION      = "vroxy_dispatch 0.28.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -2369,7 +2369,13 @@ def _progress_line(name: str, input_dict: dict | None) -> str:
         for key in interesting:
             value = input_dict.get(key)
             if isinstance(value, str) and value.strip():
-                detail = value.strip().splitlines()[0][:120]
+                # The WHOLE value squashed onto one line, not its
+                # first line.  A multi-line command usually opens with
+                # `cd <somewhere>`, so first-line-only rendered a
+                # whole session as the same line over and over while
+                # the terminal log — which already used _one_line —
+                # showed what actually ran.
+                detail = _one_line(value, 120)
                 break
     return f"{name}({detail})" if detail else str(name)
 

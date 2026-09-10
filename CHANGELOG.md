@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.28.0
+
+### Fixed
+
+- **The working log in the web showed the same line over and over.**
+  `_progress_line` took `value.splitlines()[0]` — the first line of a
+  tool's command — and nearly every command opens by `cd`-ing to the
+  checkout, so a whole session rendered as
+  `Bash(cd /home/ubuntu/code/vroxy/vroxy_web)` repeated, with the
+  actual work discarded. The terminal log was right the whole time
+  because it already went through `_one_line`; only the room trail
+  was lying.
+- It now squashes the WHOLE value onto one line through that same
+  helper, so the two surfaces can't disagree about what ran. The
+  existing test asserted the broken behaviour — it was green for the
+  wrong reason — and has been rewritten alongside a regression case
+  built from two real `cd`-prefixed commands that used to render
+  identically.
+
 ## 0.27.0
 
 ### Added

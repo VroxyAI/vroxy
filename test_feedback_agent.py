@@ -671,13 +671,28 @@ class RoomProgressLineTest(unittest.TestCase):
         self.assertEqual("Read", fa._progress_line("Read", {"unknown_key": "x"}))
         self.assertEqual("Read", fa._progress_line("Read", {"file_path": "   "}))
 
-    def test_takes_one_line_and_caps_its_length(self):
+    def test_squashes_a_multi_line_command_rather_than_keeping_line_one(self):
         line = fa._progress_line("Bash", {"command": "echo one\necho two"})
-        self.assertEqual("Bash(echo one)", line)
+        self.assertEqual("Bash(echo one echo two)", line)
 
         long_line = fa._progress_line("Bash", {"command": "x" * 400})
         self.assertLessEqual(len(long_line), 140)
         self.assertTrue(long_line.startswith("Bash(x"))
+
+    def test_a_cd_prefixed_heredoc_still_says_what_it_ran(self):
+        # The real regression: nearly every command opens by cd-ing to
+        # the checkout, so first-line-only rendered a whole session as
+        # the same line repeated, while the terminal log showed the
+        # actual command.
+        first = fa._progress_line("Bash", {"command":
+            "cd /home/ubuntu/code/vroxy/vroxy_web\ngrep -n acme test/fixtures/tenant_memberships.yml"})
+        second = fa._progress_line("Bash", {"command":
+            "cd /home/ubuntu/code/vroxy/vroxy_web\nbin/test test/controllers/workspace/settings_nav_test.rb"})
+
+        self.assertNotEqual(first, second,
+                            "two different commands must not render identically")
+        self.assertIn("grep", first)
+        self.assertIn("bin/test", second)
 
 
 class RoomCommandTest(unittest.TestCase):
