@@ -2000,6 +2000,24 @@ class HarnessProbeTest(unittest.TestCase):
         self.assertLess(worst_case, fa.STALL_SECONDS,
                         "a full sweep must not outlast the stall window")
 
+    def test_opencode_and_pi_are_detected_with_their_versions(self):
+        self._install("opencode", "opencode 0.4.2")
+        self._install("pi", "pi 1.1.0")
+        found = {h["id"]: h for h in fa.probe_harnesses()}
+        self.assertEqual(found["opencode"]["version"], "opencode 0.4.2")
+        self.assertEqual(found["pi"]["version"], "pi 1.1.0")
+        self.assertNotIn("engine", found["opencode"],
+                         "detected but not yet drivable")
+        self.assertNotIn("engine", found["pi"])
+
+    def test_every_known_harness_has_a_distinct_id_and_binary(self):
+        ids = [h["id"] for h in fa.KNOWN_HARNESSES]
+        bins = [h["bin"] for h in fa.KNOWN_HARNESSES]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(len(bins), len(set(bins)),
+                         "two harnesses probing the same binary would "
+                         "report one install twice")
+
     def test_the_heartbeat_carries_the_harness_list(self):
         self._install("codex")
         sent = {}

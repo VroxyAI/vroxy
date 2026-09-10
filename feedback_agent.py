@@ -126,7 +126,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.24.0"
+AGENT_VERSION      = "vroxy_dispatch 0.25.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -298,6 +298,7 @@ KNOWN_HARNESSES = (
     {"id": "copilot", "label": "GitHub Copilot CLI", "bin": "copilot", "engine": None},
     {"id": "aider",  "label": "Aider",         "bin": "aider",        "engine": None},
     {"id": "opencode", "label": "OpenCode",    "bin": "opencode",     "engine": None},
+    {"id": "pi",     "label": "Pi",            "bin": "pi",           "engine": None},
     {"id": "cursor", "label": "Cursor Agent",  "bin": "cursor-agent", "engine": None},
     {"id": "amp",    "label": "Amp",           "bin": "amp",          "engine": None},
     {"id": "goose",  "label": "Goose",         "bin": "goose",        "engine": None},

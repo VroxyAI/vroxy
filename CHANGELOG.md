@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.25.0
+
+### Added
+
+- **Pi joins the detected harnesses.** OpenCode was already in the
+  probe from 0.24.0, versions included; `pi` was not. Both are
+  detected and version-reported, neither is drivable yet — writing a
+  runner means learning a CLI's headless event stream from the real
+  binary, and neither is installed on this box.
+- A test asserts no two known harnesses share a binary name, which
+  would report one install twice.
+
 ## 0.24.0
 
 ### Added
