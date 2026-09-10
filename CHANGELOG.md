@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.26.0
+
+### Added
+
+- **Every `room_run` names the engine that produced it.** The server
+  stamps it on the `DispatchRun` row rather than looking it up
+  through the agent, so per-harness cost and token numbers stay true
+  after someone flips `DISPATCH_ENGINE` — that flip moves the agent
+  row, and without this every past run would re-attribute itself to
+  the new engine.
+
 ## 0.25.0
 
 ### Added
