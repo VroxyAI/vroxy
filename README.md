@@ -312,6 +312,7 @@ attached to a User instead of a Tenant.
 | `CODE_ROOT`             | parent of this checkout             |
 | `PROJECT`               | `vroxy_web`                       |
 | `DISPATCH_ENGINE`       | `claude` (or `codex`)               |
+| `DISPATCH_TELEMETRY`    | `1` (set `0` to stop reporting the box) |
 | `CLAUDE_CHAT_BIN`       | `./bin/claude-chat`                 |
 | `CODEX_BIN`             | `codex` on PATH                     |
 | `CLAUDE_STREAM`         | `1` (set `0` to skip streamed path) |
@@ -391,6 +392,29 @@ we can only report on — knowing Gemini is installed is useful before
 we can run it. `active` marks the one this instance is running. The
 server stores the list on the agent row and shows it at
 `/admin/mgmt/dispatch_agents/:id`.
+
+### Turning it off
+
+It is on by default, because a fleet view of what is installed where
+is the point. But it is somebody's machine, so:
+
+```bash
+DISPATCH_TELEMETRY=0
+```
+
+stops the probe entirely — no subprocesses are spawned — and the
+heartbeat carries `meta.telemetry: false` instead of an inventory.
+
+That flag is an explicit opt-out, NOT a missing key, and the
+difference is load-bearing. A heartbeat that simply says nothing
+about harnesses is read as "this build predates the feature" and the
+server keeps the last inventory it had. `telemetry: false` makes the
+server **delete** what it already stored. Disabling telemetry has to
+mean the data stops existing, not that it stops being refreshed.
+
+Nothing else in the heartbeat is affected: status, project, engine,
+version and install id still go up, because those are what make the
+agent reachable and routable rather than observations about the host.
 
 Probed at startup and refreshed every 15 minutes, in a thread, so
 installing a CLI does not need a restart and a slow `--version` cannot

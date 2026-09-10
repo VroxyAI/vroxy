@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.27.0
+
+### Added
+
+- **`DISPATCH_TELEMETRY=0` turns the harness inventory off.** On by
+  default. When off the probe never runs — no subprocesses at all —
+  and the heartbeat sends `meta.telemetry: false`, which makes the
+  server DELETE the inventory it already holds rather than freeze it.
+  A heartbeat that just says nothing is still read as an older build
+  and keeps its last inventory; the explicit false is what
+  distinguishes "I opted out" from "I can't tell you". Status,
+  project, engine, version and install id are unaffected — those are
+  what make the agent reachable, not observations about the host.
+
 ## 0.26.0
 
 ### Added

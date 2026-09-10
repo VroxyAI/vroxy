@@ -2018,6 +2018,46 @@ class HarnessProbeTest(unittest.TestCase):
                          "two harnesses probing the same binary would "
                          "report one install twice")
 
+    def test_telemetry_off_sends_no_inventory_at_all(self):
+        self._install("codex")
+        sent = {}
+
+        async def fake_send(ws, kind, payload, buffer=True):
+            sent.update(payload)
+
+        real_send, real_flag = fa.cable_send, fa.TELEMETRY_ENABLED
+        fa.cable_send = fake_send
+        fa.TELEMETRY_ENABLED = False
+        try:
+            asyncio.run(fa.heartbeat(None))
+        finally:
+            fa.cable_send, fa.TELEMETRY_ENABLED = real_send, real_flag
+
+        self.assertNotIn("harnesses", sent["meta"])
+        self.assertIs(sent["meta"]["telemetry"], False,
+                      "an explicit opt-out, not silence — silence means "
+                      "'too old to say' and keeps the last inventory")
+
+    def test_telemetry_off_does_not_even_probe(self):
+        probed = []
+        real_probe, real_flag = fa.probe_harnesses, fa.TELEMETRY_ENABLED
+        fa.probe_harnesses = lambda: probed.append(1) or []
+        fa.TELEMETRY_ENABLED = False
+
+        async def fake_send(ws, kind, payload, buffer=True):
+            pass
+
+        real_send = fa.cable_send
+        fa.cable_send = fake_send
+        try:
+            asyncio.run(fa.heartbeat(None))
+        finally:
+            fa.probe_harnesses, fa.TELEMETRY_ENABLED = real_probe, real_flag
+            fa.cable_send = real_send
+
+        self.assertEqual(probed, [],
+                         "opting out must not still spawn the subprocesses")
+
     def test_the_heartbeat_carries_the_harness_list(self):
         self._install("codex")
         sent = {}

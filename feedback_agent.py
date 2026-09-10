@@ -93,6 +93,13 @@ SID_DIR         = Path.home() / ".cache" / "claude-chat"
 # else is refused at startup rather than silently falling back, so a
 # typo in the unit file can't quietly run the wrong model.
 DISPATCH_ENGINE = os.environ.get("DISPATCH_ENGINE", "claude").strip().lower()
+# Whether to inventory the coding CLIs on this box and report them.
+# ON by default — it is what makes the fleet view useful — but it is
+# somebody's machine, so `DISPATCH_TELEMETRY=0` turns it off and the
+# server DELETES what was already reported rather than just freezing
+# it.  Opting out has to mean the data stops existing.
+TELEMETRY_ENABLED = os.environ.get(
+    "DISPATCH_TELEMETRY", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # Self-update: dispatch edits its own checkout often enough that a
 # run can leave the process running code that no longer exists on
@@ -126,7 +133,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.26.0"
+AGENT_VERSION      = "vroxy_dispatch 0.27.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -376,10 +383,17 @@ async def heartbeat(ws) -> None:
     into Rails.cache under a tenant-scoped key with a 60 s TTL —
     the admin index card polls that key to show 🟢/🔴 + version."""
     meta = {"status": _current_status, "project": PROJECT,
-            "engine": DISPATCH_ENGINE,
-            # Probing blocks on subprocesses, so it never runs on the
-            # event loop — a slow `--version` would stall the socket.
-            "harnesses": await asyncio.to_thread(harnesses)}
+            "engine": DISPATCH_ENGINE}
+    if TELEMETRY_ENABLED:
+        # Probing blocks on subprocesses, so it never runs on the
+        # event loop — a slow `--version` would stall the socket.
+        meta["harnesses"] = await asyncio.to_thread(harnesses)
+    else:
+        # An explicit false, not a missing key: the server treats a
+        # silent heartbeat as "this build is too old to say" and keeps
+        # the last inventory, which is the opposite of what opting out
+        # should do.
+        meta["telemetry"] = False
     # Only sent when configured — an install that predates install.sh
     # keeps the old single-agent resolution rather than registering a
     # duplicate under a name nobody chose.
