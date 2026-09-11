@@ -2560,6 +2560,15 @@ async def handle_feedback(ws, payload: dict) -> None:
         log.warning("feedback.created without chat.hashid: %s", payload)
         return
 
+    # Same rule as a room message: every local agent hears every
+    # frame, so a note routed to the other engine is not our turn.
+    # Older servers send no agent block and `_is_ours` answers True,
+    # which keeps a newer dispatch working against them.
+    if not _is_ours(payload):
+        log.info("feedback %s routed to another engine — skipping",
+                 fb.get("hashid"))
+        return
+
     prompt = build_prompt(payload)
     set_task_label(f"feedback {fb.get('hashid') or ''} {fb.get('note') or ''}")
     log.info("Handling feedback id=%s chat=%s note=%.80s",
