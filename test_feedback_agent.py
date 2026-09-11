@@ -2214,3 +2214,79 @@ class QueuedEditTest(unittest.IsolatedAsyncioTestCase):
 
         items = await self.drain()
         self.assertEqual("fb", items[0][1]["message"]["body"])
+
+
+class PausedWorkTest(unittest.TestCase):
+    """Holding a queued room task: the flag the worker consults, and
+    the guarantee that holding is not the same as discarding."""
+
+    def setUp(self):
+        fa._paused_messages.clear()
+
+    def tearDown(self):
+        fa._paused_messages.clear()
+
+    def test_nothing_is_held_by_default(self):
+        self.assertFalse(fa.is_paused({"message": {"hashid": "abc"}}))
+
+    def test_holding_and_releasing_a_message(self):
+        fa.set_paused("abc", True)
+        self.assertTrue(fa.is_paused({"message": {"hashid": "abc"}}))
+
+        fa.set_paused("abc", False)
+        self.assertFalse(fa.is_paused({"message": {"hashid": "abc"}}))
+
+    def test_a_hold_is_per_message_not_global(self):
+        fa.set_paused("abc", True)
+        self.assertFalse(fa.is_paused({"message": {"hashid": "xyz"}}))
+
+    def test_a_blank_hashid_never_holds_everything(self):
+        fa.set_paused("", True)
+        self.assertFalse(fa.is_paused({"message": {}}))
+        self.assertFalse(fa.is_paused({}))
+
+    def test_the_requeue_delay_stays_under_the_stall_ceiling(self):
+        self.assertLess(fa.PAUSED_REQUEUE_DELAY_SECONDS,
+                        fa.STALL_SECONDS)
+
+
+class CancelRunTest(unittest.TestCase):
+    """Stopping a run that is already going, and the one thing that
+    makes it a pause rather than a discard: keeping the session id."""
+
+    def setUp(self):
+        fa._cancelled_messages.clear()
+        fa._paused_messages.clear()
+        fa._current_proc = None
+
+    def tearDown(self):
+        fa._cancelled_messages.clear()
+        fa._paused_messages.clear()
+        fa._current_proc = None
+
+    def test_nothing_is_cancelled_by_default(self):
+        self.assertFalse(fa.was_cancelled("abc"))
+
+    def test_a_cancel_with_no_live_process_still_holds_the_work(self):
+        self.assertFalse(fa.request_cancel("abc"))
+        self.assertTrue(fa.was_cancelled("abc"))
+        self.assertTrue(fa.is_paused({"message": {"hashid": "abc"}}),
+                        "a stopped run must also be held, or the worker picks it straight back up")
+
+    def test_a_blank_hashid_cancels_nothing(self):
+        self.assertFalse(fa.request_cancel(""))
+        self.assertEqual(fa._cancelled_messages, set())
+
+    def test_resuming_clears_both_the_hold_and_the_cancel(self):
+        fa.request_cancel("abc")
+        fa.set_paused("abc", False)
+        self.assertFalse(fa.was_cancelled("abc"))
+        self.assertFalse(fa.is_paused({"message": {"hashid": "abc"}}))
+
+    def test_cancel_key_is_the_last_parameter_on_every_runner(self):
+        # run_agent_streamed forwards positionally, so a cancel_key
+        # inserted anywhere else silently shifts allow_resume into it.
+        import inspect
+        for fn in (fa.run_claude_streamed, fa.run_codex_streamed, fa.run_agent_streamed):
+            params = list(inspect.signature(fn).parameters)
+            self.assertEqual(params[-1], "cancel_key", f"{fn.__name__} signature drifted")

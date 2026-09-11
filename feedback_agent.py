@@ -133,7 +133,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.28.0"
+AGENT_VERSION      = "vroxy_dispatch 0.29.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -141,6 +141,9 @@ ROOM_BODY_MAX = 4_000
 
 ROOM_LOG_BODY_MAX = 1_000
 STALL_SECONDS               = int(os.environ.get("VROXY_STALL_SECONDS", "90"))
+# A held item is re-checked on this cadence.  Well under STALL_SECONDS
+# so a queue of held work never looks like a wedged process.
+PAUSED_REQUEUE_DELAY_SECONDS = 5
 STALL_WINDOWS_BEFORE_KILL   = int(os.environ.get("VROXY_STALL_WINDOWS", "4"))
 SUBPROCESS_HARD_CAP_SECONDS = STALL_SECONDS * STALL_WINDOWS_BEFORE_KILL
 
@@ -1147,7 +1150,8 @@ def _kill_process_tree(proc) -> None:
 def run_claude_streamed(prompt: str, project: str, on_event,
                         allow_resume: bool = True,
                         session_key: str | None = None,
-                        work_dir_override: Path | None = None) -> str:
+                        work_dir_override: Path | None = None,
+                        cancel_key: str | None = None) -> str:
     """`claude -p ... --output-format stream-json` variant.
 
     Emits each JSON event to `on_event(dict)` as it arrives so
@@ -1185,6 +1189,8 @@ def run_claude_streamed(prompt: str, project: str, on_event,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
         start_new_session=True,
     )
+    global _current_proc
+    _current_proc = proc
 
     final_text_chunks: list[str] = []
     new_sid: str | None = None
@@ -1301,6 +1307,7 @@ def run_claude_streamed(prompt: str, project: str, on_event,
             log.error("claude closed stdout but would not exit — killing")
             _kill_process_tree(proc)
     finally:
+        _current_proc = None
         if proc.stdout: proc.stdout.close()
         stderr_text = ""
         if proc.stderr:
@@ -1333,9 +1340,12 @@ def run_claude_streamed(prompt: str, project: str, on_event,
         try: sid_file.unlink(missing_ok=True)
         except Exception: log.exception("clearing session id failed")
         return run_claude_streamed(prompt, project, on_event,
-                                   allow_resume=False, session_key=session_key)
+                                   allow_resume=False, session_key=session_key,
+                                   cancel_key=cancel_key)
 
-    if new_sid and not failed:
+    # A deliberate stop exits non-zero, so `failed` alone would throw
+    # away the session id and turn resume into a fresh start.
+    if new_sid and (not failed or was_cancelled(cancel_key or "")):
         try: sid_file.write_text(new_sid)
         except Exception: log.exception("saving session id failed")
 
@@ -1353,7 +1363,8 @@ def run_claude_streamed(prompt: str, project: str, on_event,
 def run_codex_streamed(prompt: str, project: str, on_event,
                        allow_resume: bool = True,
                        session_key: str | None = None,
-                       work_dir_override: Path | None = None) -> str:
+                       work_dir_override: Path | None = None,
+                       cancel_key: str | None = None) -> str:
     """`codex exec --json` variant of [run_claude_streamed].
 
     Same contract on purpose: same signature, the same normalised
@@ -1596,7 +1607,8 @@ def run_codex_streamed(prompt: str, project: str, on_event,
 def run_agent_streamed(prompt: str, project: str, on_event,
                        allow_resume: bool = True,
                        session_key: str | None = None,
-                       work_dir_override: Path | None = None) -> str:
+                       work_dir_override: Path | None = None,
+                       cancel_key: str | None = None) -> str:
     """Run whichever engine `DISPATCH_ENGINE` selects.
 
     The only place in the process that knows there is more than one."""
@@ -1609,7 +1621,7 @@ def run_agent_streamed(prompt: str, project: str, on_event,
             f"DISPATCH_ENGINE={DISPATCH_ENGINE!r} is not a known engine "
             f"(expected 'claude' or 'codex')")
     return runner(prompt, project, on_event, allow_resume, session_key,
-                  work_dir_override)
+                  work_dir_override, cancel_key)
 
 
 class ProgressTrail:
@@ -1963,6 +1975,57 @@ async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
 # worker was running dies with it, and whatever was still queued dies
 # unread — the server broadcast it once and does not repeat itself.
 _current_work: tuple[str, dict] | None = None
+
+
+# Message hashids the operator has held.  The server keeps the durable
+# record in Redis; this is the copy the worker consults, because the
+# work queue lives in THIS process and the server cannot reach it.
+_paused_messages: set[str] = set()
+
+
+# Separate from _paused_messages: a stop has to reach the LIVE
+# subprocess, not just the queue.
+_cancelled_messages: set[str] = set()
+_current_proc = None
+
+
+def request_cancel(message_hashid: str) -> bool:
+    """Stop a run that is already going, and hold it.
+
+    The session id is what makes this resumable rather than a discard,
+    so the runner persists it on a deliberate cancel even though the
+    process exits non-zero — the normal `failed` path drops it."""
+    if not message_hashid:
+        return False
+    _cancelled_messages.add(message_hashid)
+    _paused_messages.add(message_hashid)
+    proc = _current_proc
+    if proc is not None and proc.poll() is None:
+        _kill_process_tree(proc)
+        return True
+    return False
+
+
+def was_cancelled(message_hashid: str) -> bool:
+    return bool(message_hashid) and message_hashid in _cancelled_messages
+
+
+def clear_cancel(message_hashid: str) -> None:
+    _cancelled_messages.discard(message_hashid)
+
+
+def set_paused(message_hashid: str, paused: bool) -> None:
+    if not message_hashid:
+        return
+    if paused:
+        _paused_messages.add(message_hashid)
+    else:
+        _paused_messages.discard(message_hashid)
+        _cancelled_messages.discard(message_hashid)
+
+
+def is_paused(payload: dict) -> bool:
+    return (payload.get("message") or {}).get("hashid", "") in _paused_messages
 
 
 def apply_queued_edit(room_hashid: str, message_hashid: str, body: str) -> bool:
@@ -2823,18 +2886,32 @@ async def handle_room_message(ws, payload: dict) -> None:
     try:
         raw = await asyncio.to_thread(
             run_agent_streamed, prompt, PROJECT, on_stream_event,
-            True, _room_session_key(room_id))
+            True, _room_session_key(room_id), None, msg.get("hashid"))
     except subprocess.TimeoutExpired:
         await room_reply(ws, room_id, "⚠️ I timed out after 30 minutes.", msg.get("hashid"))
         result["is_error"] = True
         await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
         return
     except Exception as e:
+        # A stop the operator asked for is not a crash.
+        if was_cancelled(msg.get("hashid") or ""):
+            log.info("run stopped on request message=%s — holding", msg.get("hashid"))
+            if _work_queue is not None:
+                _work_queue.put_nowait(("room", payload))
+            return
         log.exception("claude crashed on room message")
         await room_reply(ws, room_id, f"⚠️ I crashed: {type(e).__name__}: {e}", msg.get("hashid"))
         result["is_error"] = True
         await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
         return
+    # A kill can end the stream cleanly with partial text rather than
+    # raising, so both paths have to check.
+    if was_cancelled(msg.get("hashid") or ""):
+        log.info("run stopped on request message=%s — holding", msg.get("hashid"))
+        if _work_queue is not None:
+            _work_queue.put_nowait(("room", payload))
+        return
+
     if not raw:
         await room_reply(ws, room_id, "(I came back with an empty response.)", msg.get("hashid"))
         result["is_error"] = True
@@ -2879,6 +2956,11 @@ async def worker_loop(link: CableLink) -> None:
     global _current_work
     while True:
         kind, payload = await _work_queue.get()
+        # To the BACK, never dropped: holding is a request to wait.
+        if kind == "room" and is_paused(payload):
+            await asyncio.sleep(PAUSED_REQUEUE_DELAY_SECONDS)
+            _work_queue.put_nowait((kind, payload))
+            continue
         _current_work = (kind, payload)
         fb_id = ((payload.get("feedback") or {}).get("hashid")
                  or payload.get("feedback_id") or "?")
@@ -2968,6 +3050,16 @@ async def process_stream(link: CableLink, ws) -> None:
                 with contextlib.suppress(Exception):
                     await room_status(link, (msg.get("room") or {}).get("hashid"),
                                       (msg.get("message") or {}).get("hashid"), "queued")
+            elif msg.get("type") in ("room.pause", "room.resume"):
+                held = msg.get("type") == "room.pause"
+                set_paused((msg.get("message") or {}).get("hashid"), held)
+                log.info("room work %s message=%s",
+                         "held" if held else "released",
+                         (msg.get("message") or {}).get("hashid"))
+            elif msg.get("type") == "room.kill":
+                hashid = (msg.get("message") or {}).get("hashid")
+                killed = request_cancel(hashid)
+                log.info("room run stop requested message=%s live=%s", hashid, killed)
             elif msg.get("type") == "room.message.edited":
                 edited = msg.get("message") or {}
                 if apply_queued_edit((msg.get("room") or {}).get("hashid"),

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.29.0
+
+### Added
+
+- **An operator can hold queued work, and stop a run that has already
+  started.** The server sends `room.pause` / `room.resume` /
+  `room.kill`; this process acts on them, because the work queue lives
+  in ITS memory and the server cannot reach into a queue it does not
+  own.
+- **A held item is re-queued at the BACK, never dropped.** Pausing is
+  a request to wait, not to discard, so the answer still arrives when
+  it is released. Re-checked every `PAUSED_REQUEUE_DELAY_SECONDS` (5),
+  well under `STALL_SECONDS` so a queue of held work never reads as a
+  wedged process.
+- **A stop keeps the Claude session id, which is what makes it a pause
+  rather than a discard.** A killed run exits non-zero, and the normal
+  path only persists the session id when the run did NOT fail — so
+  without this, every "resume" would have silently started a fresh
+  session with no memory of the work. `run_claude_streamed` now writes
+  the id on a deliberate cancel too.
+- A stopped run posts nothing. It is held and re-queued instead, so
+  resuming answers the question rather than apologising for a crash
+  that the operator asked for.
+
+### Changed
+
+- `cancel_key` is the LAST parameter on `run_claude_streamed`,
+  `run_codex_streamed` and `run_agent_streamed`. `run_agent_streamed`
+  forwards positionally, so a parameter inserted anywhere else shifts
+  `allow_resume` into it — there is a test asserting the position.
+
 ## 0.28.0
 
 ### Fixed
