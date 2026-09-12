@@ -3,9 +3,14 @@
 # vroxy_dispatch installer.
 #
 #   ./install.sh              interactive: add a workspace
+#   ./install.sh --unattended add a workspace from the environment
 #   ./install.sh --update     git pull + reinstall deps + restart all
 #   ./install.sh --list       what's installed, and whether it's up
 #   ./install.sh --remove ID  stop, disable and forget one instance
+#
+# --unattended reads VROXY_TOKEN (required), VROXY_HOST, CODE_ROOT,
+# PROJECT, VROXY_AGENT_NAME, VROXY_INSTANCE_ID and DISPATCH_ENGINE.
+# It exists for cloud-init, which cannot answer a prompt.
 #
 # ONE PROCESS PER WORKSPACE. AdminFeedbackChannel streams for exactly
 # one tenant, so running dispatch for both vroxy and arubamu means two
@@ -106,6 +111,78 @@ for part in sys.argv[1].split("."):
     cur = (cur or {}).get(part)
 print("" if cur is None else cur)' "$1"; }
 
+write_env_file() {
+  local id="$1" name="$2" host="$3" token="$4" agent_name="$5" code_root="$6" project="$7"
+  local env_file="${ENV_DIR}/${id}.env"
+
+  # Generated once and never regenerated: it IS this instance's
+  # identity on the server. Rewriting it would orphan the agent row,
+  # its room, and its history — which is why an existing one is read
+  # back rather than minted again. cloud-init re-runs on every boot.
+  local install_id=""
+  if sudo -n test -e "$env_file" 2>/dev/null; then
+    install_id="$(sudo -n sed -n 's/^VROXY_INSTALL_ID=//p' "$env_file" | head -1)"
+  fi
+  [[ -n "$install_id" ]] || install_id="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+
+  local cable="${host%/}/cable"
+  cable="${cable/https:/wss:}"
+  cable="${cable/http:/ws:}"
+
+  sudo mkdir -p "$ENV_DIR"
+  sudo tee "$env_file" >/dev/null <<ENVFILE
+# vroxy_dispatch — ${name}
+# Written by install.sh. Contains a workspace token: keep 0640.
+VROXY_CABLE_URL=${cable}
+VROXY_SERVICE_TOKEN=${token}
+VROXY_INSTALL_ID=${install_id}
+VROXY_AGENT_NAME=${agent_name}
+VROXY_DISPATCH_UNIT=vroxy-dispatch@${id}.service
+CODE_ROOT=${code_root}
+PROJECT=${project}
+LOG_FILE=${HERE}/log/dispatch-${id}.log
+LOG_LEVEL=INFO
+PYTHONUNBUFFERED=1
+PATH=${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
+ENVFILE
+  [[ -z "${DISPATCH_ENGINE:-}" ]] \
+    || echo "DISPATCH_ENGINE=${DISPATCH_ENGINE}" | sudo tee -a "$env_file" >/dev/null
+  sudo chown root:"$RUN_GROUP" "$env_file"
+  sudo chmod 640 "$env_file"
+}
+
+# No prompts, no confirmations, and no token on the command line —
+# cloud-init has no terminal and argv is world-readable.
+unattended_workspace() {
+  ensure_venv
+  install_unit
+
+  local host="${VROXY_HOST:-https://vroxy.ai}"
+  local token="${VROXY_TOKEN:-}"
+  [[ -n "$token" ]] || die "VROXY_TOKEN is required for --unattended"
+
+  local body name slug
+  body="$(verify_token "$host" "$token")"
+  [[ -n "$body" ]] || die "couldn't reach ${host}/api/v1/whoami, or the token was refused"
+  name="$(printf '%s' "$body" | json_field workspace.name || true)"
+  slug="$(printf '%s' "$body" | json_field workspace.slug || true)"
+  [[ -n "$name" ]] || die "that response didn't name a workspace — is VROXY_HOST right?"
+
+  local id="${VROXY_INSTANCE_ID:-${slug:-workspace}}"
+  local code_root="${CODE_ROOT:-$(dirname "$HERE")}"
+  local project="${PROJECT:-vroxy_web}"
+  local agent_name="${VROXY_AGENT_NAME:-Dispatch}"
+
+  mkdir -p "$code_root"
+  write_env_file "$id" "$name" "$host" "$token" "$agent_name" "$code_root" "$project"
+
+  sudo systemctl enable --now "vroxy-dispatch@${id}.service"
+  sleep 2
+  systemctl is-active --quiet "vroxy-dispatch@${id}.service" \
+    && say "vroxy-dispatch@${id} running for ${name} as \"${agent_name}\"." \
+    || die "vroxy-dispatch@${id} did not start — journalctl -u vroxy-dispatch@${id} -n 50"
+}
+
 add_workspace() {
   ensure_venv
   install_unit
@@ -153,33 +230,7 @@ add_workspace() {
     [[ "$over" == "y" || "$over" == "Y" ]] || exit 1
   fi
 
-  # Generated once and never regenerated: it IS this instance's
-  # identity on the server. Rewriting it would orphan the agent row,
-  # its room, and its history.
-  local install_id
-  install_id="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
-
-  local cable="${host%/}/cable"
-  cable="${cable/https:/wss:}"
-  cable="${cable/http:/ws:}"
-
-  sudo tee "$env_file" >/dev/null <<ENVFILE
-# vroxy_dispatch — ${name}
-# Written by install.sh. Contains a workspace token: keep 0640.
-VROXY_CABLE_URL=${cable}
-VROXY_SERVICE_TOKEN=${token}
-VROXY_INSTALL_ID=${install_id}
-VROXY_AGENT_NAME=${agent_name}
-VROXY_DISPATCH_UNIT=vroxy-dispatch@${id}.service
-CODE_ROOT=${code_root}
-PROJECT=${project}
-LOG_FILE=${HERE}/log/dispatch-${id}.log
-LOG_LEVEL=INFO
-PYTHONUNBUFFERED=1
-PATH=${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
-ENVFILE
-  sudo chown root:"$RUN_GROUP" "$env_file"
-  sudo chmod 640 "$env_file"
+  write_env_file "$id" "$name" "$host" "$token" "$agent_name" "$code_root" "$project"
 
   say "Starting vroxy-dispatch@${id}…"
   sudo systemctl enable --now "vroxy-dispatch@${id}.service"
@@ -233,6 +284,7 @@ remove_instance() {
 }
 
 case "${1:-}" in
+  --unattended) unattended_workspace ;;
   --update) update_all ;;
   --list)   list_instances ;;
   --remove) remove_instance "${2:-}" ;;

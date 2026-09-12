@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.30.0
+
+### Added
+
+- **`./install.sh --unattended`.** The interactive path is six `read
+  -rp` prompts deep, so nothing could install dispatch without a
+  terminal — which made a cloud image impossible. The new flag takes
+  `VROXY_TOKEN` (required), `VROXY_HOST`, `CODE_ROOT`, `PROJECT`,
+  `VROXY_AGENT_NAME`, `VROXY_INSTANCE_ID` and `DISPATCH_ENGINE` from
+  the environment and never from argv, which is world-readable. It
+  still verifies the token against `/api/v1/whoami` before writing
+  anything. Used by `vroxy_infra`'s cloud-init.
+
+### Fixed
+
+- **Reinstalling a workspace minted a new `VROXY_INSTALL_ID`.** The
+  comment above it said "generated once and never regenerated", but
+  overwriting an existing install wrote a fresh one, orphaning the
+  agent row, its room and its history on the server. The env file is
+  now read back for an existing id first. This mattered little for a
+  hand-run installer and matters a lot for cloud-init, which re-runs
+  on every boot.
+
+### Changed
+
+- Env-file writing moved into `write_env_file`, shared by the
+  interactive and unattended paths so the two cannot drift.
+
 ## 0.29.1
 
 ### Fixed
