@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.29.1
+
+### Fixed
+
+- **`install.sh` couldn't install.** `ensure_venv` ran the venv's
+  `pip` script, whose shebang hardcodes the absolute path of the venv
+  that CREATED it. A checkout whose `.venv` was copied from elsewhere
+  (this box's came from `ctovibe_dispatch`) has a `pip` that cannot
+  execute at all — `required file not found`, naming a directory that
+  no longer exists. Now `python -m pip`, which has no shebang to
+  break.
+- **`--list` reported "Nothing installed yet" over a running
+  instance.** `ENV_DIR` is `0750 root:root` because the env files
+  hold workspace tokens, so an unprivileged `find` read nothing and
+  the error was swallowed by `2>/dev/null`. It reads the directory
+  under `sudo -n` now — listing instance names isn't privileged,
+  reading the files is.
+
 ## 0.29.0
 
 ### Added

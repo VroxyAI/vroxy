@@ -43,8 +43,13 @@ ensure_venv() {
     python3 -m venv "$HERE/.venv"
   fi
   say "Installing Python dependencies…"
-  "$HERE/.venv/bin/pip" install --quiet --upgrade pip
-  "$HERE/.venv/bin/pip" install --quiet -r "$HERE/requirements.txt"
+  # `python -m pip`, never the `pip` script: its shebang hardcodes the
+  # venv's ORIGINAL absolute path, so a venv that was copied from
+  # another checkout (or moved with the repo) has a pip that cannot
+  # execute at all — "required file not found" pointing at a directory
+  # that no longer exists. The module entry point has no such problem.
+  "$HERE/.venv/bin/python" -m pip install --quiet --upgrade pip
+  "$HERE/.venv/bin/python" -m pip install --quiet -r "$HERE/requirements.txt"
 }
 
 # ── the template unit ─────────────────────────────────────────────
@@ -185,8 +190,12 @@ ENVFILE
 }
 
 instances() {
-  [[ -d "$ENV_DIR" ]] || return 0
-  find "$ENV_DIR" -maxdepth 1 -name '*.env' -printf '%f\n' 2>/dev/null | sed 's/\.env$//' | sort
+  # `sudo`: ENV_DIR is 0750 root:root because the env files hold
+  # workspace tokens, so an unprivileged `find` reads nothing and
+  # --list cheerfully reported "nothing installed" over a running
+  # instance. Listing names is not privileged; reading the files is.
+  sudo -n test -d "$ENV_DIR" 2>/dev/null || return 0
+  sudo -n find "$ENV_DIR" -maxdepth 1 -name '*.env' -printf '%f\n' 2>/dev/null | sed 's/\.env$//' | sort
 }
 
 list_instances() {
