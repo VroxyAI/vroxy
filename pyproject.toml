@@ -1,0 +1,16 @@
+[project]
+name = "vroxy-cli"
+version = "0.1.0"
+description = "Command-line client for a vroxy workspace"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+vroxy = "vroxy_cli.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["vroxy_cli*"]
