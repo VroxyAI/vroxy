@@ -13,6 +13,7 @@ their capability. The CLI is a client, not a new permission surface.
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_HOST = "https://vroxy.ai"
@@ -85,6 +86,87 @@ class Client:
 
     def dispatch_status(self, workspace):
         return self._request("GET", f"/workspaces/{workspace}/dispatch_status")
+
+    def docs(self, workspace, status=None, q=None):
+        query = _query({"status": status, "q": q})
+        return self._request("GET", f"/workspaces/{workspace}/docs{query}").get("docs", [])
+
+    def doc(self, workspace, doc):
+        return self._request("GET", f"/workspaces/{workspace}/docs/{doc}").get("doc", {})
+
+    def create_doc(self, workspace, **fields):
+        payload = self._request("POST", f"/workspaces/{workspace}/docs", {"doc": _compact(fields)})
+        return payload.get("doc", {})
+
+    def update_doc(self, workspace, doc, **fields):
+        payload = self._request(
+            "PATCH", f"/workspaces/{workspace}/docs/{doc}", {"doc": _compact(fields)}
+        )
+        return payload.get("doc", {})
+
+    def publish_doc(self, workspace, doc, published=True):
+        verb = "publish" if published else "unpublish"
+        payload = self._request("POST", f"/workspaces/{workspace}/docs/{doc}/{verb}")
+        return payload.get("doc", {})
+
+    def delete_doc(self, workspace, doc):
+        return self._request("DELETE", f"/workspaces/{workspace}/docs/{doc}")
+
+    def members(self, workspace):
+        return self._request("GET", f"/workspaces/{workspace}/members")
+
+    def invite_member(self, workspace, email, role):
+        payload = self._request(
+            "POST", f"/workspaces/{workspace}/members", {"email": email, "role": role}
+        )
+        return payload.get("invitation", {})
+
+    def set_member_role(self, workspace, membership_id, role):
+        payload = self._request(
+            "PATCH", f"/workspaces/{workspace}/members/{membership_id}", {"role": role}
+        )
+        return payload.get("member", {})
+
+    def remove_member(self, workspace, membership_id):
+        return self._request("DELETE", f"/workspaces/{workspace}/members/{membership_id}")
+
+    def revoke_invitation(self, workspace, invitation):
+        return self._request(
+            "DELETE", f"/workspaces/{workspace}/members/invitations/{invitation}"
+        )
+
+    def tools(self, workspace):
+        return self._request("GET", f"/workspaces/{workspace}/tools").get("tools", [])
+
+    def tool(self, workspace, tool):
+        return self._request("GET", f"/workspaces/{workspace}/tools/{tool}").get("tool", {})
+
+    def create_tool(self, workspace, **fields):
+        payload = self._request("POST", f"/workspaces/{workspace}/tools", {"tool": _compact(fields)})
+        return payload.get("tool", {})
+
+    def update_tool(self, workspace, tool, **fields):
+        payload = self._request(
+            "PATCH", f"/workspaces/{workspace}/tools/{tool}", {"tool": _compact(fields)}
+        )
+        return payload.get("tool", {})
+
+    def toggle_tool(self, workspace, tool, enabled=None):
+        body = None if enabled is None else {"enabled": bool(enabled)}
+        payload = self._request("POST", f"/workspaces/{workspace}/tools/{tool}/toggle", body)
+        return payload.get("tool", {})
+
+    def delete_tool(self, workspace, tool):
+        return self._request("DELETE", f"/workspaces/{workspace}/tools/{tool}")
+
+
+def _compact(fields):
+    return {k: v for k, v in fields.items() if v is not None}
+
+
+def _query(pairs):
+    live = {k: v for k, v in pairs.items() if v}
+    return f"?{urllib.parse.urlencode(live)}" if live else ""
 
 
 def _safe_json(raw):

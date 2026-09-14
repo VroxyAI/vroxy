@@ -9,6 +9,9 @@ from .client import Client, VroxyError
 from .version import VERSION
 
 
+ROLES = ["operator", "member", "admin", "owner"]
+
+
 def _client(args):
     host = getattr(args, "host", None) or os.environ.get("VROXY_HOST") or config.load().get("host")
     token = os.environ.get("VROXY_TOKEN") or config.token_for(host)
@@ -108,6 +111,147 @@ def cmd_dispatch(args):
     _emit(args, payload, plain)
 
 
+def _body_from(args):
+    if args.body == "-":
+        return sys.stdin.read()
+    if args.body:
+        return args.body
+    if getattr(args, "file", None):
+        with open(args.file) as f:
+            return f.read()
+    return None
+
+
+def cmd_docs(args):
+    client = _client(args)
+    action = args.action
+
+    if action == "list":
+        rows = client.docs(args.workspace, status=args.status, q=args.q)
+
+        def plain():
+            if not rows:
+                print("No docs.")
+                return
+            for d in rows:
+                print(f"{d.get('hashid'):<12} {d.get('status', ''):<10} {d.get('title')}")
+
+        return _emit(args, rows, plain)
+
+    if action == "show":
+        doc = client.doc(args.workspace, args.doc)
+        return _emit(args, doc, lambda: print(
+            f"{doc.get('title')}  [{doc.get('status')}]\n\n{doc.get('body_md', '')}"
+        ))
+
+    if action == "create":
+        body = _body_from(args)
+        if not body:
+            raise VroxyError("Give a body with --body, --file, or --body - for stdin.")
+        doc = client.create_doc(args.workspace, title=args.title, body_md=body)
+        return _emit(args, doc, lambda: print(f"Created {doc.get('hashid')} — {doc.get('title')}"))
+
+    if action == "edit":
+        body = _body_from(args)
+        if body is None and args.title is None:
+            raise VroxyError("Nothing to change. Pass --title and/or a body.")
+        doc = client.update_doc(args.workspace, args.doc, title=args.title, body_md=body)
+        return _emit(args, doc, lambda: print(f"Updated {doc.get('hashid')}."))
+
+    if action in ("publish", "unpublish"):
+        doc = client.publish_doc(args.workspace, args.doc, published=action == "publish")
+        return _emit(args, doc, lambda: print(f"{doc.get('title')} is now {doc.get('status')}."))
+
+    if action == "delete":
+        result = client.delete_doc(args.workspace, args.doc)
+        return _emit(args, result, lambda: print("Deleted."))
+
+
+def cmd_members(args):
+    client = _client(args)
+    action = args.action
+
+    if action == "list":
+        payload = client.members(args.workspace)
+
+        def plain():
+            for m in payload.get("members", []):
+                print(f"{m.get('membership_id'):<8} {m.get('role', ''):<9} {m.get('name')}")
+            for inv in payload.get("invitations", []):
+                print(f"{'pending':<8} {inv.get('role', ''):<9} {inv.get('email')}  ({inv.get('hashid')})")
+
+        return _emit(args, payload, plain)
+
+    if action == "invite":
+        inv = client.invite_member(args.workspace, args.email, args.role)
+        return _emit(args, inv, lambda: print(f"Invited {inv.get('email')} as {inv.get('role')}."))
+
+    if action == "role":
+        member = client.set_member_role(args.workspace, args.member, args.role)
+        return _emit(args, member, lambda: print(f"{member.get('name')} is now {member.get('role')}."))
+
+    if action == "remove":
+        result = client.remove_member(args.workspace, args.member)
+        return _emit(args, result, lambda: print(
+            "You've left the workspace." if result.get("left") else "Removed."
+        ))
+
+    if action == "revoke":
+        result = client.revoke_invitation(args.workspace, args.invitation)
+        return _emit(args, result, lambda: print("Invitation revoked."))
+
+
+def cmd_tools(args):
+    client = _client(args)
+    action = args.action
+
+    if action == "list":
+        rows = client.tools(args.workspace)
+
+        def plain():
+            if not rows:
+                print("No custom tools.")
+                return
+            for t in rows:
+                state = "on " if t.get("enabled") else "off"
+                print(f"{t.get('hashid'):<12} {state} {t.get('kind', ''):<6} "
+                      f"{t.get('access', ''):<7} {t.get('name')}")
+
+        return _emit(args, rows, plain)
+
+    if action == "show":
+        tool = client.tool(args.workspace, args.tool)
+        return _emit(args, tool, lambda: print(json.dumps(tool, indent=2)))
+
+    if action == "create":
+        tool = client.create_tool(
+            args.workspace, name=args.name, label=args.label, description=args.description,
+            kind=args.kind, access=args.access, url_template=args.url,
+            follow_origin=args.follow_origin or None, params=_tool_params(args.param),
+        )
+        return _emit(args, tool, lambda: print(f"Created {tool.get('name')} ({tool.get('hashid')})."))
+
+    if action in ("enable", "disable"):
+        tool = client.toggle_tool(args.workspace, args.tool, enabled=action == "enable")
+        return _emit(args, tool, lambda: print(
+            f"{tool.get('name')} is {'enabled' if tool.get('enabled') else 'disabled'}."
+        ))
+
+    if action == "delete":
+        result = client.delete_tool(args.workspace, args.tool)
+        return _emit(args, result, lambda: print("Deleted."))
+
+
+def _tool_params(raw):
+    params = []
+    for item in raw or []:
+        name, _, description = item.partition("=")
+        if not name.strip():
+            raise VroxyError(f"--param needs name=description, got {item!r}")
+        params.append({"name": name.strip(), "description": description.strip()})
+    return params or None
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="vroxy", description="Talk to a vroxy workspace.")
     p.add_argument("--version", action="version", version=f"vroxy {VERSION}")
@@ -142,6 +286,56 @@ def build_parser():
     disp = sub.add_parser("dispatch", help="Is the workspace's agent up")
     disp.add_argument("workspace")
     disp.set_defaults(func=cmd_dispatch)
+
+    docs = sub.add_parser("docs", help="Knowledge-base docs the bot answers from")
+    docs.add_argument("workspace")
+    docs_sub = docs.add_subparsers(dest="action", required=True)
+    docs_list = docs_sub.add_parser("list")
+    docs_list.add_argument("--status", choices=["draft", "published"])
+    docs_list.add_argument("--q", help="Loose search across title and body")
+    for name in ("show", "publish", "unpublish", "delete"):
+        docs_sub.add_parser(name).add_argument("doc")
+    docs_create = docs_sub.add_parser("create")
+    docs_create.add_argument("title")
+    docs_create.add_argument("--body", help="Markdown body; - reads stdin")
+    docs_create.add_argument("--file", help="Read the body from a file")
+    docs_edit = docs_sub.add_parser("edit")
+    docs_edit.add_argument("doc")
+    docs_edit.add_argument("--title")
+    docs_edit.add_argument("--body", help="Markdown body; - reads stdin")
+    docs_edit.add_argument("--file")
+    docs.set_defaults(func=cmd_docs, status=None, q=None, title=None, body=None, file=None)
+
+    members = sub.add_parser("members", help="Who holds a seat, and at what level")
+    members.add_argument("workspace")
+    members_sub = members.add_subparsers(dest="action", required=True)
+    members_sub.add_parser("list")
+    invite = members_sub.add_parser("invite")
+    invite.add_argument("email")
+    invite.add_argument("role", choices=ROLES)
+    role = members_sub.add_parser("role")
+    role.add_argument("member", help="Membership id from `members list`")
+    role.add_argument("role", choices=ROLES)
+    members_sub.add_parser("remove").add_argument("member")
+    members_sub.add_parser("revoke").add_argument("invitation", help="Invitation hashid")
+    members.set_defaults(func=cmd_members)
+
+    tools = sub.add_parser("tools", help="Custom bot tools")
+    tools.add_argument("workspace")
+    tools_sub = tools.add_subparsers(dest="action", required=True)
+    tools_sub.add_parser("list")
+    for name in ("show", "enable", "disable", "delete"):
+        tools_sub.add_parser(name).add_argument("tool")
+    make = tools_sub.add_parser("create")
+    make.add_argument("name", help="lowercase letters, digits, underscores")
+    make.add_argument("--label", required=True)
+    make.add_argument("--description", required=True, help="What the model reads to decide when to call it")
+    make.add_argument("--url", required=True, help="Template with {placeholders}")
+    make.add_argument("--kind", choices=["link", "fetch"], default="link")
+    make.add_argument("--access", choices=["public", "user", "admin"], default="public")
+    make.add_argument("--param", action="append", metavar="NAME=DESCRIPTION")
+    make.add_argument("--follow-origin", action="store_true", dest="follow_origin")
+    tools.set_defaults(func=cmd_tools)
 
     return p
 

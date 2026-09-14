@@ -4,7 +4,7 @@ import stat
 import tempfile
 import unittest
 import urllib.error
-from io import BytesIO
+from io import BytesIO, StringIO
 from unittest import mock
 
 from vroxy_cli import config
@@ -123,6 +123,75 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(printed.call_args[0][0]), rows)
+
+
+class ManagementCommandsTest(unittest.TestCase):
+    def run_cli(self, argv):
+        with mock.patch("vroxy_cli.cli._client") as fake:
+            with mock.patch("builtins.print"):
+                code = main(argv)
+        return code, fake.return_value
+
+    def test_docs_create_reads_stdin_when_the_body_is_a_dash(self):
+        with mock.patch("sys.stdin", StringIO("# Refunds\n14 days.")):
+            code, client = self.run_cli(["docs", "ws1", "create", "Refunds", "--body", "-"])
+
+        self.assertEqual(code, 0)
+        client.create_doc.assert_called_once_with("ws1", title="Refunds", body_md="# Refunds\n14 days.")
+
+    def test_docs_create_without_a_body_refuses_rather_than_posting_an_empty_one(self):
+        code, client = self.run_cli(["docs", "ws1", "create", "Refunds"])
+
+        self.assertEqual(code, 1)
+        client.create_doc.assert_not_called()
+
+    def test_docs_edit_with_nothing_to_change_refuses(self):
+        code, client = self.run_cli(["docs", "ws1", "edit", "d1"])
+
+        self.assertEqual(code, 1)
+        client.update_doc.assert_not_called()
+
+    def test_unpublish_is_the_publish_call_with_published_false(self):
+        _, client = self.run_cli(["docs", "ws1", "unpublish", "d1"])
+
+        client.publish_doc.assert_called_once_with("ws1", "d1", published=False)
+
+    def test_a_role_outside_the_ladder_never_reaches_the_server(self):
+        with self.assertRaises(SystemExit):
+            main(["members", "ws1", "invite", "a@b.test", "superuser"])
+
+    def test_invite_passes_the_role_through(self):
+        _, client = self.run_cli(["members", "ws1", "invite", "a@b.test", "admin"])
+
+        client.invite_member.assert_called_once_with("ws1", "a@b.test", "admin")
+
+    def test_enable_and_disable_are_explicit_not_a_flip(self):
+        _, client = self.run_cli(["tools", "ws1", "disable", "t1"])
+
+        client.toggle_tool.assert_called_once_with("ws1", "t1", enabled=False)
+
+    def test_tool_params_parse_into_name_and_description(self):
+        _, client = self.run_cli([
+            "tools", "ws1", "create", "search_listings",
+            "--label", "Search", "--description", "Find listings.",
+            "--url", "https://x.test/s?q={query}",
+            "--param", "query=what to search for",
+        ])
+
+        self.assertEqual(
+            client.create_tool.call_args.kwargs["params"],
+            [{"name": "query", "description": "what to search for"}],
+        )
+
+    def test_a_param_with_no_name_is_refused(self):
+        code, client = self.run_cli([
+            "tools", "ws1", "create", "search_listings",
+            "--label", "Search", "--description", "Find listings.",
+            "--url", "https://x.test/s", "--param", "=orphaned",
+        ])
+
+        self.assertEqual(code, 1)
+        client.create_tool.assert_not_called()
 
 
 if __name__ == "__main__":

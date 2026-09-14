@@ -14,6 +14,34 @@ echo "from a pipe" | vroxy post <workspace> <room> -
 vroxy dispatch <workspace>       # is the agent up
 ```
 
+Managing the workspace, not just reading it:
+
+```bash
+vroxy docs <ws> list --status draft
+vroxy docs <ws> create "Refund policy" --file refunds.md
+cat refunds.md | vroxy docs <ws> edit <doc> --body -
+vroxy docs <ws> publish <doc>
+
+vroxy members <ws> list                       # membership ids + pending invites
+vroxy members <ws> invite sam@example.com admin
+vroxy members <ws> role 42 operator
+vroxy members <ws> revoke <invitation-hashid>
+
+vroxy tools <ws> list
+vroxy tools <ws> create search_listings \
+  --label "Search listings" \
+  --description "Search listings by keyword and location." \
+  --url "https://example.com/search?q={query}" \
+  --param "query=what to search for"
+vroxy tools <ws> disable <tool>
+```
+
+Both member rank rules are enforced server-side by the same
+`MembershipRank` the web app asks: you cannot grant a level above your
+own, and you cannot act on someone at or above your own. The CLI's
+`--role` choices are a courtesy that saves a round-trip, never the
+gate.
+
 `--json` on any command gives raw JSON, which is the point: this
 exists so an agent in a checkout can answer questions about live
 workspace state instead of asking a human to copy-paste. See
