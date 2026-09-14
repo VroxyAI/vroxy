@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.32.0
+
+### Added
+
+- The heartbeat reports `meta.model` — the model the CLI actually used
+  on the last run, captured from the stream's `assistant` events
+  rather than read from config. Config says what was asked for; the
+  stream says what answered, and an alias like `opus[1m]` only
+  resolves at run time. Rides under `DISPATCH_TELEMETRY` with the
+  harness inventory and hostname, so opting out erases it server-side.
+- It follows that the value is absent until the first run of a
+  process. That is deliberate: reporting a configured name that never
+  ran would be a guess dressed as a fact.
+
 ## 0.31.0
 
 ### Added

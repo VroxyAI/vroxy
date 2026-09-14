@@ -94,6 +94,11 @@ SID_DIR         = Path.home() / ".cache" / "claude-chat"
 # else is refused at startup rather than silently falling back, so a
 # typo in the unit file can't quietly run the wrong model.
 DISPATCH_ENGINE = os.environ.get("DISPATCH_ENGINE", "claude").strip().lower()
+
+# The model the CLI actually used on the last run, read off the stream
+# rather than from config: config says what was asked for, the stream
+# says what answered.
+_last_model: str | None = None
 # Whether to inventory the coding CLIs on this box and report them.
 # ON by default — it is what makes the fleet view useful — but it is
 # somebody's machine, so `DISPATCH_TELEMETRY=0` turns it off and the
@@ -134,7 +139,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.31.0"
+AGENT_VERSION      = "vroxy_dispatch 0.32.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -393,6 +398,8 @@ async def heartbeat(ws) -> None:
         # event loop — a slow `--version` would stall the socket.
         meta["harnesses"] = await asyncio.to_thread(harnesses)
         meta["hostname"] = socket.gethostname()
+        if _last_model:
+            meta["model"] = _last_model
     else:
         # An explicit false, not a missing key: the server treats a
         # silent heartbeat as "this build is too old to say" and keeps
@@ -1238,6 +1245,10 @@ def run_claude_streamed(prompt: str, project: str, on_event,
             etype = event.get("type")
 
             if etype == "assistant":
+                global _last_model
+                reported = (event.get("message") or {}).get("model")
+                if reported:
+                    _last_model = str(reported)[:80]
                 content = ((event.get("message") or {}).get("content")) or event.get("content") or []
                 for block in content:
                     btype = block.get("type")
