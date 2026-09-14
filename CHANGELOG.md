@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.31.0
+
+### Added
+
+- The heartbeat now reports `meta.hostname` (`socket.gethostname()`),
+  so the room can say which box a run is on next to which harness is
+  driving it. It sits inside the `DISPATCH_TELEMETRY` branch with the
+  harness inventory — it names somebody's machine, so the opt-out has
+  to take it too, and on the server an opt-out erases the stored value
+  rather than freezing it.
+
+### Fixed
+
+- `AGENT_VERSION` was left at `0.29.1` when 0.30.0 shipped, so every
+  heartbeat under-reported its own version and the admin showed a
+  build that wasn't running. Now `0.31.0`.
+
 ## 0.30.0
 
 ### Added

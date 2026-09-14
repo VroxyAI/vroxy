@@ -57,6 +57,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -133,7 +134,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.29.1"
+AGENT_VERSION      = "vroxy_dispatch 0.31.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -391,6 +392,7 @@ async def heartbeat(ws) -> None:
         # Probing blocks on subprocesses, so it never runs on the
         # event loop — a slow `--version` would stall the socket.
         meta["harnesses"] = await asyncio.to_thread(harnesses)
+        meta["hostname"] = socket.gethostname()
     else:
         # An explicit false, not a missing key: the server treats a
         # silent heartbeat as "this build is too old to say" and keeps
