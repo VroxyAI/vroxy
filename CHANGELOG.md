@@ -17,6 +17,19 @@
 - The repo is now `VroxyAI/vroxy`. GitHub redirects the old name.
 - One version number across the CLI, the agent, and the package.
 
+### Fixed
+
+- **`curl … | bash` actually works.** Piped, there is no script on disk,
+  so `BASH_SOURCE` resolved to the caller's current directory and every
+  `$HERE/...` path pointed at whatever folder they were standing in —
+  `pip install "$HERE"` would have tried to install that. The installer
+  now detects it has no checkout, clones one into `~/.local/share/vroxy`
+  (`VROXY_HOME`), and re-execs inside it. `--help` reads the same path
+  rather than a `BASH_SOURCE` that does not exist there.
+- A virtualenv that fails to build is removed rather than left half-made
+  for the next run to trip over, and says `apt install python3-venv`,
+  which is the actual cause on Debian.
+
 ## 0.32.0
 
 ### Added

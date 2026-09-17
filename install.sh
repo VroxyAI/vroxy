@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo /nonexistent)"
 UNIT_NAME="vroxy-dispatch@.service"
 UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
 ENV_DIR="/etc/vroxy-dispatch"
@@ -41,6 +41,27 @@ warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+REPO_URL="${VROXY_REPO_URL:-https://github.com/VroxyAI/vroxy.git}"
+CHECKOUT="${VROXY_HOME:-$HOME/.local/share/vroxy}"
+
+# Piped from curl there is no script on disk, so BASH_SOURCE resolves
+# to the caller's CWD and every "$HERE/..." path below would point at
+# whatever directory they happened to be standing in.  Fetch a real
+# checkout and re-exec inside it.
+bootstrap_if_piped() {
+  [[ -f "$HERE/feedback_agent.py" && -f "$HERE/pyproject.toml" ]] && return
+  need git
+  if [[ -d "$CHECKOUT/.git" ]]; then
+    say "Updating $CHECKOUT…"
+    git -C "$CHECKOUT" pull --ff-only --quiet || die "could not update $CHECKOUT"
+  else
+    say "Fetching vroxy into $CHECKOUT…"
+    mkdir -p "$(dirname "$CHECKOUT")"
+    git clone --quiet "$REPO_URL" "$CHECKOUT" || die "clone failed"
+  fi
+  exec bash "$CHECKOUT/install.sh" "$@"
+}
 
 # ── venv ──────────────────────────────────────────────────────────
 ensure_venv() {
@@ -300,7 +321,12 @@ install_cli() {
     # venv rather than arguing with it, and put the entry point on the
     # PATH by hand.  No root, nothing outside $HOME.
     say "System python is externally managed — installing the CLI into its own venv."
-    [[ -x "$HERE/.venv-cli/bin/python" ]] || python3 -m venv "$HERE/.venv-cli"
+    if [[ ! -x "$HERE/.venv-cli/bin/python" ]]; then
+      python3 -m venv "$HERE/.venv-cli" || {
+        rm -rf "$HERE/.venv-cli"
+        die "could not create a virtualenv — on Debian/Ubuntu: sudo apt install python3-venv"
+      }
+    fi
     "$HERE/.venv-cli/bin/python" -m pip install --quiet --upgrade "$HERE" ||
       die "venv install failed"
     mkdir -p "$HOME/.local/bin"
@@ -330,6 +356,8 @@ default_install() {
   esac
 }
 
+bootstrap_if_piped "$@"
+
 case "${1:-}" in
   --unattended) unattended_workspace ;;
   --cli)        install_cli ;;
@@ -338,7 +366,7 @@ case "${1:-}" in
   --list)   list_instances ;;
   --remove) remove_instance "${2:-}" ;;
   --help|-h)
-    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,20p' "$HERE/install.sh" | sed 's/^# \{0,1\}//'
     ;;
   "")       default_install ;;
   *)        die "unknown option: $1 (try --help)" ;;
