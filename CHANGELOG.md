@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.33.0
+
+### Changed
+
+- **`vroxy_cli` merged in — one repo, one installer, two programs.**
+  `install.sh` now installs the `vroxy` CLI and then asks whether this
+  machine should also run a dispatch agent, so a laptop gets the CLI
+  without anything privileged happening. `--cli` and `--dispatch`
+  install one half. The CLI stays dependency-free (websockets sits
+  behind a `dispatch` extra) and falls back to its own venv when the
+  system python is externally managed, which PEP 668 makes the norm on
+  current distros. `feedback_agent.py`, `requirements.txt` and
+  `install.sh` keep their root paths, so a `git pull` on an existing
+  systemd install is uneventful.
+- The repo is now `VroxyAI/vroxy`. GitHub redirects the old name.
+- One version number across the CLI, the agent, and the package.
+
 ## 0.32.0
 
 ### Added
