@@ -60,6 +60,12 @@ bootstrap_if_piped() {
     mkdir -p "$(dirname "$CHECKOUT")"
     git clone --quiet "$REPO_URL" "$CHECKOUT" || die "clone failed"
   fi
+  # Reattach stdin to the terminal: piped, stdin IS the script, so the
+  # dispatch prompt would never see an answer and would silently skip
+  # the question this installer exists to ask.
+  if { : < /dev/tty; } 2>/dev/null; then
+    exec bash "$CHECKOUT/install.sh" "$@" < /dev/tty
+  fi
   exec bash "$CHECKOUT/install.sh" "$@"
 }
 

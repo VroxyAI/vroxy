@@ -26,6 +26,15 @@
   now detects it has no checkout, clones one into `~/.local/share/vroxy`
   (`VROXY_HOME`), and re-execs inside it. `--help` reads the same path
   rather than a `BASH_SOURCE` that does not exist there.
+- **The piped installer can actually ask the dispatch question.** Under
+  `curl | bash`, stdin IS the script, so the prompt would have read the
+  remaining script bytes and skipped the one question the installer
+  exists to ask. Bootstrap now re-execs with stdin reattached to
+  `/dev/tty` when a controlling terminal exists, and falls back to the
+  CLI-only path when one does not (cloud-init, CI, a Dockerfile).
+  Openability is tested by opening it — `[[ -r /dev/tty ]]` passes on
+  the device node even with no controlling terminal, and the failed
+  redirect took the whole install down with it.
 - A virtualenv that fails to build is removed rather than left half-made
   for the next run to trip over, and says `apt install python3-venv`,
   which is the actual cause on Debian.
