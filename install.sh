@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 #
-# vroxy_dispatch installer.
+# vroxy installer — the CLI, and optionally a dispatch agent.
 #
-#   ./install.sh              interactive: add a workspace
+#   ./install.sh              install the CLI, then offer a dispatch agent
+#   ./install.sh --cli        install just the `vroxy` CLI
+#   ./install.sh --dispatch   add a dispatch workspace (no CLI prompt)
 #   ./install.sh --unattended add a workspace from the environment
 #   ./install.sh --update     git pull + reinstall deps + restart all
 #   ./install.sh --list       what's installed, and whether it's up
@@ -283,14 +285,61 @@ remove_instance() {
   say "Removed ${id}. The agent row and its room stay in the workspace — delete them there if you want them gone."
 }
 
+# ── the CLI ───────────────────────────────────────────────────────
+# Installed for the invoking user, never system-wide: `vroxy` is an
+# ordinary command and has no business needing root.  pipx when it is
+# there (its own venv, no clashes), pip --user otherwise.
+install_cli() {
+  need python3
+  if command -v pipx >/dev/null 2>&1; then
+    pipx install --force "$HERE" >/dev/null || die "pipx install failed"
+  elif python3 -m pip install --user --quiet --upgrade "$HERE" 2>/dev/null; then
+    :
+  else
+    # PEP 668: a distro-managed python refuses --user installs.  Own a
+    # venv rather than arguing with it, and put the entry point on the
+    # PATH by hand.  No root, nothing outside $HOME.
+    say "System python is externally managed — installing the CLI into its own venv."
+    [[ -x "$HERE/.venv-cli/bin/python" ]] || python3 -m venv "$HERE/.venv-cli"
+    "$HERE/.venv-cli/bin/python" -m pip install --quiet --upgrade "$HERE" ||
+      die "venv install failed"
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$HERE/.venv-cli/bin/vroxy" "$HOME/.local/bin/vroxy"
+  fi
+  say "Installed the vroxy CLI.  Try: vroxy --help"
+  command -v vroxy >/dev/null 2>&1 ||
+    warn "vroxy is not on PATH yet — add ~/.local/bin to PATH, or restart your shell."
+}
+
+# The default install: everyone wants the CLI, only some people want a
+# long-running agent on this box.  Asking beats assuming — the daemon
+# writes systemd units and an env file, which is not what someone who
+# typed `curl | bash` for a command expects.
+default_install() {
+  install_cli
+  if [[ ! -t 0 ]]; then
+    say "Not a terminal — skipping the dispatch agent.  Run ./install.sh --dispatch to add one."
+    return
+  fi
+  printf '\nAlso run a dispatch agent on this machine? It connects to one\nworkspace and installs a systemd unit. [y/N] '
+  local answer
+  read -r answer || answer=""
+  case "$answer" in
+    [yY]*) add_workspace ;;
+    *)     say "Skipped.  Run ./install.sh --dispatch later if you change your mind." ;;
+  esac
+}
+
 case "${1:-}" in
   --unattended) unattended_workspace ;;
+  --cli)        install_cli ;;
+  --dispatch)   add_workspace ;;
   --update) update_all ;;
   --list)   list_instances ;;
   --remove) remove_instance "${2:-}" ;;
   --help|-h)
     sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
-  "")       add_workspace ;;
+  "")       default_install ;;
   *)        die "unknown option: $1 (try --help)" ;;
 esac

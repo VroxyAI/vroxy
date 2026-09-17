@@ -1,17 +1,66 @@
-# vroxy_dispatch
+# vroxy
 
-An ActionCable client that lets an admin (or a widget visitor's
-`/note` slash command) pass messages to **Claude Code (headless)**
-and stream the response back into vroxy's support chat.
+Two programs that talk to a [vroxy](https://vroxy.ai) workspace,
+shipped together because they install together.
 
-Ported from the walkie-talkie app's dispatch agent (that product has
-since been renamed cuh; its web repo is `wartron/cuh_web`) with
-adjustments for vroxy's tenant-scoped channel + hashid message
-identifiers. Deployment note: this same host previously ran the
-walkie-talkie's dispatch under the `vroxy-dispatch-*` unit names —
-those stale units must be stopped/disabled before installing the
-units below (they run deleted code and hold the old product's
-service token).
+- **`vroxy`** — the CLI. Read and post to rooms, list workspaces,
+  manage docs and tools, fire a dispatch from a terminal or a script.
+  Pure stdlib, no dependencies.
+- **`feedback_agent.py`** — the **dispatch agent**. A long-running
+  ActionCable client that hands messages to a coding agent (Claude
+  Code or Codex, headless), runs it in a throwaway git worktree, and
+  streams the answer back into a vroxy room or support chat.
+
+You want the CLI on your laptop. You want the dispatch agent on the
+one machine that holds a checkout of the code it is allowed to change.
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VroxyAI/vroxy/main/install.sh | bash
+```
+
+That installs the CLI and then asks whether this machine should also
+run a dispatch agent. Answer no and nothing privileged happens — the
+CLI lands in `~/.local/bin` and that is the end of it.
+
+Either half on its own:
+
+```bash
+./install.sh --cli        # just the CLI
+./install.sh --dispatch   # just add a dispatch workspace
+```
+
+The CLI goes in via `pipx` when you have it, `pip install --user`
+when you don't, and its own venv when the system python is externally
+managed (PEP 668, which is most current distros). All three end with
+`vroxy` on your PATH.
+
+## The CLI
+
+```bash
+vroxy login                            # host + API token, stored 0600
+vroxy workspaces                       # what you can reach
+vroxy rooms <workspace>                # rooms in one
+vroxy read <workspace> <room>          # recent messages
+vroxy post <workspace> <room> "ship it"
+vroxy dispatch <workspace>             # the workspace's dispatch agents
+vroxy docs    <workspace> list|show|create|edit|publish|unpublish|delete
+vroxy members <workspace> list|invite|role|remove|revoke
+vroxy tools   <workspace> list|show|create|enable|disable|delete
+```
+
+Every command after `login` takes the workspace first — a hashid or
+its slug.
+
+`--json` goes before the subcommand and prints the raw payload, which
+is the point of having a CLI at all — `vroxy --json rooms acme | jq`
+beats a browser tab inside a script. Credentials live in
+`~/.config/vroxy/credentials.json`; `VROXY_CONFIG_DIR` moves them.
+
+## The dispatch agent
+
+Everything below this line is the agent.
 
 ## Runtime shape
 
@@ -235,16 +284,16 @@ just starts a new session. Session files live in
 `~/.cache/claude-chat/`; `bin/claude-chat /clear` only clears the
 non-streamed one, which is why it never fixed the streamed path.
 
-## Install
+## Installing a dispatch workspace
 
-Run `./install.sh`. It creates the venv, installs a systemd TEMPLATE
-unit (`vroxy-dispatch@<workspace>.service`), asks for the vroxy host
-and a workspace API token, **confirms the workspace by name** before
-wiring anything to it, and writes `/etc/vroxy-dispatch/<id>.env` at
-0640.
+`./install.sh --dispatch` creates the venv, installs a systemd
+TEMPLATE unit (`vroxy-dispatch@<workspace>.service`), asks for the
+vroxy host and a workspace API token, **confirms the workspace by
+name** before wiring anything to it, and writes
+`/etc/vroxy-dispatch/<id>.env` at 0640.
 
 ```bash
-./install.sh              # add a workspace (interactive)
+./install.sh --dispatch   # add a workspace (interactive)
 ./install.sh --list       # what's installed, and whether it's up
 ./install.sh --update     # git pull + deps + restart every instance
 ./install.sh --remove ID  # stop, disable, forget one instance
@@ -711,7 +760,8 @@ The client-side picker that populates the payload lives in
 ## Tests
 
 ```bash
-python3 -m unittest test_feedback_agent
+python3 -m unittest test_feedback_agent      # the dispatch agent
+python3 -m unittest discover -s tests        # the CLI
 ```
 
 Covers `build_prompt` (full / page-level / sparse / duplicate-
