@@ -1130,6 +1130,37 @@ class WorkerSurvivesReconnectTest(unittest.IsolatedAsyncioTestCase):
             worker.cancel()
             fa.handle_room_message = original
 
+    async def test_an_armed_restart_holds_new_work_instead_of_dying_on_it(self):
+        # 2026-09-16: a message arrived inside the 5s restart delay,
+        # ran for nine seconds, and systemd killed it mid-tool-call.
+        # The spool replayed the message but every result was gone.
+        link = fa.CableLink()
+        started = asyncio.Event()
+
+        async def handler(_link, _payload):
+            started.set()
+
+        original, fa.handle_room_message = fa.handle_room_message, handler
+        saved_flag = fa._restart_scheduled
+        fa._restart_scheduled = True
+        worker = asyncio.create_task(fa.worker_loop(link))
+        try:
+            await fa._work_queue.put(("room", {"room": {"hashid": "r1"}}))
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(started.wait(), 0.5)
+            self.assertFalse(started.is_set(),
+                             "a run must not start into an armed restart")
+            self.assertFalse(fa._work_queue.empty(),
+                             "the held item must stay queued for the spool")
+
+            # And it runs the moment the restart is called off.
+            fa._restart_scheduled = False
+            await asyncio.wait_for(started.wait(), 3)
+        finally:
+            worker.cancel()
+            fa.handle_room_message = original
+            fa._restart_scheduled = saved_flag
+
     async def test_a_handler_raising_does_not_kill_the_worker(self):
         link = fa.CableLink()
         boom = asyncio.Event()
@@ -1520,6 +1551,54 @@ class WorkSpoolTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         fa._work_queue, fa._current_work = self._saved_queue, self._saved_work
         self.stop_sandbox()
+
+    async def test_the_in_flight_task_records_what_it_was_doing(self):
+        # A queued item was never started, so there is nothing to
+        # report about it; the one that was running is the only one
+        # the room is owed an explanation for.
+        saved_status, saved_started = fa._current_status, fa._current_work_started
+        fa._current_status = "answering #Dispatch"
+        fa._current_work_started = time.time() - 42
+        fa._current_work = ("room", {"room": {"hashid": "r1"}})
+        fa._work_queue.put_nowait(("room", {"room": {"hashid": "r2"}}))
+        try:
+            fa.spool_pending_work()
+            items = fa.take_spooled_work()
+            self.assertTrue(items[0].get("in_flight"))
+            self.assertEqual("answering #Dispatch", items[0].get("status"))
+            self.assertGreaterEqual(items[0].get("ran_for"), 40)
+            self.assertFalse(items[1].get("in_flight"),
+                             "a queued task was never started — nothing to explain")
+        finally:
+            fa._current_status, fa._current_work_started = saved_status, saved_started
+
+    async def test_the_room_is_told_what_the_restart_interrupted(self):
+        saved = list(fa._interrupted_on_boot)
+        fa._interrupted_on_boot = [{
+            "kind": "room", "in_flight": True, "status": "answering #Dispatch",
+            "ran_for": 9,
+            "payload": {"room": {"hashid": "r1"}, "message": {"hashid": "m1"}},
+        }]
+        sent = []
+
+        async def fake_reply(_link, room_id, body, reply_to=None):
+            sent.append((room_id, body, reply_to))
+
+        original, fa.room_reply = fa.room_reply, fake_reply
+        try:
+            await fa.announce_interrupted(object())
+            self.assertEqual(1, len(sent))
+            self.assertEqual("r1", sent[0][0])
+            self.assertIn("answering #Dispatch", sent[0][1])
+            self.assertEqual("m1", sent[0][2], "it must thread under the asker")
+
+            # Announced once: a reconnect confirms the subscription
+            # again, and this must not re-announce on each of them.
+            await fa.announce_interrupted(object())
+            self.assertEqual(1, len(sent))
+        finally:
+            fa.room_reply = original
+            fa._interrupted_on_boot = saved
 
     async def test_the_in_flight_task_is_spooled_ahead_of_the_queued_ones(self):
         # The one being worked was taken off the queue but never

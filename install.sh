@@ -9,6 +9,9 @@
 #   ./install.sh --update     git pull + reinstall deps + restart all
 #   ./install.sh --list       what's installed, and whether it's up
 #   ./install.sh --remove ID  stop, disable and forget one instance
+#   ./install.sh --migrate-legacy [ID]
+#                             move a pre-template unit onto the
+#                             template.  Needs the agent's EXACT name.
 #
 # --unattended reads VROXY_TOKEN (required), VROXY_HOST, CODE_ROOT,
 # PROJECT, VROXY_AGENT_NAME, VROXY_INSTANCE_ID and DISPATCH_ENGINE.
@@ -278,6 +281,17 @@ instances() {
   sudo -n find "$ENV_DIR" -maxdepth 1 -name '*.env' -printf '%f\n' 2>/dev/null | sed 's/\.env$//' | sort
 }
 
+LEGACY_UNIT="vroxy-dispatch-feedback-agent.service"
+LEGACY_ENV="/etc/default/vroxy-dispatch"
+
+# The pre-template unit, if this box still runs one.  It predates both
+# the template and VROXY_INSTALL_ID, so `instances` cannot see it and
+# --list reported a box as empty while an agent ran on it.
+legacy_present() {
+  systemctl list-unit-files "$LEGACY_UNIT" >/dev/null 2>&1 &&
+    systemctl cat "$LEGACY_UNIT" >/dev/null 2>&1
+}
+
 list_instances() {
   local any=0
   while read -r id; do
@@ -285,6 +299,11 @@ list_instances() {
     any=1
     printf '%-20s %s\n' "$id" "$(systemctl is-active "vroxy-dispatch@${id}.service" 2>/dev/null || echo unknown)"
   done < <(instances)
+  if legacy_present; then
+    any=1
+    printf '%-20s %s  (legacy unit — ./install.sh --migrate-legacy)\n' \
+      "$LEGACY_UNIT" "$(systemctl is-active "$LEGACY_UNIT" 2>/dev/null || echo unknown)"
+  fi
   [[ $any -eq 1 ]] || say "Nothing installed yet — run ./install.sh"
 }
 
@@ -301,6 +320,11 @@ update_all() {
     sudo systemd-run --on-active=2s --unit="vroxy-dispatch-update-${id}-$RANDOM" --collect \
       systemctl restart "vroxy-dispatch@${id}.service"
   done < <(instances)
+  if legacy_present; then
+    say "Restarting ${LEGACY_UNIT}…"
+    sudo systemd-run --on-active=2s --unit="vroxy-dispatch-update-legacy-$RANDOM" --collect \
+      systemctl restart "$LEGACY_UNIT"
+  fi
   say "Restarts scheduled. Each instance spools its in-flight work and replays it on boot."
 }
 
@@ -362,12 +386,67 @@ default_install() {
   esac
 }
 
+migrate_legacy() {
+  legacy_present || die "no legacy unit on this box — nothing to migrate."
+  need python3
+
+  local id="${1:-}"
+  [[ -n "$id" ]] || { printf 'Instance id for this workspace (e.g. vroxy): '; read -r id; }
+  [[ -n "$id" ]] || die "an instance id is required."
+  sudo -n test -e "${ENV_DIR}/${id}.env" 2>/dev/null &&
+    die "${ENV_DIR}/${id}.env already exists — pick another id or remove that instance first."
+
+  local legacy
+  legacy="$(sudo cat "$LEGACY_ENV" 2>/dev/null)" || die "cannot read $LEGACY_ENV"
+  local host token agent_name code_root project cable
+  cable="$(sed -n 's/^VROXY_CABLE_URL=//p'    <<<"$legacy" | head -1)"
+  token="$(sed -n 's/^VROXY_SERVICE_TOKEN=//p' <<<"$legacy" | head -1)"
+  agent_name="$(sed -n 's/^VROXY_AGENT_NAME=//p' <<<"$legacy" | head -1)"
+  code_root="$(sed -n 's/^CODE_ROOT=//p'       <<<"$legacy" | head -1)"
+  project="$(sed -n 's/^PROJECT=//p'           <<<"$legacy" | head -1)"
+  [[ -n "$token" ]] || die "no VROXY_SERVICE_TOKEN in $LEGACY_ENV"
+
+  host="${cable%/cable}"
+  host="${host/wss:/https:}"
+  host="${host/ws:/http:}"
+
+  # THE ONE THING THIS CANNOT GUESS.  The legacy unit predates
+  # VROXY_INSTALL_ID, so the server matched it by "the workspace's only
+  # local agent".  Once it sends an install id it is resolved by id,
+  # and the server ADOPTS the existing row only when the name matches
+  # exactly (DispatchAgent.adoptable).  A blank or wrong name creates a
+  # SECOND agent and strands the original's room and history.
+  if [[ -z "$agent_name" ]]; then
+    say ""
+    say "This agent has no name in $LEGACY_ENV."
+    say "Open /w/<workspace>/dispatch and copy the agent's name EXACTLY."
+    say "Get it wrong and the server makes a second agent instead of"
+    say "adopting this one — its room and history stay on the old row."
+    printf 'Agent name: '
+    read -r agent_name
+  fi
+  [[ -n "$agent_name" ]] || die "an agent name is required — see /w/<workspace>/dispatch"
+
+  say "Migrating ${LEGACY_UNIT} → vroxy-dispatch@${id}.service (agent: ${agent_name})"
+  write_env_file "$id" "$id" "$host" "$token" "$agent_name" "$code_root" "$project"
+  install_unit
+  sudo systemctl enable "vroxy-dispatch@${id}.service" >/dev/null
+
+  # Out of band: this script may itself be running inside the unit it
+  # is about to stop.
+  sudo systemd-run --on-active=2s --unit="vroxy-dispatch-migrate-$RANDOM" --collect \
+    bash -c "systemctl disable --now ${LEGACY_UNIT}; systemctl start vroxy-dispatch@${id}.service"
+  say "Scheduled. The old unit stops and the new one starts in ~2s;"
+  say "in-flight work is spooled and replayed. Check: ./install.sh --list"
+}
+
 bootstrap_if_piped "$@"
 
 case "${1:-}" in
   --unattended) unattended_workspace ;;
   --cli)        install_cli ;;
   --dispatch)   add_workspace ;;
+  --migrate-legacy) migrate_legacy "${2:-}" ;;
   --update) update_all ;;
   --list)   list_instances ;;
   --remove) remove_instance "${2:-}" ;;

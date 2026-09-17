@@ -122,6 +122,7 @@ AGENT_NAME      = os.environ.get("VROXY_AGENT_NAME", "")
 SERVICE_UNIT    = os.environ.get("VROXY_DISPATCH_UNIT",
                                  "vroxy-dispatch-feedback-agent.service")
 RESTART_DELAY_SECONDS = int(os.environ.get("VROXY_DISPATCH_RESTART_DELAY", "5"))
+RESTART_HOLD_POLL_SECONDS = 1
 STATE_DIR       = Path(os.environ.get("VROXY_DISPATCH_STATE_DIR",
                                       str(Path.home() / ".cache" / "vroxy-dispatch")))
 RESTART_NOTICE_PATH = STATE_DIR / "restart-notice.json"
@@ -139,7 +140,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.33.0"
+AGENT_VERSION      = "vroxy_dispatch 0.34.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1988,6 +1989,8 @@ async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
 # worker was running dies with it, and whatever was still queued dies
 # unread — the server broadcast it once and does not repeat itself.
 _current_work: tuple[str, dict] | None = None
+_current_work_started: float | None = None
+_interrupted_on_boot: list[dict] = []
 
 
 # Message hashids the operator has held.  The server keeps the durable
@@ -2085,7 +2088,13 @@ def spool_pending_work() -> int:
     as lost as the ones behind it."""
     items: list[dict] = []
     if _current_work:
-        items.append({"kind": _current_work[0], "payload": _current_work[1]})
+        items.append({
+            "kind":      _current_work[0],
+            "payload":   _current_work[1],
+            "in_flight": True,
+            "status":    _current_status,
+            "ran_for":   round(time.time() - (_current_work_started or time.time())),
+        })
     if _work_queue is not None:
         while not _work_queue.empty():
             try:
@@ -2148,6 +2157,31 @@ def install_shutdown_handler(loop) -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, handle, sig)
+
+
+async def announce_interrupted(link) -> None:
+    """Say what died, in the room that asked for it.
+
+    A restart that lands on a running task is invisible from the
+    room's side: the question sits there answered by nothing while
+    the next process quietly starts over.  One line costs nothing and
+    turns a silence into a wait."""
+    global _interrupted_on_boot
+    items, _interrupted_on_boot = _interrupted_on_boot, []
+    for item in items:
+        room = (item.get("payload") or {}).get("room") or {}
+        room_id = room.get("hashid")
+        if item.get("kind") != "room" or not room_id:
+            continue
+        doing = item.get("status") or "working"
+        ran   = item.get("ran_for")
+        spent = f" after about {ran}s" if isinstance(ran, int) and ran >= 5 else ""
+        with contextlib.suppress(Exception):
+            await room_reply(
+                link, room_id,
+                f"⏸ A restart interrupted me while I was {doing}{spent} — "
+                f"nothing I'd done was saved, so I'm starting that one over.",
+                ((item.get("payload") or {}).get("message") or {}).get("hashid"))
 
 
 async def announce_restart(link) -> None:
@@ -2975,15 +3009,28 @@ async def worker_loop(link: CableLink) -> None:
     reentrant and we don't want to race a `--resume` with itself."""
     global _current_status
     assert _work_queue is not None
-    global _current_work
+    global _current_work, _current_work_started
     while True:
         kind, payload = await _work_queue.get()
+        # A restart timer is already armed and fires in seconds.
+        # Starting a Claude run now means systemd kills it mid-flight
+        # and the next process redoes it from nothing, which is what
+        # happened on 2026-09-16: a message arrived inside the delay,
+        # ran for nine seconds, and died holding every tool result it
+        # had gathered.  Leave it queued — the spool carries it over
+        # and the next process starts it clean.
+        if _restart_scheduled:
+            _work_queue.put_nowait((kind, payload))
+            _work_queue.task_done()
+            await asyncio.sleep(RESTART_HOLD_POLL_SECONDS)
+            continue
         # To the BACK, never dropped: holding is a request to wait.
         if kind == "room" and is_paused(payload):
             await asyncio.sleep(PAUSED_REQUEUE_DELAY_SECONDS)
             _work_queue.put_nowait((kind, payload))
             continue
         _current_work = (kind, payload)
+        _current_work_started = time.time()
         fb_id = ((payload.get("feedback") or {}).get("hashid")
                  or payload.get("feedback_id") or "?")
         if kind == "room":
@@ -3009,6 +3056,7 @@ async def worker_loop(link: CableLink) -> None:
         finally:
             _current_status = "idle"
             _current_work = None
+            _current_work_started = None
             set_task_label("")
             _work_queue.task_done()
 
@@ -3047,6 +3095,7 @@ async def process_stream(link: CableLink, ws) -> None:
                 await link.flush()
                 try:
                     await announce_restart(link)
+                    await announce_interrupted(link)
                 except Exception:
                     log.exception("could not announce the restart")
                 continue
@@ -3121,9 +3170,12 @@ async def main() -> None:
     # Anything the previous process was holding when it was stopped.
     # Re-queued before the socket is even open, so it runs in the
     # order it was asked rather than behind whatever arrives next.
+    global _interrupted_on_boot
     for item in take_spooled_work():
         log.warning("replaying a %s task the last process never finished", item["kind"])
         _work_queue.put_nowait((item["kind"], item["payload"]))
+        if item.get("in_flight"):
+            _interrupted_on_boot.append(item)
 
     link = CableLink()
     # Started once, outside the reconnect loop, so a run in progress

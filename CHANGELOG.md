@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.34.0
+
+### Fixed
+
+- **An armed restart no longer kills work that started during its
+  delay.** `schedule_restart` arms a `systemd-run` timer 5s out, and
+  the worker kept dequeuing in that window — so a message that arrived
+  inside it ran for seconds and was killed mid-tool-call, and the next
+  process redid it from nothing. Happened on 2026-09-16 to a message
+  asking about this exact behaviour. The worker now holds new work once
+  a restart is scheduled and leaves it queued for the spool.
+
+### Added
+
+- **A restart says what it interrupted.** The spool marks the in-flight
+  task with the status and elapsed time, and the next process posts
+  `⏸ A restart interrupted me while I was …` into the room that asked,
+  threaded under the original message. A killed run used to be a
+  silence on the room's side.
+- **`./install.sh --migrate-legacy [ID]`** moves a pre-template
+  `vroxy-dispatch-feedback-agent.service` onto the template unit. It
+  refuses to guess the agent NAME: the legacy unit predates
+  `VROXY_INSTALL_ID`, so the server matched it as "the workspace's only
+  local agent", and once it sends an id the row is adopted only on an
+  exact name match — a blank name creates a SECOND agent and strands
+  the original's room and history.
+- **`--list` and `--update` see a legacy unit.** `instances()` reads
+  `/etc/vroxy-dispatch/*.env`, which a pre-template install has none
+  of, so `--list` reported an empty box while an agent ran on it and
+  `--update` never restarted it.
+
 ## 0.33.0
 
 ### Changed
