@@ -140,7 +140,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.34.0"
+AGENT_VERSION      = "vroxy_dispatch 0.35.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -2519,6 +2519,10 @@ async def _emit_room_run(ws, room_id: str, reply_to: str | None,
             "status":        "error" if result.get("is_error") else "ok",
             "agent_version": AGENT_VERSION,
             "engine":        DISPATCH_ENGINE,
+            # Rides the same opt-out as the heartbeat's model: turning
+            # telemetry off has to mean the data stops existing, not
+            # that one surface keeps reporting it.
+            "model":         _last_model if TELEMETRY_ENABLED else None,
             "project":       PROJECT,
             "usage":         usage,
             "cost_usd":      result.get("cost_usd"),

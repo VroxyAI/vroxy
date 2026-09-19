@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.35.0
+
+### Added
+
+- **`room_run` reports the model.** The heartbeat already said which
+  model answered; a finished run did not, so reading a run back weeks
+  later told you the harness but never what drove it. Rides the same
+  `DISPATCH_TELEMETRY` opt-out as the heartbeat's copy — turning
+  telemetry off has to mean the data stops existing, not that one
+  surface keeps reporting it.
+
 ## 0.34.0
 
 ### Fixed
