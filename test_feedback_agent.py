@@ -2057,11 +2057,19 @@ class HarnessProbeTest(unittest.TestCase):
         self.assertTrue(found["codex"]["active"])
         self.assertFalse(found["claude"]["active"])
 
+    # aider has no resumable session id in the shape the runners need,
+    # so it stays detect-only on purpose rather than by omission.
     def test_a_harness_we_cannot_drive_is_reported_without_an_engine(self):
+        self._install("aider")
+        found = fa.probe_harnesses()
+        self.assertEqual(found[0]["id"], "aider")
+        self.assertNotIn("engine", found[0])
+
+    def test_a_drivable_harness_reports_the_engine_that_runs_it(self):
         self._install("gemini")
         found = fa.probe_harnesses()
-        self.assertEqual(found[0]["id"], "gemini")
-        self.assertNotIn("engine", found[0])
+        self.assertEqual(found[0]["engine"], "gemini")
+        self.assertIn("gemini", fa.HARNESS_SPECS)
 
     def test_an_explicit_bin_override_wins_over_path(self):
         outside = Path(self.tmp) / "elsewhere"
@@ -2100,9 +2108,9 @@ class HarnessProbeTest(unittest.TestCase):
         found = {h["id"]: h for h in fa.probe_harnesses()}
         self.assertEqual(found["opencode"]["version"], "opencode 0.4.2")
         self.assertEqual(found["pi"]["version"], "pi 1.1.0")
-        self.assertNotIn("engine", found["opencode"],
+        self.assertEqual(found["opencode"]["engine"], "opencode")
+        self.assertNotIn("engine", found["pi"],
                          "detected but not yet drivable")
-        self.assertNotIn("engine", found["pi"])
 
     def test_every_known_harness_has_a_distinct_id_and_binary(self):
         ids = [h["id"] for h in fa.KNOWN_HARNESSES]
@@ -2445,3 +2453,106 @@ class SessionRetirementTest(unittest.TestCase):
         for _ in range(fa.SESSION_MAX_TURNS):
             fa._note_session_turn(self.sid, fresh=False)
         self.assertIsNotNone(fa._session_spent(self.sid))
+
+
+class HarnessParserTest(unittest.TestCase):
+    """Copilot's cases are real events captured from a live run; the
+    other three are written from their documented shapes and have
+    never executed here."""
+
+    def test_copilot_tool_call_comes_from_the_complete_message(self):
+        # The assistant.tool_call_delta events carry partial argument
+        # fragments ("{\"comma", "nd\": \"c"); parsing those would
+        # produce garbage tool calls.
+        delta = {"type": "assistant.tool_call_delta",
+                 "data": {"toolCallId": "t1", "toolName": "bash",
+                          "inputDelta": '{"comma'}}
+        events, _, _ = fa._copilot_shaped(delta)
+        self.assertEqual(events, [])
+
+        msg = {"type": "assistant.message",
+               "data": {"model": "claude-sonnet-5", "content": "",
+                        "toolRequests": [{"toolCallId": "t1", "name": "bash",
+                                          "arguments": {"command": "cat a.txt"}}]}}
+        events, _, model = fa._copilot_shaped(msg)
+        self.assertEqual(model, "claude-sonnet-5")
+        self.assertEqual(events[0]["type"], "tool_use")
+        self.assertEqual(events[0]["name"], "bash")
+        self.assertEqual(events[0]["input"]["command"], "cat a.txt")
+
+    def test_copilot_session_id_only_arrives_on_the_result(self):
+        mid = {"type": "assistant.turn_end", "data": {"turnId": "0"},
+               "id": "987a0e7f-c0e5-4e30-9961-b5c2aa3873f2"}
+        _, sid, _ = fa._copilot_shaped(mid)
+        self.assertIsNone(sid, "the per-event `id` is not a session id")
+
+        result = {"type": "result", "sessionId": "fa81c0ad-ffc3-4661-80a4-fc9637217c4f",
+                  "exitCode": 0, "usage": {"premiumRequests": 1, "sessionDurationMs": 1722}}
+        events, sid, _ = fa._copilot_shaped(result)
+        self.assertEqual(sid, "fa81c0ad-ffc3-4661-80a4-fc9637217c4f")
+        self.assertEqual(events[0]["type"], "result")
+        self.assertFalse(events[0]["is_error"])
+
+    def test_copilot_nonzero_exit_is_an_error(self):
+        events, _, _ = fa._copilot_shaped(
+            {"type": "result", "sessionId": "s", "exitCode": 1, "usage": {}})
+        self.assertTrue(events[0]["is_error"])
+
+    def test_copilot_final_text_is_a_message_with_content(self):
+        events, _, _ = fa._copilot_shaped(
+            {"type": "assistant.message", "data": {"content": "the answer"}})
+        self.assertEqual(events[0], {"type": "text_delta", "text": "the answer"})
+
+    # amp documents its --stream-json as Claude Code's shape.
+    def test_claude_shaped_handles_tool_text_and_thinking(self):
+        events, sid, model = fa._claude_shaped({
+            "type": "assistant", "session_id": "sess-1",
+            "message": {"model": "amp-1", "content": [
+                {"type": "tool_use", "name": "bash", "input": {"command": "ls"}},
+                {"type": "text", "text": "hi"},
+                {"type": "thinking", "thinking": "hmm"}]}})
+        self.assertEqual(sid, "sess-1")
+        self.assertEqual(model, "amp-1")
+        self.assertEqual([e["type"] for e in events],
+                         ["tool_use", "text_delta", "thinking"])
+
+    def test_claude_shaped_result_carries_final_text(self):
+        events, _, _ = fa._claude_shaped(
+            {"type": "result", "result": "done", "usage": {"input_tokens": 3}})
+        self.assertEqual(events[0]["final_text"], "done")
+
+    def test_a_malformed_block_is_skipped_not_raised(self):
+        events, _, _ = fa._claude_shaped(
+            {"type": "assistant", "message": {"content": ["not-a-dict", None]}})
+        self.assertEqual(events, [])
+
+    def test_opencode_falls_back_rather_than_dropping_a_turn(self):
+        events, sid, _ = fa._opencode_shaped(
+            {"sessionID": "oc-1", "part": {"type": "text", "text": "hello"}})
+        self.assertEqual(sid, "oc-1")
+        self.assertEqual(events[0], {"type": "text_delta", "text": "hello"})
+
+    def test_opencode_prefers_the_claude_shape_when_it_matches(self):
+        events, sid, _ = fa._opencode_shaped(
+            {"type": "assistant", "session_id": "oc-2",
+             "message": {"content": [{"type": "text", "text": "hi"}]}})
+        self.assertEqual(sid, "oc-2")
+        self.assertEqual(events[0]["text"], "hi")
+
+    def test_every_spec_builds_argv_with_and_without_a_session(self):
+        for engine, spec in fa.HARNESS_SPECS.items():
+            fresh = spec["argv"]("/bin/x", "PROMPT", None)
+            resumed = spec["argv"]("/bin/x", "PROMPT", "SID")
+            self.assertIn("PROMPT", fresh, engine)
+            self.assertNotIn("SID", fresh, engine)
+            self.assertIn("SID", resumed, engine)
+
+    def test_only_copilot_claims_to_be_verified(self):
+        verified = {e for e, s in fa.HARNESS_SPECS.items() if s["verified"]}
+        self.assertEqual(verified, {"copilot_cli"},
+                         "a spec that has never run must not claim otherwise")
+
+    def test_every_drivable_harness_has_a_runner(self):
+        engines = {h["engine"] for h in fa.KNOWN_HARNESSES if h["engine"]}
+        self.assertTrue(engines <= {"claude", "codex", *fa.HARNESS_SPECS},
+                        "KNOWN_HARNESSES names an engine nothing can run")

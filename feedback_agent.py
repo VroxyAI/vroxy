@@ -140,7 +140,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.36.0"
+AGENT_VERSION      = "vroxy_dispatch 0.37.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -319,13 +319,13 @@ async def subscribe(ws) -> None:
 KNOWN_HARNESSES = (
     {"id": "claude", "label": "Claude Code",   "bin": "claude",       "engine": "claude"},
     {"id": "codex",  "label": "OpenAI Codex",  "bin": "codex",        "engine": "codex"},
-    {"id": "gemini", "label": "Gemini CLI",    "bin": "gemini",       "engine": None},
-    {"id": "copilot", "label": "GitHub Copilot CLI", "bin": "copilot", "engine": None},
+    {"id": "gemini", "label": "Gemini CLI",    "bin": "gemini",       "engine": "gemini"},
+    {"id": "copilot", "label": "GitHub Copilot CLI", "bin": "copilot", "engine": "copilot_cli"},
     {"id": "aider",  "label": "Aider",         "bin": "aider",        "engine": None},
-    {"id": "opencode", "label": "OpenCode",    "bin": "opencode",     "engine": None},
+    {"id": "opencode", "label": "OpenCode",    "bin": "opencode",     "engine": "opencode"},
     {"id": "pi",     "label": "Pi",            "bin": "pi",           "engine": None},
     {"id": "cursor", "label": "Cursor Agent",  "bin": "cursor-agent", "engine": None},
-    {"id": "amp",    "label": "Amp",           "bin": "amp",          "engine": None},
+    {"id": "amp",    "label": "Amp",           "bin": "amp",          "engine": "amp"},
     {"id": "goose",  "label": "Goose",         "bin": "goose",        "engine": None},
 )
 
@@ -1694,6 +1694,312 @@ def run_codex_streamed(prompt: str, project: str, on_event,
     return final_text
 
 
+# ── Additional harnesses ────────────────────────────────────────
+#
+# claude and codex keep bespoke runners: their streams share nothing.
+# These four share one loop, and differ only in argv, where a session
+# id comes back, and how one event becomes our normalised
+# {tool_use, text_delta, thinking, result}.
+#
+# VERIFIED AGAINST A REAL RUN: copilot only — it rides the machine's
+# gh credential.  gemini, opencode and amp are written from their
+# --help surfaces and have never executed here for want of provider
+# credentials, so their parsers fall back to plain text rather than
+# dropping a turn on an unexpected shape.
+
+def _claude_shaped(event: dict):
+    """Claude Code's stream-json.  amp copies it deliberately — its own
+    help calls `--stream-json-thinking` a "non-Claude Code extension"
+    and documents piping `.message.content[]`."""
+    out: list[dict] = []
+    sid = event.get("session_id") or event.get("sessionId")
+    model = None
+    etype = event.get("type")
+    msg = event.get("message") if isinstance(event.get("message"), dict) else {}
+
+    if etype == "assistant":
+        model = msg.get("model")
+        for block in (msg.get("content") or event.get("content") or []):
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "tool_use":
+                out.append({"type": "tool_use",
+                            "name": block.get("name") or "",
+                            "input": block.get("input") or {}})
+            elif btype == "text" and block.get("text"):
+                out.append({"type": "text_delta", "text": block["text"]})
+            elif btype == "thinking" and (block.get("thinking") or block.get("text")):
+                out.append({"type": "thinking",
+                            "text": block.get("thinking") or block.get("text")})
+    elif etype == "result":
+        final = event.get("result")
+        out.append({"type": "result",
+                    "usage": event.get("usage") or {},
+                    "cost_usd": event.get("total_cost_usd"),
+                    "duration_ms": event.get("duration_ms"),
+                    "is_error": bool(event.get("is_error")),
+                    "final_text": final if isinstance(final, str) else None})
+    return out, sid, model
+
+
+def _copilot_shaped(event: dict):
+    """GitHub Copilot CLI `--output-format json`.  Captured from a real
+    run: tool calls arrive complete on `assistant.message.toolRequests`
+    (the `assistant.tool_call_delta` events are partial argument
+    fragments and are deliberately ignored), and the session id only
+    appears on the terminal `result`."""
+    out: list[dict] = []
+    sid = event.get("sessionId")
+    model = None
+    etype = event.get("type")
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+
+    if etype == "assistant.message":
+        model = data.get("model")
+        for req in (data.get("toolRequests") or []):
+            if isinstance(req, dict):
+                out.append({"type": "tool_use",
+                            "name": req.get("name") or "",
+                            "input": req.get("arguments") or {}})
+        if data.get("content"):
+            out.append({"type": "text_delta", "text": data["content"]})
+    elif etype == "session.tools_updated":
+        model = data.get("model")
+    elif etype == "result":
+        out.append({"type": "result",
+                    "usage": event.get("usage") or {},
+                    "cost_usd": None,
+                    "duration_ms": (event.get("usage") or {}).get("sessionDurationMs"),
+                    "is_error": bool(event.get("exitCode")),
+                    "final_text": None})
+    return out, sid, model
+
+
+def _opencode_shaped(event: dict):
+    """`opencode run --format json` documents only "raw JSON events".
+    Unverified: try the Claude shape, then fall back to any obvious
+    text so an unexpected event degrades to narration instead of
+    silence."""
+    out, sid, model = _claude_shaped(event)
+    if out or sid:
+        return out, sid, model
+
+    sid = event.get("sessionID") or event.get("session_id") or event.get("sessionId")
+    part = event.get("part") if isinstance(event.get("part"), dict) else event
+    ptype = part.get("type")
+    if ptype == "tool" or part.get("tool"):
+        out.append({"type": "tool_use",
+                    "name": part.get("tool") or part.get("name") or "",
+                    "input": part.get("state") or part.get("input") or {}})
+    elif ptype in ("text", "message") and part.get("text"):
+        out.append({"type": "text_delta", "text": part["text"]})
+    elif ptype == "reasoning" and part.get("text"):
+        out.append({"type": "thinking", "text": part["text"]})
+    return out, sid, model
+
+
+HARNESS_SPECS = {
+    "gemini": {
+        "bin": "gemini",
+        "label": "Gemini CLI",
+        "parse": _claude_shaped,
+        "verified": False,
+        # --session-id takes a UUID we choose, so the id never has to
+        # be scraped back out of the stream.
+        "argv": lambda b, prompt, sid: (
+            [b, "-p", prompt, "-o", "stream-json", "--approval-mode", "yolo"]
+            + (["-r", sid] if sid else [])),
+    },
+    "opencode": {
+        "bin": "opencode",
+        "label": "OpenCode",
+        "parse": _opencode_shaped,
+        "verified": False,
+        "argv": lambda b, prompt, sid: (
+            [b, "run", "--format", "json"]
+            + (["-s", sid] if sid else []) + [prompt]),
+    },
+    "amp": {
+        "bin": "amp",
+        "label": "Amp",
+        "parse": _claude_shaped,
+        "verified": False,
+        "argv": lambda b, prompt, sid: (
+            ([b, "threads", "continue", sid, "-x", prompt]
+             if sid else [b, "-x", prompt])
+            + ["--stream-json", "--stream-json-thinking"]),
+    },
+    "copilot_cli": {
+        "bin": "copilot",
+        "label": "GitHub Copilot CLI",
+        "parse": _copilot_shaped,
+        "verified": True,
+        "argv": lambda b, prompt, sid: (
+            [b, "-p", prompt, "--allow-all-tools",
+             "--output-format", "json", "--stream", "on"]
+            + (["--resume", sid] if sid else [])),
+    },
+}
+
+
+def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
+                         allow_resume: bool = True,
+                         session_key: str | None = None,
+                         work_dir_override: Path | None = None,
+                         cancel_key: str | None = None) -> str:
+    """One loop for every harness in HARNESS_SPECS.
+
+    Same contract as run_claude_streamed: emits normalised events,
+    honours the stall watchdog, retires a session that has grown past
+    its limits, and returns the aggregated final text."""
+    spec = HARNESS_SPECS[engine]
+    work_dir = str(work_dir_override or (CODE_ROOT / project))
+    if not Path(work_dir).is_dir():
+        raise FileNotFoundError(f"CODE_ROOT/{project} not found at {work_dir!r}")
+
+    from shutil import which
+    binpath = which(spec["bin"])
+    if not binpath:
+        raise FileNotFoundError(
+            f"{spec['label']} not installed — `{spec['bin']}` is not on PATH")
+
+    sid_file = _streamed_sid_file(f"{engine}_{session_key or project}")
+    sid_file.parent.mkdir(parents=True, exist_ok=True)
+
+    stored_sid = sid_file.read_text().strip() if sid_file.exists() else ""
+    if stored_sid and allow_resume:
+        spent = _session_spent(sid_file)
+        if spent:
+            _retire_session(sid_file, spent)
+            stored_sid = ""
+    resumed = bool(allow_resume and stored_sid)
+
+    argv = spec["argv"](binpath, prompt, stored_sid if resumed else None)
+    log.info("Running streamed %s in %s (session=%s, resume=%s)",
+             engine, work_dir, sid_file, resumed)
+
+    proc = subprocess.Popen(
+        argv, cwd=work_dir, env=os.environ.copy(),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+        start_new_session=True,
+    )
+    global _current_proc, _last_model
+    _current_proc = proc
+
+    final_text_chunks: list[str] = []
+    new_sid: str | None = None
+    tool_calls = text_chars = thinking_chars = 0
+    stalled_windows = 0
+
+    try:
+        for raw in _stream_lines(proc):
+            if raw is _STALLED:
+                stalled_windows += 1
+                waited = stalled_windows * STALL_SECONDS
+                log.warning("%s produced nothing for %ss (window %s/%s)",
+                            engine, waited, stalled_windows, STALL_WINDOWS_BEFORE_KILL)
+                try:
+                    on_event({"type": "stalled", "seconds": waited,
+                              "window": stalled_windows,
+                              "max_windows": STALL_WINDOWS_BEFORE_KILL})
+                except Exception:
+                    log.exception("on_event stalled raised")
+                if stalled_windows >= STALL_WINDOWS_BEFORE_KILL:
+                    log.error("killing wedged %s run after %ss of silence", engine, waited)
+                    _kill_process_tree(proc)
+                    break
+                continue
+            stalled_windows = 0
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+
+            try:
+                events, sid, model = spec["parse"](event)
+            except Exception:
+                log.exception("%s parser raised on %s", engine, _one_line(line, 200))
+                continue
+
+            if sid:
+                new_sid = sid
+            if model:
+                _last_model = str(model)[:80]
+
+            for out in events:
+                etype = out.get("type")
+                if etype == "tool_use":
+                    tool_calls += 1
+                    log.info("  → tool_use %s(%s)", out["name"],
+                             _compact_tool_args(out.get("input") or {}))
+                elif etype == "text_delta":
+                    text_chars += len(out["text"])
+                    final_text_chunks.append(out["text"])
+                    log.info("  → text %s", _one_line(out["text"], 200))
+                elif etype == "thinking":
+                    thinking_chars += len(out["text"])
+                    log.info("  · thinking %s", _one_line(out["text"], 200))
+                elif etype == "result":
+                    if out.get("final_text"):
+                        final_text_chunks = [out["final_text"]]
+                    if out.get("usage"):
+                        log.info("  · usage %s", out["usage"])
+                try:
+                    on_event(out)
+                except Exception:
+                    log.exception("on_event %s raised", etype)
+
+        try:
+            proc.wait(timeout=STALL_SECONDS)
+        except subprocess.TimeoutExpired:
+            log.error("%s closed stdout but would not exit — killing", engine)
+            _kill_process_tree(proc)
+    finally:
+        _current_proc = None
+        if proc.stdout:
+            proc.stdout.close()
+        if proc.stderr:
+            if proc.poll() is None:
+                _kill_process_tree(proc)
+            err = proc.stderr.read() or ""
+            if err:
+                log.warning("%s stderr: %s", engine, _one_line(err, 400))
+            proc.stderr.close()
+
+    failed = proc.returncode not in (0, None)
+    produced_nothing = not final_text_chunks and tool_calls == 0
+
+    if resumed and failed and produced_nothing:
+        log.warning("%s resume produced nothing (rc=%s) — dropping stale session",
+                    engine, proc.returncode)
+        _retire_session(sid_file, "resume produced nothing")
+        return run_harness_streamed(engine, prompt, project, on_event,
+                                    allow_resume=False, session_key=session_key,
+                                    work_dir_override=work_dir_override,
+                                    cancel_key=cancel_key)
+
+    if new_sid and (not failed or was_cancelled(cancel_key or "")):
+        try:
+            sid_file.write_text(new_sid)
+        except Exception:
+            log.exception("saving session id failed")
+        _note_session_turn(sid_file, fresh=not resumed)
+
+    log.info("streamed %s done — tool_calls=%d text_chars=%d thinking_chars=%d",
+             engine, tool_calls, text_chars, thinking_chars)
+
+    if failed and produced_nothing:
+        raise RuntimeError(f"{spec['label']} exited {proc.returncode} without output")
+
+    return "".join(final_text_chunks).strip()
+
+
 def run_agent_streamed(prompt: str, project: str, on_event,
                        allow_resume: bool = True,
                        session_key: str | None = None,
@@ -1706,10 +2012,15 @@ def run_agent_streamed(prompt: str, project: str, on_event,
         runner = run_codex_streamed
     elif DISPATCH_ENGINE == "claude":
         runner = run_claude_streamed
+    elif DISPATCH_ENGINE in HARNESS_SPECS:
+        return run_harness_streamed(DISPATCH_ENGINE, prompt, project, on_event,
+                                    allow_resume, session_key,
+                                    work_dir_override, cancel_key)
     else:
+        known = ", ".join(sorted(["claude", "codex", *HARNESS_SPECS]))
         raise ValueError(
             f"DISPATCH_ENGINE={DISPATCH_ENGINE!r} is not a known engine "
-            f"(expected 'claude' or 'codex')")
+            f"(expected one of: {known})")
     return runner(prompt, project, on_event, allow_resume, session_key,
                   work_dir_override, cancel_key)
 

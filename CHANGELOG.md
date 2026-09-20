@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.37.0
+
+### Added
+
+- **Four more harnesses can be driven, not just detected.**
+  `DISPATCH_ENGINE` now takes `gemini`, `opencode`, `amp` and
+  `copilot_cli` alongside `claude` and `codex`. They share one loop
+  (`run_harness_streamed`) and differ only in argv, where a session id
+  comes back, and how an event maps onto our normalised
+  `{tool_use, text_delta, thinking, result}`. All four resume, and all
+  four inherit 0.36.0's turn/age retirement.
+- `KNOWN_HARNESSES` marks those four with the engine that runs them.
+  `aider`, `pi`, `cursor` and `goose` stay detect-only — Aider has no
+  resumable session id in the shape these runners need.
+
+### Verified, and not
+
+- **`copilot_cli` was run end to end on this box** — it rides the
+  machine's `gh` credential. Proof of resume rather than an assertion
+  about it: a second turn answered "what word did I ask you to reply
+  with a moment ago" correctly, kept the same session id, and Copilot's
+  own cumulative `premiumRequests` went 1 → 2 on the one session.
+  Note it bills per run.
+- **`gemini`, `opencode` and `amp` have never executed here** — there
+  are no provider credentials on this box, and Gemini fails closed with
+  "set an Auth method… GEMINI_API_KEY". Their argv and parsers come
+  from the installed binaries' `--help`, not from a run. Their specs
+  carry `verified: False` and a test asserts only `copilot_cli` claims
+  otherwise, so nothing can quietly start pretending.
+- Amp's parser is the Claude one, and that is evidence rather than
+  hope: Amp's own help calls `--stream-json-thinking` a "non-Claude
+  Code extension" and documents piping `.message.content[]`.
+- Copilot's tool calls are read from the complete
+  `assistant.message.toolRequests`, never from `assistant.tool_call_delta`
+  — those carry partial argument fragments (`{"comma`, `nd": "c`) and
+  parsing them would produce garbage calls. A test pins that.
+- The OpenCode parser tries the Claude shape first and falls back to
+  plain text, so an unexpected event degrades to narration rather than
+  a dropped turn.
+
 ## 0.36.0
 
 ### Added
