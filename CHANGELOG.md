@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.36.0
+
+### Added
+
+- **Sessions retire themselves.** Dispatch stored one Claude session id
+  per room and `--resume`d it forever — 464 resumes against 3 fresh
+  starts in the current log, across reboots, because the id lives in
+  `~/.cache/claude-chat/` rather than memory. Measured cost: cache-read
+  tokens per turn went from **0.5M on a fresh session to 32.8M a day
+  later**. That figure is the sum across a turn's API round trips, not
+  the context size — the CLI compacts internally so it never overflows,
+  it just sits near the cap, and every tool call in the turn re-reads
+  it. A session is now retired after `VROXY_SESSION_MAX_TURNS` (40) or
+  `VROXY_SESSION_MAX_AGE_HOURS` (12), whichever trips first; 0 disables
+  either. State lives in a `.meta` sidecar beside the id.
+- A session id written before the sidecar existed reads as zero turns,
+  so without adoption the longest-lived sessions would be exactly the
+  ones that never retire. An unreadable or missing sidecar is adopted
+  at first sight and the limits apply from there.
+- `clear_sessions` takes the sidecar with the id. Leaving it behind
+  would hand a brand-new session the retired one's turn count.
+
+### Note
+
+A `/reset` issued from inside a turn cannot clear that turn's own
+session — the id is written back when the run finishes. `/reset` works
+because the room handler runs it outside the Claude run.
+
 ## 0.35.0
 
 ### Added

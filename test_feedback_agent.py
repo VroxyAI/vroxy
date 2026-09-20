@@ -2369,3 +2369,79 @@ class CancelRunTest(unittest.TestCase):
         for fn in (fa.run_claude_streamed, fa.run_codex_streamed, fa.run_agent_streamed):
             params = list(inspect.signature(fn).parameters)
             self.assertEqual(params[-1], "cancel_key", f"{fn.__name__} signature drifted")
+
+
+class SessionRetirementTest(unittest.TestCase):
+    """A resumed session grows until something retires it; these pin
+    which signals do that and that /reset takes the sidecar with it."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.sid = Path(self.dir) / "feedback_stream_room_abc_proj"
+        self.sid.write_text("session-xyz")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_fresh_session_is_not_spent(self):
+        self.assertIsNone(fa._session_spent(self.sid))
+
+    def test_a_session_with_no_sidecar_is_not_spent(self):
+        self.assertIsNone(fa._session_spent(self.sid))
+
+    def test_turns_accumulate_and_then_retire_it(self):
+        for _ in range(fa.SESSION_MAX_TURNS - 1):
+            fa._note_session_turn(self.sid, fresh=False)
+        self.assertIsNone(fa._session_spent(self.sid))
+
+        fa._note_session_turn(self.sid, fresh=False)
+        self.assertIn("turns", fa._session_spent(self.sid) or "")
+
+    def test_age_retires_it_even_with_few_turns(self):
+        fa._note_session_turn(self.sid, fresh=True)
+        meta = fa._session_meta_file(self.sid)
+        payload = json.loads(meta.read_text())
+        payload["started_at"] = time.time() - (fa.SESSION_MAX_AGE_HOURS + 1) * 3600
+        meta.write_text(json.dumps(payload))
+
+        self.assertIn("old", fa._session_spent(self.sid) or "")
+
+    def test_a_fresh_turn_resets_the_count(self):
+        for _ in range(fa.SESSION_MAX_TURNS):
+            fa._note_session_turn(self.sid, fresh=False)
+        self.assertIsNotNone(fa._session_spent(self.sid))
+
+        fa._note_session_turn(self.sid, fresh=True)
+        self.assertIsNone(fa._session_spent(self.sid))
+
+    def test_retiring_removes_both_files(self):
+        fa._note_session_turn(self.sid, fresh=True)
+        self.assertTrue(fa._session_meta_file(self.sid).exists())
+
+        fa._retire_session(self.sid, "because")
+
+        self.assertFalse(self.sid.exists())
+        self.assertFalse(fa._session_meta_file(self.sid).exists())
+
+    def test_a_corrupt_sidecar_never_blocks_a_run(self):
+        fa._session_meta_file(self.sid).write_text("{not json")
+
+        self.assertIsNone(fa._session_spent(self.sid))
+
+        fa._note_session_turn(self.sid, fresh=False)
+        payload = json.loads(fa._session_meta_file(self.sid).read_text())
+        self.assertGreaterEqual(payload["turns"], 1)
+        self.assertGreater(payload["started_at"], 0)
+
+    # An id written before the sidecar existed reads as zero turns, so
+    # without adoption the longest-lived sessions would be the ones
+    # that never retire.
+    def test_a_session_predating_the_sidecar_is_adopted(self):
+        self.assertFalse(fa._session_meta_file(self.sid).exists())
+
+        self.assertIsNone(fa._session_spent(self.sid))
+
+        self.assertTrue(fa._session_meta_file(self.sid).exists())
+        for _ in range(fa.SESSION_MAX_TURNS):
+            fa._note_session_turn(self.sid, fresh=False)
+        self.assertIsNotNone(fa._session_spent(self.sid))

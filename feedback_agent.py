@@ -140,7 +140,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.35.0"
+AGENT_VERSION      = "vroxy_dispatch 0.36.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -152,6 +152,14 @@ STALL_SECONDS               = int(os.environ.get("VROXY_STALL_SECONDS", "90"))
 # so a queue of held work never looks like a wedged process.
 PAUSED_REQUEUE_DELAY_SECONDS = 5
 STALL_WINDOWS_BEFORE_KILL   = int(os.environ.get("VROXY_STALL_WINDOWS", "4"))
+# A resumed session grows for as long as it lives, and every tool call
+# in a turn re-reads the whole thing: measured at 0.5M cache-read
+# tokens per turn on a fresh session and 32.8M a day later, on the same
+# session id.  The CLI compacts internally so it never overflows — it
+# just sits near the cap and each turn pays for it.  0 disables either
+# limit.
+SESSION_MAX_TURNS     = int(os.environ.get("VROXY_SESSION_MAX_TURNS", "40"))
+SESSION_MAX_AGE_HOURS = int(os.environ.get("VROXY_SESSION_MAX_AGE_HOURS", "12"))
 SUBPROCESS_HARD_CAP_SECONDS = STALL_SECONDS * STALL_WINDOWS_BEFORE_KILL
 
 # Mutable status reported on each heartbeat.  Updated by the worker
@@ -938,6 +946,60 @@ def _room_session_key(room_hashid: str) -> str:
     return f"room_{room_hashid}_{PROJECT}"
 
 
+def _session_meta_file(sid_file: Path) -> Path:
+    return sid_file.with_suffix(sid_file.suffix + ".meta")
+
+
+def _read_session_meta(sid_file: Path) -> dict:
+    try:
+        return json.loads(_session_meta_file(sid_file).read_text())
+    except Exception:
+        return {}
+
+
+def _session_spent(sid_file: Path) -> str | None:
+    """Why this session should be retired, or None to keep resuming."""
+    meta = _read_session_meta(sid_file)
+    if not meta:
+        # A session that predates the sidecar would otherwise read as
+        # zero turns forever and never retire.  Its mtime is no use —
+        # it is rewritten every turn — so adopt it from now and let the
+        # limits apply from here.
+        _note_session_turn(sid_file, fresh=True)
+        return None
+
+    turns = int(meta.get("turns") or 0)
+    if SESSION_MAX_TURNS > 0 and turns >= SESSION_MAX_TURNS:
+        return f"{turns} turns (limit {SESSION_MAX_TURNS})"
+
+    started = float(meta.get("started_at") or 0)
+    if SESSION_MAX_AGE_HOURS > 0 and started > 0:
+        hours = (time.time() - started) / 3600.0
+        if hours >= SESSION_MAX_AGE_HOURS:
+            return f"{hours:.1f}h old (limit {SESSION_MAX_AGE_HOURS}h)"
+
+    return None
+
+
+def _note_session_turn(sid_file: Path, fresh: bool) -> None:
+    meta = {} if fresh else _read_session_meta(sid_file)
+    meta["started_at"] = meta.get("started_at") or time.time()
+    meta["turns"] = int(meta.get("turns") or 0) + 1
+    try:
+        _session_meta_file(sid_file).write_text(json.dumps(meta))
+    except Exception:
+        log.exception("saving session meta failed")
+
+
+def _retire_session(sid_file: Path, reason: str) -> None:
+    log.info("retiring session %s — %s", sid_file.name, reason)
+    for path in (sid_file, _session_meta_file(sid_file)):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            log.exception("retiring session file failed")
+
+
 def clear_sessions(keys: list[str] | None = None) -> list[str]:
     """Delete stored session ids so the next run starts a fresh
     Claude conversation.  Returns the names actually removed.
@@ -955,12 +1017,15 @@ def clear_sessions(keys: list[str] | None = None) -> list[str]:
 
     removed = []
     for path in targets:
-        if path.exists():
-            try:
-                path.unlink()
-                removed.append(path.name)
-            except OSError:
-                log.exception("could not remove %s", path)
+        # The sidecar has to go with its id, or a fresh session
+        # inherits the retired one's turn count and retires early.
+        for target in (path, _session_meta_file(path)):
+            if target.exists():
+                try:
+                    target.unlink()
+                    removed.append(target.name)
+                except OSError:
+                    log.exception("could not remove %s", target)
     return removed
 
 
@@ -1189,8 +1254,12 @@ def run_claude_streamed(prompt: str, project: str, on_event,
             "--dangerously-skip-permissions"]
     resumed = False
     if allow_resume and sid_file.exists() and sid_file.read_text().strip():
-        argv += ["--resume", sid_file.read_text().strip()]
-        resumed = True
+        spent = _session_spent(sid_file)
+        if spent:
+            _retire_session(sid_file, spent)
+        else:
+            argv += ["--resume", sid_file.read_text().strip()]
+            resumed = True
 
     log.info("Running streamed claude in %s (session=%s, resume=%s)",
              work_dir, sid_file, resumed)
@@ -1362,6 +1431,7 @@ def run_claude_streamed(prompt: str, project: str, on_event,
     if new_sid and (not failed or was_cancelled(cancel_key or "")):
         try: sid_file.write_text(new_sid)
         except Exception: log.exception("saving session id failed")
+        _note_session_turn(sid_file, fresh=not resumed)
 
     log.info("streamed claude done — tool_calls=%d text_chars=%d thinking_chars=%d",
              tool_calls, text_chars, thinking_chars)
@@ -1403,6 +1473,11 @@ def run_codex_streamed(prompt: str, project: str, on_event,
     sid_file.parent.mkdir(parents=True, exist_ok=True)
 
     stored_sid = sid_file.read_text().strip() if sid_file.exists() else ""
+    if stored_sid and allow_resume:
+        spent = _session_spent(sid_file)
+        if spent:
+            _retire_session(sid_file, spent)
+            stored_sid = ""
     resumed = bool(allow_resume and stored_sid)
 
     # The worktree this runs in is already disposable and already the
@@ -1606,6 +1681,7 @@ def run_codex_streamed(prompt: str, project: str, on_event,
     if new_sid and not failed:
         try: sid_file.write_text(new_sid)
         except Exception: log.exception("saving thread id failed")
+        _note_session_turn(sid_file, fresh=not resumed)
 
     log.info("streamed codex done — tool_calls=%d text_chars=%d thinking_chars=%d",
              tool_calls, text_chars, thinking_chars)
