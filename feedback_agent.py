@@ -53,6 +53,7 @@ import contextlib
 import hashlib
 import json
 import contextvars
+import functools
 import logging
 import os
 import re
@@ -374,7 +375,40 @@ _AUTH_HINTS = (
     ("rate limit",        "rate limited"),
     ("usage limit",       "usage limit reached"),
     ("insufficient",      "out of credit"),
+    ("out of credit",     "out of credit"),
+    ("add credits",       "out of credit"),
+    ("billing",           "a billing problem"),
 )
+
+
+def _account_problem(text: str) -> str | None:
+    """The account-level reason in `text`, if any."""
+    low = (text or "").lower()
+    for needle, label in _AUTH_HINTS:
+        if needle in low:
+            return label
+    return None
+
+
+_engine_fault: str | None = None
+
+
+def _note_engine_fault(reason: str) -> None:
+    global _engine_fault, _harness_cache
+    problem = _account_problem(reason)
+    if problem and problem != _engine_fault:
+        log.error("%s cannot work: %s", DISPATCH_ENGINE, problem)
+        _engine_fault = problem
+        _harness_cache = None
+
+
+def _clear_engine_fault() -> None:
+    global _engine_fault, _harness_cache
+    if _engine_fault:
+        log.info("%s is answering again — clearing %r",
+                 DISPATCH_ENGINE, _engine_fault)
+        _engine_fault = None
+        _harness_cache = None
 
 
 def _harness_health(path: str, args: list[str]) -> tuple[bool, str | None]:
@@ -396,17 +430,14 @@ def _harness_health(path: str, args: list[str]) -> tuple[bool, str | None]:
         return False, f"could not be run ({type(exc).__name__})"
 
     text = f"{out.stdout or ''}\n{out.stderr or ''}".strip()
+    problem = _account_problem(text)
     if out.returncode == 0:
         # Exit 0 is not always healthy: `doctor` reports problems in
         # its body. Only trust it when nothing in the text says auth.
-        for needle, label in _AUTH_HINTS:
-            if needle in text.lower():
-                return False, label
-        return True, None
+        return (False, problem) if problem else (True, None)
 
-    for needle, label in _AUTH_HINTS:
-        if needle in text.lower():
-            return False, label
+    if problem:
+        return False, problem
     first = _one_line(text.splitlines()[0], 120) if text else None
     return False, first or f"exited {out.returncode}"
 
@@ -440,6 +471,8 @@ def probe_harnesses() -> list[dict]:
         # subprocesses spent proving something nobody asked.
         if entry["active"] and h.get("health"):
             healthy, problem = _harness_health(path, h["health"])
+            if _engine_fault:
+                healthy, problem = False, _engine_fault
             entry["healthy"] = healthy
             if problem:
                 entry["problem"] = problem
@@ -1289,6 +1322,17 @@ def _kill_process_tree(proc) -> None:
             continue
 
 
+def _cut_short(text: str, reason: str) -> str:
+    """A run that died holding partial output must SAY so.  Returning
+    the last narration line on its own reads as a finished answer —
+    the room sees "the tests are running" and never learns the run
+    was killed mid-sentence."""
+    _note_engine_fault(reason)
+    note = f"⚠️ Cut short — {reason}."
+    text = (text or "").strip()
+    return f"{text}\n\n{note}" if text else note
+
+
 def run_claude_streamed(prompt: str, project: str, on_event,
                         allow_resume: bool = True,
                         session_key: str | None = None,
@@ -1474,6 +1518,8 @@ def run_claude_streamed(prompt: str, project: str, on_event,
 
     produced_nothing = not final_text_chunks and tool_calls == 0
 
+    cancelled = was_cancelled(cancel_key or "")
+
     if killed_for_stall:
         waited = STALL_SECONDS * STALL_WINDOWS_BEFORE_KILL
         reason = (f"the run produced nothing for {waited}s, so I killed it as "
@@ -1481,8 +1527,7 @@ def run_claude_streamed(prompt: str, project: str, on_event,
         if produced_nothing:
             raise RuntimeError(reason)
         log.warning("returning partial output from a stalled run")
-        partial = "".join(final_text_chunks).strip()
-        return f"{partial}\n\n⚠️ Cut short — {reason}.".strip()
+        return _cut_short("".join(final_text_chunks), reason)
 
     if resumed and failed and produced_nothing:
         log.warning("resume produced nothing (rc=%s) — dropping stale session "
@@ -1495,7 +1540,7 @@ def run_claude_streamed(prompt: str, project: str, on_event,
 
     # A deliberate stop exits non-zero, so `failed` alone would throw
     # away the session id and turn resume into a fresh start.
-    if new_sid and (not failed or was_cancelled(cancel_key or "")):
+    if new_sid and (not failed or cancelled or not produced_nothing):
         try: sid_file.write_text(new_sid)
         except Exception: log.exception("saving session id failed")
         _note_session_turn(sid_file, fresh=not resumed)
@@ -1507,6 +1552,11 @@ def run_claude_streamed(prompt: str, project: str, on_event,
         raise RuntimeError(
             f"claude exited {proc.returncode} with no output"
             + (f": {_one_line(stderr_text, 300)}" if stderr_text else ""))
+
+    if failed and not cancelled:
+        return _cut_short("".join(final_text_chunks),
+                          _one_line(stderr_text, 300) or
+                          f"claude exited {proc.returncode} mid-run")
 
     return "".join(final_text_chunks).strip()
 
@@ -1569,10 +1619,13 @@ def run_codex_streamed(prompt: str, project: str, on_event,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
         start_new_session=True,
     )
+    global _current_proc
+    _current_proc = proc
 
     messages: list[str] = []
     new_sid: str | None = None
     usage: dict = {}
+    errors: list[str] = []
     turn_failed = False
     tool_calls = 0
     text_chars = 0
@@ -1681,8 +1734,20 @@ def run_codex_streamed(prompt: str, project: str, on_event,
                         log.exception("on_event tool_use raised")
                 continue
 
+            if etype == "error":
+                detail = _one_line(str(event.get("message") or ""), 300)
+                if detail and detail not in errors:
+                    errors.append(detail)
+                    log.warning("  ✗ codex error: %s", detail)
+                continue
+
             if etype in ("turn.completed", "turn.failed"):
                 turn_failed = turn_failed or etype == "turn.failed"
+                detail = _one_line(
+                    str((event.get("error") or {}).get("message") or ""), 300)
+                if detail and detail not in errors:
+                    errors.append(detail)
+                    log.warning("  ✗ codex turn failed: %s", detail)
                 usage = event.get("usage") or usage
                 if usage:
                     log.info("  · usage %s", usage)
@@ -1707,6 +1772,7 @@ def run_codex_streamed(prompt: str, project: str, on_event,
             log.error("codex closed stdout but would not exit — killing")
             _kill_process_tree(proc)
     finally:
+        _current_proc = None
         if proc.stdout: proc.stdout.close()
         stderr_text = ""
         if proc.stderr:
@@ -1719,13 +1785,15 @@ def run_codex_streamed(prompt: str, project: str, on_event,
 
     failed = turn_failed or proc.returncode not in (0, None)
     if failed:
-        log.warning("streamed codex rc=%s turn_failed=%s", proc.returncode, turn_failed)
+        log.warning("streamed codex rc=%s turn_failed=%s errors=%s",
+                    proc.returncode, turn_failed, errors or "none")
 
     # The LAST agent message is the answer; the ones before it are
     # narration the trail has already shown.  Joining them all would
     # repeat the commentary inside the reply.
     final_text = messages[-1].strip() if messages else ""
     produced_nothing = not final_text and tool_calls == 0
+    cancelled = was_cancelled(cancel_key or "")
 
     if killed_for_stall:
         waited = STALL_SECONDS * STALL_WINDOWS_BEFORE_KILL
@@ -1734,7 +1802,7 @@ def run_codex_streamed(prompt: str, project: str, on_event,
         if produced_nothing:
             raise RuntimeError(reason)
         log.warning("returning partial output from a stalled codex run")
-        return f"{final_text}\n\n⚠️ Cut short — {reason}.".strip()
+        return _cut_short(final_text, reason)
 
     if resumed and failed and produced_nothing:
         log.warning("codex resume produced nothing (rc=%s) — dropping stale "
@@ -1743,9 +1811,10 @@ def run_codex_streamed(prompt: str, project: str, on_event,
         except Exception: log.exception("clearing thread id failed")
         return run_codex_streamed(prompt, project, on_event,
                                   allow_resume=False, session_key=session_key,
-                                  work_dir_override=work_dir_override)
+                                  work_dir_override=work_dir_override,
+                                  cancel_key=cancel_key)
 
-    if new_sid and not failed:
+    if new_sid and (not failed or cancelled or not produced_nothing):
         try: sid_file.write_text(new_sid)
         except Exception: log.exception("saving thread id failed")
         _note_session_turn(sid_file, fresh=not resumed)
@@ -1753,10 +1822,16 @@ def run_codex_streamed(prompt: str, project: str, on_event,
     log.info("streamed codex done — tool_calls=%d text_chars=%d thinking_chars=%d",
              tool_calls, text_chars, thinking_chars)
 
+    reason = "; ".join(errors) or _one_line(stderr_text, 300)
+
     if failed and produced_nothing:
         raise RuntimeError(
             f"codex exited {proc.returncode} with no output"
-            + (f": {_one_line(stderr_text, 300)}" if stderr_text else ""))
+            + (f": {reason}" if reason else ""))
+
+    if failed and not cancelled:
+        return _cut_short(final_text, reason or
+                          f"codex exited {proc.returncode} mid-run")
 
     return final_text
 
@@ -2031,16 +2106,18 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
         _current_proc = None
         if proc.stdout:
             proc.stdout.close()
+        stderr_text = ""
         if proc.stderr:
             if proc.poll() is None:
                 _kill_process_tree(proc)
-            err = proc.stderr.read() or ""
-            if err:
-                log.warning("%s stderr: %s", engine, _one_line(err, 400))
+            stderr_text = proc.stderr.read() or ""
+            if stderr_text:
+                log.warning("%s stderr: %s", engine, _one_line(stderr_text, 400))
             proc.stderr.close()
 
     failed = proc.returncode not in (0, None)
     produced_nothing = not final_text_chunks and tool_calls == 0
+    cancelled = was_cancelled(cancel_key or "")
 
     if resumed and failed and produced_nothing:
         log.warning("%s resume produced nothing (rc=%s) — dropping stale session",
@@ -2051,7 +2128,7 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
                                     work_dir_override=work_dir_override,
                                     cancel_key=cancel_key)
 
-    if new_sid and (not failed or was_cancelled(cancel_key or "")):
+    if new_sid and (not failed or cancelled or not produced_nothing):
         try:
             sid_file.write_text(new_sid)
         except Exception:
@@ -2062,7 +2139,14 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
              engine, tool_calls, text_chars, thinking_chars)
 
     if failed and produced_nothing:
-        raise RuntimeError(f"{spec['label']} exited {proc.returncode} without output")
+        raise RuntimeError(
+            f"{spec['label']} exited {proc.returncode} without output"
+            + (f": {_one_line(stderr_text, 300)}" if stderr_text else ""))
+
+    if failed and not cancelled:
+        return _cut_short("".join(final_text_chunks),
+                          _one_line(stderr_text, 300) or
+                          f"{spec['label']} exited {proc.returncode} mid-run")
 
     return "".join(final_text_chunks).strip()
 
@@ -2080,16 +2164,21 @@ def run_agent_streamed(prompt: str, project: str, on_event,
     elif DISPATCH_ENGINE == "claude":
         runner = run_claude_streamed
     elif DISPATCH_ENGINE in HARNESS_SPECS:
-        return run_harness_streamed(DISPATCH_ENGINE, prompt, project, on_event,
-                                    allow_resume, session_key,
-                                    work_dir_override, cancel_key)
+        runner = functools.partial(run_harness_streamed, DISPATCH_ENGINE)
     else:
         known = ", ".join(sorted(["claude", "codex", *HARNESS_SPECS]))
         raise ValueError(
             f"DISPATCH_ENGINE={DISPATCH_ENGINE!r} is not a known engine "
             f"(expected one of: {known})")
-    return runner(prompt, project, on_event, allow_resume, session_key,
-                  work_dir_override, cancel_key)
+    try:
+        answer = runner(prompt, project, on_event, allow_resume, session_key,
+                        work_dir_override, cancel_key)
+    except Exception as exc:
+        _note_engine_fault(str(exc))
+        raise
+    if "⚠️ Cut short" not in answer:
+        _clear_engine_fault()
+    return answer
 
 
 class ProgressTrail:

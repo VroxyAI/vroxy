@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.38.0
+
+### Fixed
+
+- **A run that dies mid-turn now says so.** Codex reports why a turn
+  failed in an `error` event and in `turn.failed.error`; both were
+  dropped. The room got the last narration line — "the tests are
+  running" — as if it were the finished answer, or `codex exited 1
+  with no output`, which names the one thing the reader already knew.
+  Both now carry the actual reason.
+- **A thread that did work survives a failed turn.** The thread id was
+  discarded whenever a turn failed, so a run that made forty tool
+  calls and then hit a credit wall left nothing to resume; the next
+  message started from scratch. Only a run that produced nothing is
+  dropped now. Same fix in all three runners.
+- **`/stop` reaches a codex run.** `run_codex_streamed` never
+  registered its process, so a stop request had nothing to kill.
+- **Being logged in is not being able to work.** `codex login status`
+  answers "Logged in using ChatGPT" and exits 0 while every turn comes
+  back "Your workspace is out of credits." A turn refused for an
+  account reason now marks the engine unhealthy until one succeeds,
+  and that reason reaches the heartbeat instead of a green light.
+  `out of credit` / `add credits` / `billing` join the hints.
+
 ## 0.37.0
 
 ### Added

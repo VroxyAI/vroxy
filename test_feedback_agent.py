@@ -1913,13 +1913,64 @@ class CodexStreamTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self._run([json.dumps({"type": "turn.failed", "usage": {}})])
 
-    def test_a_failed_turn_that_did_work_still_answers(self):
+    def test_a_failed_turn_that_did_work_answers_and_says_it_was_cut_short(self):
         text, _ = self._run([
             json.dumps({"type": "item.completed", "item": {
                 "type": "agent_message", "text": "Got partway."}}),
             json.dumps({"type": "turn.failed", "usage": {}}),
         ])
-        self.assertEqual(text, "Got partway.")
+        self.assertIn("Got partway.", text)
+        self.assertIn("Cut short", text)
+
+    def test_why_the_turn_died_reaches_the_reader(self):
+        """An `error` event is the only place codex says "out of
+        credits". Dropping it left the room reading "exited 1 with no
+        output", which names nothing the reader can act on."""
+        with self.assertRaises(RuntimeError) as caught:
+            self._run([
+                json.dumps({"type": "thread.started", "thread_id": "T-9"}),
+                json.dumps({"type": "error",
+                            "message": "Your workspace is out of credits."}),
+                json.dumps({"type": "turn.failed", "error": {
+                    "message": "Your workspace is out of credits."}}),
+            ], returncode=1)
+        self.assertIn("out of credits", str(caught.exception))
+
+    def test_the_reason_rides_along_with_partial_output(self):
+        text, _ = self._run([
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": "Tests are running."}}),
+            json.dumps({"type": "turn.failed", "error": {
+                "message": "Your workspace is out of credits."}}),
+        ], returncode=1)
+        self.assertIn("Tests are running.", text)
+        self.assertIn("out of credits", text)
+
+    def test_a_thread_that_did_work_survives_a_failed_turn(self):
+        """Losing the thread id on a mid-run failure throws away every
+        tool call that came before it, and the next message restarts
+        from nothing instead of resuming."""
+        self._run([
+            json.dumps({"type": "thread.started", "thread_id": "T-77"}),
+            json.dumps({"type": "item.started", "item": {
+                "id": "i1", "type": "command_execution", "command": "ls"}}),
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": "Partway."}}),
+            json.dumps({"type": "turn.failed", "error": {
+                "message": "Your workspace is out of credits."}}),
+        ], returncode=1, session_key="room-9")
+        sid = fa._streamed_sid_file("codex_room-9")
+        self.assertTrue(sid.exists(), "a thread with work done must stay resumable")
+        self.assertEqual(sid.read_text(), "T-77")
+
+    def test_a_washout_leaves_no_thread_to_resume(self):
+        with self.assertRaises(RuntimeError):
+            self._run([
+                json.dumps({"type": "thread.started", "thread_id": "T-78"}),
+                json.dumps({"type": "turn.failed", "error": {
+                    "message": "Your workspace is out of credits."}}),
+            ], returncode=1, session_key="room-10")
+        self.assertFalse(fa._streamed_sid_file("codex_room-10").exists())
 
 
 class EngineSelectorTest(unittest.TestCase):
@@ -2496,6 +2547,43 @@ class HarnessHealthTest(unittest.TestCase):
         healthy, problem = fa._harness_health(cli, ["status"])
         self.assertFalse(healthy)
         self.assertEqual(problem, "usage limit reached")
+
+    def test_being_out_of_credits_is_named(self):
+        """The wording that actually took dispatch down. `login status`
+        answers "Logged in using ChatGPT" and exits 0 while every turn
+        comes back "Your workspace is out of credits.\""""
+        cli = self._script(
+            "x", 'echo "Your workspace is out of credits. Add credits to continue."')
+        healthy, problem = fa._harness_health(cli, ["status"])
+        self.assertFalse(healthy)
+        self.assertEqual(problem, "out of credit")
+
+    def test_a_refused_turn_outranks_a_probe_that_says_logged_in(self):
+        """Being logged in is not being able to work. The engine that
+        just refused a turn is the more honest source."""
+        fa.DISPATCH_ENGINE = "codex"
+        self._script("codex", 'echo "0.1.0"')
+        try:
+            self.assertTrue(
+                {h["id"]: h for h in fa.probe_harnesses()}["codex"]["healthy"])
+            fa._note_engine_fault("Your workspace is out of credits.")
+            entry = {h["id"]: h for h in fa.probe_harnesses()}["codex"]
+            self.assertFalse(entry["healthy"])
+            self.assertEqual(entry["problem"], "out of credit")
+
+            fa._clear_engine_fault()
+            self.assertTrue(
+                {h["id"]: h for h in fa.probe_harnesses()}["codex"]["healthy"])
+        finally:
+            fa._clear_engine_fault()
+
+    def test_an_ordinary_failure_does_not_condemn_the_engine(self):
+        """A test that went red is not an engine that cannot work."""
+        try:
+            fa._note_engine_fault("bin/test exited 1: 3 failures")
+            self.assertIsNone(fa._engine_fault)
+        finally:
+            fa._clear_engine_fault()
 
     def test_an_unrecognised_failure_is_still_a_failure(self):
         """Reporting green because we could not parse WHY it was red
