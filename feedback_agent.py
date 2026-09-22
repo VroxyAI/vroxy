@@ -316,9 +316,16 @@ async def subscribe(ws) -> None:
 # the DISPATCH_ENGINE value that runs it, or None for one we can only
 # report on — knowing Gemini is installed is useful to an operator
 # deciding what to configure even before we can drive it.
+# `health` is a CHEAP, NON-INTERACTIVE command that answers "could
+# this actually do a turn right now" — a lost login, an expired
+# token, a model it can't reach. `--version` only ever answered "is
+# the binary on disk", which is why a harness that had silently lost
+# its auth still reported green. None of these cost a model call.
 KNOWN_HARNESSES = (
-    {"id": "claude", "label": "Claude Code",   "bin": "claude",       "engine": "claude"},
-    {"id": "codex",  "label": "OpenAI Codex",  "bin": "codex",        "engine": "codex"},
+    {"id": "claude", "label": "Claude Code",   "bin": "claude",       "engine": "claude",
+     "health": ["doctor"]},
+    {"id": "codex",  "label": "OpenAI Codex",  "bin": "codex",        "engine": "codex",
+     "health": ["login", "status"]},
     {"id": "gemini", "label": "Gemini CLI",    "bin": "gemini",       "engine": "gemini"},
     {"id": "copilot", "label": "GitHub Copilot CLI", "bin": "copilot", "engine": "copilot_cli"},
     {"id": "aider",  "label": "Aider",         "bin": "aider",        "engine": None},
@@ -353,6 +360,57 @@ def _harness_version(path: str) -> str | None:
     return _one_line(text.splitlines()[0], 60)
 
 
+# Words a CLI uses when the problem is the account rather than the
+# code. Matched case-insensitively against a failing health probe so
+# an operator gets "not logged in" instead of a raw exit code.
+_AUTH_HINTS = (
+    ("not logged in",     "not logged in"),
+    ("please log in",     "not logged in"),
+    ("login required",    "not logged in"),
+    ("unauthenticated",   "not logged in"),
+    ("unauthorized",      "not authorised — the login may have expired"),
+    ("expired",           "the login has expired"),
+    ("quota",             "out of quota"),
+    ("rate limit",        "rate limited"),
+    ("usage limit",       "usage limit reached"),
+    ("insufficient",      "out of credit"),
+)
+
+
+def _harness_health(path: str, args: list[str]) -> tuple[bool, str | None]:
+    """Can this CLI actually do a turn?  (healthy, problem).
+
+    A non-zero exit is the signal; the output is only used to say
+    something better than "exit 1".  An UNKNOWN failure is still a
+    failure — reporting a harness green because we couldn't parse why
+    it was red is the bug this whole path exists to fix.
+    """
+    try:
+        out = subprocess.run(
+            [path, *args], capture_output=True, text=True,
+            timeout=HARNESS_PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "it stopped responding"
+    except Exception as exc:
+        return False, f"could not be run ({type(exc).__name__})"
+
+    text = f"{out.stdout or ''}\n{out.stderr or ''}".strip()
+    if out.returncode == 0:
+        # Exit 0 is not always healthy: `doctor` reports problems in
+        # its body. Only trust it when nothing in the text says auth.
+        for needle, label in _AUTH_HINTS:
+            if needle in text.lower():
+                return False, label
+        return True, None
+
+    for needle, label in _AUTH_HINTS:
+        if needle in text.lower():
+            return False, label
+    first = _one_line(text.splitlines()[0], 120) if text else None
+    return False, first or f"exited {out.returncode}"
+
+
 def probe_harnesses() -> list[dict]:
     """Which coding CLIs are installed on this box.
 
@@ -376,6 +434,15 @@ def probe_harnesses() -> list[dict]:
         if h["engine"]:
             entry["engine"] = h["engine"]
         entry["active"] = h["engine"] == DISPATCH_ENGINE
+        # Only the harness we would actually USE gets health-probed.
+        # A broken gemini on a box running claude is a fact, not a
+        # problem, and probing all ten every 15 minutes is ten
+        # subprocesses spent proving something nobody asked.
+        if entry["active"] and h.get("health"):
+            healthy, problem = _harness_health(path, h["health"])
+            entry["healthy"] = healthy
+            if problem:
+                entry["problem"] = problem
         found.append(entry)
     return found
 

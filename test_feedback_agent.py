@@ -2455,6 +2455,84 @@ class SessionRetirementTest(unittest.TestCase):
         self.assertIsNotNone(fa._session_spent(self.sid))
 
 
+class HarnessHealthTest(unittest.TestCase):
+    """`--version` only ever answered "is the binary on disk".  A
+    harness that had silently lost its login still reported green,
+    which is exactly how a dead agent looked healthy for an hour."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._path = os.environ.get("PATH", "")
+        self._engine = fa.DISPATCH_ENGINE
+        os.environ["PATH"] = self.tmp
+        fa._harness_cache = None
+
+    def tearDown(self):
+        os.environ["PATH"] = self._path
+        fa.DISPATCH_ENGINE = self._engine
+        fa._harness_cache = None
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _script(self, name, body, exit_code=0):
+        path = Path(self.tmp) / name
+        path.write_text(f'#!/bin/sh\n{body}\nexit {exit_code}\n')
+        path.chmod(0o755)
+        return str(path)
+
+    def test_a_clean_exit_is_healthy(self):
+        self.assertEqual(fa._harness_health("/bin/true", []), (True, None))
+
+    def test_a_lost_login_is_named_rather_than_an_exit_code(self):
+        cli = self._script("x", 'echo "Error: Not logged in." >&2', exit_code=1)
+        healthy, problem = fa._harness_health(cli, ["status"])
+        self.assertFalse(healthy)
+        self.assertEqual(problem, "not logged in")
+
+    def test_a_usage_limit_is_caught_even_when_the_cli_exits_zero(self):
+        """The nasty one: some CLIs report the bad news on stdout and
+        still exit 0, so trusting the exit code alone reads a
+        quota-exhausted harness as healthy."""
+        cli = self._script("x", 'echo "You have exceeded your usage limit."')
+        healthy, problem = fa._harness_health(cli, ["status"])
+        self.assertFalse(healthy)
+        self.assertEqual(problem, "usage limit reached")
+
+    def test_an_unrecognised_failure_is_still_a_failure(self):
+        """Reporting green because we could not parse WHY it was red
+        is the bug this whole path exists to fix."""
+        cli = self._script("x", 'echo "kaboom" >&2', exit_code=3)
+        healthy, problem = fa._harness_health(cli, ["status"])
+        self.assertFalse(healthy)
+        self.assertIsNotNone(problem)
+
+    def test_a_missing_binary_is_a_failure_not_an_exception(self):
+        healthy, problem = fa._harness_health("/nope/not/here", [])
+        self.assertFalse(healthy)
+        self.assertIsNotNone(problem)
+
+    def test_only_the_engine_in_use_is_health_probed(self):
+        """A broken gemini on a box running claude is a fact, not a
+        problem, and probing all ten is subprocesses spent proving
+        something nobody asked."""
+        fa.DISPATCH_ENGINE = "claude"
+        self._script("claude", 'echo "2.1.0"')
+        self._script("codex", 'echo "0.1.0"')
+
+        found = {h["id"]: h for h in fa.probe_harnesses()}
+
+        self.assertIn("healthy", found["claude"])
+        self.assertNotIn("healthy", found["codex"])
+
+    def test_an_unhealthy_active_harness_carries_its_reason(self):
+        fa.DISPATCH_ENGINE = "codex"
+        self._script("codex", 'if [ "$1" = "login" ]; then echo "Not logged in" >&2; exit 1; fi; echo "0.1.0"')
+
+        found = {h["id"]: h for h in fa.probe_harnesses()}
+
+        self.assertFalse(found["codex"]["healthy"])
+        self.assertEqual(found["codex"]["problem"], "not logged in")
+
+
 class HarnessParserTest(unittest.TestCase):
     """Copilot's cases are real events captured from a live run; the
     other three are written from their documented shapes and have
