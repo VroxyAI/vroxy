@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.43.0"
+AGENT_VERSION      = "vroxy_dispatch 0.44.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -3051,6 +3051,34 @@ def is_paused(payload: dict) -> bool:
     return (payload.get("message") or {}).get("hashid", "") in _paused_messages
 
 
+def promote_queued(message_hashid: str) -> bool:
+    """Move a queued room task to the front so a question does not
+    wait behind a long build. asyncio.Queue has no priority, so we
+    drain and rebuild with the match first."""
+    if _work_queue is None or not message_hashid:
+        return False
+
+    items: list[tuple[str, dict]] = []
+    while not _work_queue.empty():
+        try:
+            items.append(_work_queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    match: list[tuple[str, dict]] = []
+    rest: list[tuple[str, dict]] = []
+    for kind, payload in items:
+        msg = (payload.get("message") or {}) if kind == "room" else {}
+        if kind == "room" and msg.get("hashid") == message_hashid:
+            match.append((kind, payload))
+        else:
+            rest.append((kind, payload))
+
+    for item in match + rest:
+        _work_queue.put_nowait(item)
+    return bool(match)
+
+
 def apply_queued_edit(room_hashid: str, message_hashid: str, body: str) -> bool:
     """Rewrite a queued room task whose message was edited.
 
@@ -3877,6 +3905,19 @@ def _is_ours(payload: dict) -> bool:
     return kind == ENGINE_AGENT_KINDS.get(DISPATCH_ENGINE, "claude_code")
 
 
+async def _fast_lane_room(link, payload: dict) -> None:
+    """Parallel answer while the main lane is mid-build.
+
+    Fresh session (no --resume), own session key — does not race the
+    main lane's session. Shares the checkout, so this is for questions
+    that should not rewrite files mid-build.
+    """
+    try:
+        await handle_room_message(link, payload)
+    except Exception:
+        log.exception("fast-lane room message failed")
+
+
 async def handle_room_message(ws, payload: dict) -> None:
     """`room.message` handler — dispatch's turn in a workspace room.
 
@@ -3962,9 +4003,14 @@ async def handle_room_message(ws, payload: dict) -> None:
         trail.feed(event)
 
     try:
+        fast = bool(payload.get("fast_lane"))
+        allow_resume = not fast
+        session_key = (
+            f"fast_{msg.get('hashid')}" if fast else _room_session_key(room_id)
+        )
         raw = await asyncio.to_thread(
             run_agent_streamed, prompt, PROJECT, on_stream_event,
-            True, _room_session_key(room_id), None, msg.get("hashid"))
+            allow_resume, session_key, None, msg.get("hashid"))
     except subprocess.TimeoutExpired:
         await room_reply(ws, room_id, "⚠️ I timed out after 30 minutes.", msg.get("hashid"))
         result["is_error"] = True
@@ -3974,7 +4020,7 @@ async def handle_room_message(ws, payload: dict) -> None:
         # A stop the operator asked for is not a crash.
         if was_cancelled(msg.get("hashid") or ""):
             log.info("run stopped on request message=%s — holding", msg.get("hashid"))
-            if _work_queue is not None:
+            if not payload.get("fast_lane") and _work_queue is not None:
                 _work_queue.put_nowait(("room", payload))
             return
         log.exception("claude crashed on room message")
@@ -3986,7 +4032,7 @@ async def handle_room_message(ws, payload: dict) -> None:
     # raising, so both paths have to check.
     if was_cancelled(msg.get("hashid") or ""):
         log.info("run stopped on request message=%s — holding", msg.get("hashid"))
-        if _work_queue is not None:
+        if not payload.get("fast_lane") and _work_queue is not None:
             _work_queue.put_nowait(("room", payload))
         return
 
@@ -4139,16 +4185,32 @@ async def process_stream(link: CableLink, ws) -> None:
             elif msg.get("type") == "approve.requested":
                 await _work_queue.put(("approve", msg))
             elif msg.get("type") == "room.message":
-                await _work_queue.put(("room", msg))
-                with contextlib.suppress(Exception):
-                    await room_status(link, (msg.get("room") or {}).get("hashid"),
-                                      (msg.get("message") or {}).get("hashid"), "queued")
+                if msg.get("fast_lane") and _current_work is not None:
+                    # Main lane is busy — answer in parallel on a
+                    # fresh non-resuming session so a question does
+                    # not wait behind a build. Same checkout, so this
+                    # is for asks that should not mutate files.
+                    log.info("fast-lane parallel room=%s message=%s",
+                             (msg.get("room") or {}).get("hashid"),
+                             (msg.get("message") or {}).get("hashid"))
+                    asyncio.create_task(_fast_lane_room(link, msg))
+                else:
+                    if msg.get("fast_lane"):
+                        promote_queued((msg.get("message") or {}).get("hashid") or "")
+                    await _work_queue.put(("room", msg))
+                    with contextlib.suppress(Exception):
+                        await room_status(link, (msg.get("room") or {}).get("hashid"),
+                                          (msg.get("message") or {}).get("hashid"), "queued")
             elif msg.get("type") in ("room.pause", "room.resume"):
                 held = msg.get("type") == "room.pause"
                 set_paused((msg.get("message") or {}).get("hashid"), held)
                 log.info("room work %s message=%s",
                          "held" if held else "released",
                          (msg.get("message") or {}).get("hashid"))
+            elif msg.get("type") == "room.promote":
+                mid = (msg.get("message") or {}).get("hashid")
+                moved = promote_queued(mid or "")
+                log.info("room work promoted message=%s moved=%s", mid, moved)
             elif msg.get("type") == "room.kill":
                 hashid = (msg.get("message") or {}).get("hashid")
                 killed = request_cancel(hashid)

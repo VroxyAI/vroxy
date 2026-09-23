@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.44.0
+
+### Added
+- **Fast lane / Run now** — `room.promote` jumps a queued message to
+  the front; a `fast_lane` room.message (from `/now`) answers in
+  parallel on a fresh non-resuming session when the main lane is
+  busy, so a short question does not wait behind a build.
+
 ## 0.43.0
 
 ### Added
