@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.42.0"
+AGENT_VERSION      = "vroxy_dispatch 0.43.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -343,8 +343,11 @@ KNOWN_HARNESSES = (
 # five seconds is the worst case and it is still well inside it.
 HARNESS_PROBE_TIMEOUT  = 5
 HARNESS_REPROBE_SECONDS = 900
+QUOTA_PROBE_TIMEOUT = 8
+QUOTA_REPROBE_SECONDS = 300
 
 _harness_cache: tuple[float, list] | None = None
+_quota_cache: tuple[float, dict] | None = None
 
 
 def _harness_version(path: str) -> str | None:
@@ -497,6 +500,251 @@ def harnesses(now: float | None = None) -> list[dict]:
     return found
 
 
+def _read_json_file(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _http_json(method: str, url: str, headers: dict, body: bytes | None = None) -> tuple[int | None, Any]:
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=QUOTA_PROBE_TIMEOUT) as resp:
+            raw = resp.read()
+            status = resp.status
+    except Exception as exc:
+        status = getattr(exc, "code", None)
+        raw = exc.read() if hasattr(exc, "read") else b""
+        if not raw:
+            return status, {"error": type(exc).__name__}
+    try:
+        return status, json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return status, {"error": "non_json"}
+
+
+def _cap_str(value: Any, n: int = 160) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:n] if text else None
+
+
+def _window(**fields) -> dict:
+    out = {}
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, float):
+            out[key] = round(value, 2)
+        elif isinstance(value, (int, bool)):
+            out[key] = value
+        else:
+            out[key] = _cap_str(value, 80) or value
+    return out
+
+
+def _probe_cursor_quota() -> dict:
+    auth = _read_json_file(Path.home() / ".config" / "cursor" / "auth.json")
+    token = (auth or {}).get("accessToken") or (auth or {}).get("token")
+    if not token:
+        return {"ok": False, "error": "not_signed_in"}
+    status, data = _http_json(
+        "POST",
+        "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+        {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        b"{}",
+    )
+    if status != 200 or not isinstance(data, dict):
+        return {"ok": False, "error": f"http_{status or 'err'}"}
+    plan = data.get("planUsage") if isinstance(data.get("planUsage"), dict) else {}
+    used_pct = plan.get("totalPercentUsed")
+    if used_pct is None:
+        used_pct = plan.get("autoPercentUsed")
+    remaining = None
+    if isinstance(used_pct, (int, float)):
+        remaining = max(0.0, 100.0 - float(used_pct))
+    windows = [
+        _window(
+            name="included",
+            used_percent=used_pct,
+            remaining_percent=remaining,
+            used=plan.get("totalSpend"),
+            limit=plan.get("limit") or plan.get("includedSpend"),
+            unit="spend_units",
+            resets_at=_ms_epoch_to_unix(data.get("billingCycleEnd")),
+        )
+    ]
+    note = (
+        data.get("autoModelSelectedDisplayMessage")
+        or data.get("displayMessage")
+    )
+    return {
+        "ok": True,
+        "note": _cap_str(note),
+        "windows": [w for w in windows if w],
+    }
+
+
+def _ms_epoch_to_unix(value: Any) -> int | None:
+    try:
+        n = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    if n > 10_000_000_000:
+        n //= 1000
+    return n if n > 0 else None
+
+
+def _probe_codex_quota() -> dict:
+    auth = _read_json_file(Path.home() / ".codex" / "auth.json")
+    if not auth:
+        return {"ok": False, "error": "not_signed_in"}
+    tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+    token = tokens.get("access_token") or auth.get("access_token")
+    account = tokens.get("account_id") or auth.get("account_id")
+    if not token:
+        return {"ok": False, "error": "not_signed_in"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "codex-cli",
+    }
+    if account:
+        headers["ChatGPT-Account-ID"] = str(account)
+    status, data = _http_json(
+        "GET",
+        "https://chatgpt.com/backend-api/wham/usage",
+        headers,
+    )
+    if status != 200 or not isinstance(data, dict):
+        return {"ok": False, "error": f"http_{status or 'err'}"}
+    rate = data.get("rate_limit") if isinstance(data.get("rate_limit"), dict) else {}
+    windows = []
+    for key, name in (("primary_window", "primary"), ("secondary_window", "weekly")):
+        win = rate.get(key)
+        if not isinstance(win, dict):
+            continue
+        used_pct = win.get("used_percent")
+        remaining = None
+        if isinstance(used_pct, (int, float)):
+            remaining = max(0.0, 100.0 - float(used_pct))
+        windows.append(_window(
+            name=name,
+            used_percent=used_pct,
+            remaining_percent=remaining,
+            window_seconds=win.get("limit_window_seconds"),
+            resets_in_seconds=win.get("reset_after_seconds"),
+            resets_at=win.get("reset_at"),
+        ))
+    credits = data.get("credits") if isinstance(data.get("credits"), dict) else {}
+    upsell = data.get("rate_limit_upsell") if isinstance(data.get("rate_limit_upsell"), dict) else {}
+    note = upsell.get("title") or upsell.get("description")
+    if credits.get("has_credits") is False and not note:
+        note = "out of credits"
+    return {
+        "ok": True,
+        "plan": _cap_str(data.get("plan_type"), 40),
+        "note": _cap_str(note),
+        "windows": [w for w in windows if w],
+    }
+
+
+def _probe_claude_quota() -> dict:
+    cred = _read_json_file(Path.home() / ".claude" / ".credentials.json")
+    oauth = (cred or {}).get("claudeAiOauth") if isinstance((cred or {}).get("claudeAiOauth"), dict) else {}
+    token = oauth.get("accessToken") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if not token:
+        sub = oauth.get("subscriptionType")
+        return {
+            "ok": False,
+            "error": "not_signed_in",
+            "plan": _cap_str(sub, 40),
+        }
+    status, data = _http_json(
+        "GET",
+        "https://api.anthropic.com/api/oauth/usage",
+        {
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-cli/2.0.0 (external, vroxy_dispatch)",
+            "Accept": "application/json",
+        },
+    )
+    if status != 200 or not isinstance(data, dict):
+        return {"ok": False, "error": f"http_{status or 'err'}"}
+    windows = []
+    for key, name in (
+        ("five_hour", "5h"),
+        ("seven_day", "weekly"),
+        ("seven_day_opus", "weekly_opus"),
+    ):
+        win = data.get(key)
+        if not isinstance(win, dict):
+            continue
+        util = win.get("utilization")
+        remaining = None
+        if isinstance(util, (int, float)):
+            remaining = max(0.0, 100.0 - float(util))
+        windows.append(_window(
+            name=name,
+            used_percent=util,
+            remaining_percent=remaining,
+            resets_at=win.get("resets_at"),
+        ))
+    return {
+        "ok": True,
+        "plan": _cap_str(oauth.get("subscriptionType") or data.get("subscription_type"), 40),
+        "windows": [w for w in windows if w],
+    }
+
+
+def probe_quotas() -> dict:
+    """Account remaining/limits for CLIs signed in on this box.
+
+    Official CLIs still have no `usage` subcommand — these hit the
+    same private HTTP endpoints the vendor apps use, with tokens
+    already on disk. Nothing here is workspace-scoped: it is the
+    account the dispatch box is logged into. Never include email,
+    user ids, or raw tokens in the payload.
+    """
+    out: dict[str, dict] = {}
+    for engine, probe in (
+        ("cursor", _probe_cursor_quota),
+        ("codex", _probe_codex_quota),
+        ("claude", _probe_claude_quota),
+    ):
+        try:
+            entry = probe()
+        except Exception as exc:
+            entry = {"ok": False, "error": type(exc).__name__}
+        if not isinstance(entry, dict):
+            entry = {"ok": False, "error": "bad_shape"}
+        entry["probed_at"] = int(time.time())
+        out[engine] = entry
+    return out
+
+
+def quotas(now: float | None = None) -> dict:
+    """Cached remaining/limits map, keyed by engine."""
+    global _quota_cache
+    now = time.monotonic() if now is None else now
+    if _quota_cache and (now - _quota_cache[0]) < QUOTA_REPROBE_SECONDS:
+        return _quota_cache[1]
+    found = probe_quotas()
+    _quota_cache = (now, found)
+    summary = ", ".join(
+        f"{eng}={'ok' if row.get('ok') else row.get('error', '?')}"
+        for eng, row in found.items()
+    )
+    log.info("account quotas: %s", summary or "none")
+    return found
+
+
 async def heartbeat(ws) -> None:
     """Heartbeat frame.  AdminFeedbackChannel#heartbeat writes it
     into Rails.cache under a tenant-scoped key with a 60 s TTL —
@@ -504,9 +752,11 @@ async def heartbeat(ws) -> None:
     meta = {"status": _current_status, "project": PROJECT,
             "engine": DISPATCH_ENGINE}
     if TELEMETRY_ENABLED:
-        # Probing blocks on subprocesses, so it never runs on the
-        # event loop — a slow `--version` would stall the socket.
+        # Probing blocks on subprocesses / HTTP, so it never runs on
+        # the event loop — a slow `--version` or quota call would
+        # stall the socket.
         meta["harnesses"] = await asyncio.to_thread(harnesses)
+        meta["quotas"] = await asyncio.to_thread(quotas)
         meta["hostname"] = socket.gethostname()
         if _last_model:
             meta["model"] = _last_model
@@ -516,6 +766,7 @@ async def heartbeat(ws) -> None:
         # the last inventory, which is the opposite of what opting out
         # should do.
         meta["telemetry"] = False
+        meta["quotas"] = {}
     # Only sent when configured — an install that predates install.sh
     # keeps the old single-agent resolution rather than registering a
     # duplicate under a name nobody chose.

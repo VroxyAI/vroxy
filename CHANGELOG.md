@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.43.0
+
+### Added
+- **Account quotas on the heartbeat** — `meta.quotas` carries remaining /
+  limit windows for Cursor, Codex, and Claude (when signed in), probed
+  from the same private HTTP endpoints the vendor apps use. Cached
+  5 minutes. No email / user id / tokens ever leave the box. Powers
+  the account-limits section of `/usage` on vroxy_web.
+
 ## 0.42.0
 
 ### Improved

@@ -1191,7 +1191,13 @@ class CableSendTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_heartbeat_is_not_buffered(self):
         link = fa.CableLink()
-        await fa.heartbeat(link)
+        real_quotas, real_harnesses = fa.quotas, fa.harnesses
+        fa.quotas = lambda now=None: {}
+        fa.harnesses = lambda now=None: []
+        try:
+            await fa.heartbeat(link)
+        finally:
+            fa.quotas, fa.harnesses = real_quotas, real_harnesses
         self.assertEqual([], link.outbox, "a stale heartbeat must not be replayed")
 
 
@@ -2073,12 +2079,15 @@ class EngineAddressingTest(unittest.TestCase):
             sent.update(payload)
 
         real = fa.cable_send
+        real_quotas = fa.quotas
         fa.cable_send = fake_send
+        fa.quotas = lambda now=None: {}
         fa.DISPATCH_ENGINE = "codex"
         try:
             asyncio.run(fa.heartbeat(None))
         finally:
             fa.cable_send = real
+            fa.quotas = real_quotas
         self.assertEqual(sent["meta"]["engine"], "codex")
 
 
@@ -2093,10 +2102,13 @@ class HarnessProbeTest(unittest.TestCase):
         self._engine = fa.DISPATCH_ENGINE
         os.environ["PATH"] = self.tmp
         fa._harness_cache = None
+        self._quotas = fa.quotas
+        fa.quotas = lambda now=None: {}
 
     def tearDown(self):
         os.environ["PATH"] = self._path
         fa.DISPATCH_ENGINE = self._engine
+        fa.quotas = self._quotas
         fa._harness_cache = None
         for var in ("CLAUDE_BIN", "CODEX_BIN", "GEMINI_BIN"):
             os.environ.pop(var, None)
@@ -2243,12 +2255,148 @@ class HarnessProbeTest(unittest.TestCase):
             sent.update(payload)
 
         real = fa.cable_send
+        real_quotas = fa.quotas
         fa.cable_send = fake_send
+        fa.quotas = lambda now=None: {"codex": {"ok": True, "windows": []}}
         try:
             asyncio.run(fa.heartbeat(None))
         finally:
             fa.cable_send = real
+            fa.quotas = real_quotas
         self.assertEqual([h["id"] for h in sent["meta"]["harnesses"]], ["codex"])
+        self.assertIn("quotas", sent["meta"])
+        self.assertEqual(sent["meta"]["quotas"]["codex"]["ok"], True)
+
+    def test_telemetry_off_clears_quotas(self):
+        sent = {}
+
+        async def fake_send(ws, kind, payload, buffer=True):
+            sent.update(payload)
+
+        real_send, real_flag = fa.cable_send, fa.TELEMETRY_ENABLED
+        probed = []
+        real_probe = fa.probe_quotas
+        fa.cable_send = fake_send
+        fa.TELEMETRY_ENABLED = False
+        fa.probe_quotas = lambda: probed.append(1) or {}
+        try:
+            asyncio.run(fa.heartbeat(None))
+        finally:
+            fa.cable_send, fa.TELEMETRY_ENABLED = real_send, real_flag
+            fa.probe_quotas = real_probe
+        self.assertEqual(sent["meta"]["quotas"], {})
+        self.assertEqual(probed, [])
+
+
+class QuotaProbeTest(unittest.TestCase):
+    def tearDown(self):
+        fa._quota_cache = None
+
+    def test_cursor_shape_from_dashboard_payload(self):
+        payload = {
+            "billingCycleEnd": "1792199970000",
+            "planUsage": {
+                "totalSpend": 3613,
+                "limit": 2000,
+                "totalPercentUsed": 7.6,
+            },
+            "autoModelSelectedDisplayMessage": "You've used 8% of your included total usage",
+        }
+
+        def fake_http(method, url, headers, body=None):
+            self.assertIn("DashboardService/GetCurrentPeriodUsage", url)
+            return 200, payload
+
+        real_http, real_read = fa._http_json, fa._read_json_file
+        fa._http_json = fake_http
+        fa._read_json_file = lambda path: {"accessToken": "tok"}
+        try:
+            row = fa._probe_cursor_quota()
+        finally:
+            fa._http_json, fa._read_json_file = real_http, real_read
+
+        self.assertTrue(row["ok"])
+        win = row["windows"][0]
+        self.assertEqual(win["name"], "included")
+        self.assertEqual(win["used_percent"], 7.6)
+        self.assertEqual(win["remaining_percent"], 92.4)
+        self.assertEqual(win["resets_at"], 1792199970)
+        self.assertNotIn("email", row)
+
+    def test_codex_shape_from_wham_payload(self):
+        payload = {
+            "email": "secret@example.com",
+            "user_id": "user-x",
+            "plan_type": "team",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 100,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 90,
+                    "reset_at": 1790137810,
+                },
+                "secondary_window": {
+                    "used_percent": 32,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 500,
+                    "reset_at": 1790705531,
+                },
+            },
+            "credits": {"has_credits": False},
+            "rate_limit_upsell": {"title": "You're out of credits"},
+        }
+
+        def fake_http(method, url, headers, body=None):
+            self.assertIn("wham/usage", url)
+            self.assertIn("Authorization", headers)
+            return 200, payload
+
+        real_http, real_read = fa._http_json, fa._read_json_file
+        fa._http_json = fake_http
+        fa._read_json_file = lambda path: {
+            "tokens": {"access_token": "tok", "account_id": "acct"}
+        }
+        try:
+            row = fa._probe_codex_quota()
+        finally:
+            fa._http_json, fa._read_json_file = real_http, real_read
+
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["plan"], "team")
+        self.assertEqual(row["note"], "You're out of credits")
+        self.assertEqual(row["windows"][0]["remaining_percent"], 0.0)
+        self.assertEqual(row["windows"][1]["used_percent"], 32)
+        blob = json.dumps(row)
+        self.assertNotIn("secret@example.com", blob)
+        self.assertNotIn("user-x", blob)
+
+    def test_claude_without_token_is_not_signed_in(self):
+        real_read = fa._read_json_file
+        fa._read_json_file = lambda path: {
+            "claudeAiOauth": {"accessToken": "", "subscriptionType": "max"}
+        }
+        try:
+            row = fa._probe_claude_quota()
+        finally:
+            fa._read_json_file = real_read
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error"], "not_signed_in")
+        self.assertEqual(row["plan"], "max")
+
+    def test_quotas_cache_avoids_reprobe(self):
+        calls = []
+        real = fa.probe_quotas
+        fa.probe_quotas = lambda: calls.append(1) or {"cursor": {"ok": True}}
+        fa._quota_cache = None
+        try:
+            fa.quotas(now=1000.0)
+            fa.quotas(now=1000.0 + fa.QUOTA_REPROBE_SECONDS - 1)
+            self.assertEqual(calls, [1])
+            fa.quotas(now=1000.0 + fa.QUOTA_REPROBE_SECONDS + 1)
+            self.assertEqual(calls, [1, 1])
+        finally:
+            fa.probe_quotas = real
+            fa._quota_cache = None
 
 
 if __name__ == "__main__":
