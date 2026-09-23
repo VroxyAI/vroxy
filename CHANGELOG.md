@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.41.0
+
+### Added
+
+- **`restart_dispatch` skill** under `.claude/skills/`, plus an
+  `AGENTS.md` that points at it. A bare `systemctl restart` from
+  inside a room turn kills the harness mid-reply; the skill arms a
+  delayed `systemd-run` timer outside the cgroup instead (same path
+  `schedule_restart` already uses for self-update). The room system
+  prompt now tells the agent to use that skill when it must reload.
+
 ## 0.40.0
 
 ### Improved

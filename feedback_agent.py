@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.40.0"
+AGENT_VERSION      = "vroxy_dispatch 0.41.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -786,6 +786,12 @@ the end of is the worst thing you can do to them.
   free-text box, `options` omitted).  Twelve options at most, one
   block per reply, last thing in the message.  Keep asking in the
   prose too: not every surface draws the buttons.
+
+- If you need to restart the dispatch systemd unit (engine flip,
+  forced reload, hung cable), use the `restart_dispatch` skill —
+  never a bare `systemctl restart` from inside a turn. That kills
+  the harness mid-reply. Prefer letting self-update restart after
+  the turn when you only shipped this checkout.
 
 The conversation so far is below.  Reply with only your message —
 no "Dispatch:" prefix, no fenced proposal block.

@@ -669,6 +669,12 @@ it booted with. Hashing bytes rather than reading `AGENT_VERSION`
 catches a fix that shipped without a version bump, and an edit that
 was never committed.
 
+For a **manual** restart from inside a room turn (engine flip, hung
+cable, operator ask), use the `restart_dispatch` skill in
+`.claude/skills/restart_dispatch/` — never a bare
+`systemctl restart` from the harness. That skill is the operator-
+facing copy of the same delayed `systemd-run` recipe below.
+
 When they differ:
 
 1. **Wait for the work queue to drain.** The queue is in memory;
