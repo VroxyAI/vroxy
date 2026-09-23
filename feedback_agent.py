@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.37.0"
+AGENT_VERSION      = "vroxy_dispatch 0.39.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -332,7 +332,8 @@ KNOWN_HARNESSES = (
     {"id": "aider",  "label": "Aider",         "bin": "aider",        "engine": None},
     {"id": "opencode", "label": "OpenCode",    "bin": "opencode",     "engine": "opencode"},
     {"id": "pi",     "label": "Pi",            "bin": "pi",           "engine": None},
-    {"id": "cursor", "label": "Cursor Agent",  "bin": "cursor-agent", "engine": None},
+    {"id": "cursor", "label": "Cursor Agent",  "bin": "cursor-agent", "engine": "cursor",
+     "health": ["status"]},
     {"id": "amp",    "label": "Amp",           "bin": "amp",          "engine": "amp"},
     {"id": "goose",  "label": "Goose",         "bin": "goose",        "engine": None},
 )
@@ -1839,15 +1840,16 @@ def run_codex_streamed(prompt: str, project: str, on_event,
 # ── Additional harnesses ────────────────────────────────────────
 #
 # claude and codex keep bespoke runners: their streams share nothing.
-# These four share one loop, and differ only in argv, where a session
+# These five share one loop, and differ only in argv, where a session
 # id comes back, and how one event becomes our normalised
 # {tool_use, text_delta, thinking, result}.
 #
-# VERIFIED AGAINST A REAL RUN: copilot only — it rides the machine's
-# gh credential.  gemini, opencode and amp are written from their
-# --help surfaces and have never executed here for want of provider
-# credentials, so their parsers fall back to plain text rather than
-# dropping a turn on an unexpected shape.
+# VERIFIED AGAINST A REAL RUN: copilot (it rides the machine's gh
+# credential) and cursor (a logged-in cursor-agent, captured tool
+# calls, resume and all).  gemini, opencode and amp are written from
+# their --help surfaces and have never executed here for want of
+# provider credentials, so their parsers fall back to plain text
+# rather than dropping a turn on an unexpected shape.
 
 def _claude_shaped(event: dict):
     """Claude Code's stream-json.  amp copies it deliberately — its own
@@ -1918,6 +1920,63 @@ def _copilot_shaped(event: dict):
     return out, sid, model
 
 
+def _cursor_usage(usage: dict) -> dict:
+    """Cursor's camelCase token counts in the shape Rails writes a
+    DispatchRun from.  Left untranslated they reach the server as
+    unknown keys and every cursor run reports zero tokens."""
+    mapped = {
+        "input_tokens":                usage.get("inputTokens"),
+        "output_tokens":               usage.get("outputTokens"),
+        "cache_read_input_tokens":     usage.get("cacheReadTokens"),
+        "cache_creation_input_tokens": usage.get("cacheWriteTokens"),
+    }
+    return {k: v for k, v in mapped.items() if v is not None}
+
+
+def _cursor_shaped(event: dict):
+    """`cursor-agent -p --output-format stream-json`, captured from a
+    real run.  Close to the Claude shape with three differences:
+    thinking is its own top-level event rather than a content block,
+    a tool call arrives as `tool_call` wrapping ONE key that names the
+    tool (`shellToolCall`, `editToolCall`, …), and the usage keys are
+    camelCase."""
+    out: list[dict] = []
+    sid = event.get("session_id")
+    model = None
+    etype = event.get("type")
+
+    if etype == "system":
+        model = event.get("model")
+    elif etype == "assistant":
+        msg = event.get("message") if isinstance(event.get("message"), dict) else {}
+        for block in (msg.get("content") or []):
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                out.append({"type": "text_delta", "text": block["text"]})
+    elif etype == "thinking":
+        if event.get("text"):
+            out.append({"type": "thinking", "text": event["text"]})
+    elif etype == "tool_call" and event.get("subtype") == "started":
+        call = event.get("tool_call") if isinstance(event.get("tool_call"), dict) else {}
+        key = next((k for k, v in call.items()
+                    if isinstance(v, dict) and "args" in v), None)
+        body = call.get(key) or {} if key else {}
+        name = key[:-len("ToolCall")] if key and key.endswith("ToolCall") else (key or "tool")
+        out.append({"type": "tool_use", "name": name,
+                    "input": body.get("args") or {}})
+    elif etype == "result":
+        # `result.result` is every assistant text block CONCATENATED,
+        # narration included — unlike Claude's, which is the final
+        # message. Taking it would hand the room "I'll read the file.
+        # ALPHA", so the streamed text is what answers instead.
+        out.append({"type": "result",
+                    "usage": _cursor_usage(event.get("usage") or {}),
+                    "cost_usd": None,
+                    "duration_ms": event.get("duration_ms"),
+                    "is_error": bool(event.get("is_error")),
+                    "final_text": None})
+    return out, sid, model
+
+
 def _opencode_shaped(event: dict):
     """`opencode run --format json` documents only "raw JSON events".
     Unverified: try the Claude shape, then fall back to any obvious
@@ -1971,6 +2030,19 @@ HARNESS_SPECS = {
             ([b, "threads", "continue", sid, "-x", prompt]
              if sid else [b, "-x", prompt])
             + ["--stream-json", "--stream-json-thinking"]),
+    },
+    "cursor": {
+        "bin": "cursor-agent",
+        "label": "Cursor Agent",
+        "parse": _cursor_shaped,
+        "verified": True,
+        # The prompt is POSITIONAL — `-p` is the print/non-interactive
+        # flag, not the prompt flag — and `--resume` takes an OPTIONAL
+        # value, so the prompt has to come last or it gets eaten as
+        # the session id.
+        "argv": lambda b, prompt, sid: (
+            [b, "-p", "--output-format", "stream-json", "--force"]
+            + (["--resume", sid] if sid else []) + [prompt]),
     },
     "copilot_cli": {
         "bin": "copilot",
@@ -2029,7 +2101,15 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
     global _current_proc, _last_model
     _current_proc = proc
 
+    # The ANSWER is the prose after the last tool call — the same rule
+    # ProgressTrail reads a stream by. Prose BEFORE one is narration
+    # the room has already been shown as a trail line, and repeating
+    # it as the reply is how a cursor answer came back as "I'll read
+    # notes.txt and reply with its first word.ALPHA". It is kept as
+    # `narration` only so a run that ends on a tool call still has
+    # something to say.
     final_text_chunks: list[str] = []
+    narration: list[str] = []
     new_sid: str | None = None
     tool_calls = text_chars = thinking_chars = 0
     stalled_windows = 0
@@ -2078,6 +2158,9 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
                 etype = out.get("type")
                 if etype == "tool_use":
                     tool_calls += 1
+                    if final_text_chunks:
+                        narration = final_text_chunks
+                        final_text_chunks = []
                     log.info("  → tool_use %s(%s)", out["name"],
                              _compact_tool_args(out.get("input") or {}))
                 elif etype == "text_delta":
@@ -2115,8 +2198,9 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
                 log.warning("%s stderr: %s", engine, _one_line(stderr_text, 400))
             proc.stderr.close()
 
+    answer_chunks = final_text_chunks or narration
     failed = proc.returncode not in (0, None)
-    produced_nothing = not final_text_chunks and tool_calls == 0
+    produced_nothing = not answer_chunks and tool_calls == 0
     cancelled = was_cancelled(cancel_key or "")
 
     if resumed and failed and produced_nothing:
@@ -2144,11 +2228,11 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
             + (f": {_one_line(stderr_text, 300)}" if stderr_text else ""))
 
     if failed and not cancelled:
-        return _cut_short("".join(final_text_chunks),
+        return _cut_short("".join(answer_chunks),
                           _one_line(stderr_text, 300) or
                           f"{spec['label']} exited {proc.returncode} mid-run")
 
-    return "".join(final_text_chunks).strip()
+    return "".join(answer_chunks).strip()
 
 
 def run_agent_streamed(prompt: str, project: str, on_event,
@@ -3384,7 +3468,7 @@ def ask_fallback(body: str, ask: dict) -> str:
 # Which DispatchAgent kind this process answers as.  The server keys
 # an agent row on the engine it reports, so the two must agree or a
 # codex instance registers itself as Claude Code.
-ENGINE_AGENT_KINDS = {"claude": "claude_code", "codex": "codex"}
+ENGINE_AGENT_KINDS = {"claude": "claude_code", "codex": "codex", "cursor": "cursor"}
 
 
 def _is_ours(payload: dict) -> bool:

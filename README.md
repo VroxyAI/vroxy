@@ -360,7 +360,7 @@ attached to a User instead of a Tenant.
 | `VROXY_SERVICE_TOKEN` | *(required)*                        |
 | `CODE_ROOT`             | parent of this checkout             |
 | `PROJECT`               | `vroxy_web`                       |
-| `DISPATCH_ENGINE`       | `claude` (or `codex`)               |
+| `DISPATCH_ENGINE`       | `claude` (or `codex`, `cursor`)     |
 | `DISPATCH_TELEMETRY`    | `1` (set `0` to stop reporting the box) |
 | `CLAUDE_CHAT_BIN`       | `./bin/claude-chat`                 |
 | `CODEX_BIN`             | `codex` on PATH                     |
@@ -376,15 +376,19 @@ attached to a User instead of a Tenant.
 ## Which CLI does the work
 
 `DISPATCH_ENGINE` picks the engine for the whole process: `claude`
-(the default) or `codex` for OpenAI's Codex CLI. One instance runs
-one engine — to have both, install a second systemd instance with
-its own `DISPATCH_ENGINE`, the same way a second project gets its
-own. An unrecognised value raises at the first run rather than
-falling back, because a typo that silently ran the other model is
-worse than a loud failure.
+(the default), `codex` for OpenAI's Codex CLI, or `cursor` for
+`cursor-agent`. One instance runs one engine — to have several,
+install a second systemd instance with its own `DISPATCH_ENGINE`, the
+same way a second project gets its own. An unrecognised value raises
+at the first run rather than falling back, because a typo that
+silently ran the other model is worse than a loud failure.
+
+`gemini`, `copilot_cli`, `opencode` and `amp` also have runners, but
+only `claude`, `codex`, `cursor` and `copilot_cli` have ever executed
+here — the rest are written from their `--help` surfaces.
 
 The engine is reported in the heartbeat as `meta.engine`, and the
-server registers this install as a `claude_code` or `codex`
+server registers this install as a `claude_code`, `codex` or `cursor`
 DispatchAgent accordingly — which is what makes it @-mentionable
 under its own name. Flipping `DISPATCH_ENGINE` on an existing install
 MOVES that agent rather than creating a second one, so the room and

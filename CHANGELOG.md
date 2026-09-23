@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.39.0
+
+### Added
+
+- **`DISPATCH_ENGINE=cursor` drives `cursor-agent`.** Verified against
+  a real logged-in run on this box, not written from `--help`: tool
+  calls, thinking, resume across turns and token counts all captured
+  from the live stream. Three things differ from the Claude shape and
+  are handled rather than assumed — thinking is its own top-level
+  event, a tool call arrives as `tool_call` wrapping ONE key that
+  names the tool (`shellToolCall`, `editToolCall`, …), and the usage
+  keys are camelCase, so they are translated into the shape Rails
+  writes a `DispatchRun` from. Left untranslated every cursor run
+  would report zero tokens. The prompt is POSITIONAL (`-p` is the
+  print flag, not the prompt flag) and `--resume` takes an optional
+  value, so the prompt goes last or the session id eats it.
+- `cursor-agent status` is its health probe, so a lost login is
+  reported into the room like any other broken harness instead of
+  going quiet.
+
+### Fixed
+
+- **The answer a streamed harness returns is the prose after the last
+  tool call.** Prose before one is narration the room has already been
+  shown as a trail line, so repeating it in the reply said everything
+  twice — cursor's `result.result` is every text block concatenated,
+  which came back as "I'll read notes.txt and reply with its first
+  word.ALPHA". A run that ends ON a tool call still returns its last
+  prose rather than nothing.
+
 ## 0.38.0
 
 ### Fixed

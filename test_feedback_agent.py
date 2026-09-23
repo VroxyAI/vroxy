@@ -2713,12 +2713,137 @@ class HarnessParserTest(unittest.TestCase):
             self.assertNotIn("SID", fresh, engine)
             self.assertIn("SID", resumed, engine)
 
-    def test_only_copilot_claims_to_be_verified(self):
+    def test_only_harnesses_that_have_really_run_claim_to_be_verified(self):
         verified = {e for e, s in fa.HARNESS_SPECS.items() if s["verified"]}
-        self.assertEqual(verified, {"copilot_cli"},
+        self.assertEqual(verified, {"copilot_cli", "cursor"},
                          "a spec that has never run must not claim otherwise")
+
+    # Captured from a real `cursor-agent -p --output-format stream-json`
+    # run on this box.
+    def test_cursor_reads_thinking_from_its_own_event(self):
+        events, sid, _ = fa._cursor_shaped(
+            {"type": "thinking", "subtype": "delta", "text": "hmm",
+             "session_id": "cur-1"})
+        self.assertEqual(sid, "cur-1")
+        self.assertEqual(events[0], {"type": "thinking", "text": "hmm"})
+
+    def test_cursor_names_a_tool_from_the_key_that_wraps_it(self):
+        events, _, _ = fa._cursor_shaped(
+            {"type": "tool_call", "subtype": "started", "session_id": "cur-2",
+             "tool_call": {"shellToolCall": {"args": {"command": "ls"}},
+                           "toolCallId": "call-1", "hookAdditionalContexts": []}})
+        self.assertEqual(events[0], {"type": "tool_use", "name": "shell",
+                                     "input": {"command": "ls"}})
+
+    def test_cursor_counts_a_tool_call_once_not_on_completion_too(self):
+        events, _, _ = fa._cursor_shaped(
+            {"type": "tool_call", "subtype": "completed",
+             "tool_call": {"editToolCall": {"args": {"path": "/a"},
+                                            "result": {"success": {}}}}})
+        self.assertEqual(events, [])
+
+    # cursor's `result.result` is every text block concatenated,
+    # narration and all, so the streamed text has to answer instead.
+    def test_cursor_does_not_take_the_result_as_the_final_text(self):
+        events, _, _ = fa._cursor_shaped(
+            {"type": "result", "subtype": "success",
+             "result": "I'll read the file.ALPHA", "is_error": False})
+        self.assertIsNone(events[0]["final_text"])
+
+    def test_cursor_translates_its_camelcase_token_counts(self):
+        events, _, _ = fa._cursor_shaped(
+            {"type": "result", "subtype": "success", "result": "done",
+             "is_error": False, "duration_ms": 4945,
+             "usage": {"inputTokens": 12923, "outputTokens": 142,
+                       "cacheReadTokens": 6656, "cacheWriteTokens": 0}})
+        self.assertEqual(events[0]["usage"], {
+            "input_tokens": 12923, "output_tokens": 142,
+            "cache_read_input_tokens": 6656, "cache_creation_input_tokens": 0})
+
+    def test_cursor_reads_the_model_off_the_init_event(self):
+        _, sid, model = fa._cursor_shaped(
+            {"type": "system", "subtype": "init", "session_id": "cur-3",
+             "model": "Auto"})
+        self.assertEqual((sid, model), ("cur-3", "Auto"))
+
+    def test_cursor_puts_the_prompt_last_because_it_is_positional(self):
+        argv = fa.HARNESS_SPECS["cursor"]["argv"]("/bin/cursor-agent", "PROMPT", "SID")
+        self.assertEqual(argv[-1], "PROMPT",
+                         "--resume takes an optional value and would eat it")
+        self.assertEqual(argv[argv.index("--resume") + 1], "SID")
+
+    def test_cursor_registers_as_its_own_agent_kind(self):
+        self.assertEqual(fa.ENGINE_AGENT_KINDS["cursor"], "cursor")
 
     def test_every_drivable_harness_has_a_runner(self):
         engines = {h["engine"] for h in fa.KNOWN_HARNESSES if h["engine"]}
         self.assertTrue(engines <= {"claude", "codex", *fa.HARNESS_SPECS},
                         "KNOWN_HARNESSES names an engine nothing can run")
+
+
+class HarnessAnswerTest(unittest.TestCase):
+    """What a streamed harness RETURNS as the reply.
+
+    The answer is the prose after the last tool call. Prose before one
+    is narration the room has already been shown as a trail line, and
+    repeating it as the reply is how a cursor run came back as "I'll
+    read notes.txt and reply with its first word.ALPHA".
+    """
+
+    INIT = {"type": "system", "subtype": "init", "session_id": "s1", "model": "Auto"}
+    TOOL = {"type": "tool_call", "subtype": "started", "session_id": "s1",
+            "tool_call": {"shellToolCall": {"args": {"command": "cat notes.txt"}}}}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.binhome = self.tmp / "bin"
+        self.binhome.mkdir()
+        self.work = self.tmp / "work"
+        self.work.mkdir()
+        self._path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self.binhome}:{self._path}"
+        self._sid_dir = fa.SID_DIR
+        fa.SID_DIR = self.tmp / "sids"
+        fa.SID_DIR.mkdir()
+
+    def tearDown(self):
+        os.environ["PATH"] = self._path
+        fa.SID_DIR = self._sid_dir
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _say(self, text):
+        return {"type": "assistant", "session_id": "s1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
+
+    def _fake_cursor(self, events):
+        script = self.binhome / "cursor-agent"
+        lines = "".join(json.dumps(e) + "\n" for e in events)
+        script.write_text("#!/usr/bin/env python3\nimport sys\n"
+                          f"sys.stdout.write({lines!r})\n")
+        script.chmod(0o755)
+
+    def _run(self):
+        return fa.run_harness_streamed("cursor", "go", "proj", lambda e: None,
+                                       work_dir_override=self.work)
+
+    def test_the_answer_is_the_prose_after_the_last_tool_call(self):
+        self._fake_cursor([
+            self.INIT, self._say("I'll read the file."), self.TOOL, self._say("ALPHA"),
+            {"type": "result", "subtype": "success", "is_error": False,
+             "result": "I'll read the file.ALPHA", "usage": {"inputTokens": 1}},
+        ])
+        self.assertEqual(self._run(), "ALPHA")
+
+    def test_a_run_that_ends_on_a_tool_call_still_says_something(self):
+        self._fake_cursor([
+            self.INIT, self._say("Fixing that now."), self.TOOL,
+            {"type": "result", "subtype": "success", "is_error": False, "usage": {}},
+        ])
+        self.assertEqual(self._run(), "Fixing that now.",
+                         "the last prose is better than an empty reply")
+
+    def test_the_session_id_is_saved_so_the_next_turn_resumes(self):
+        self._fake_cursor([self.INIT, self._say("hi"),
+                           {"type": "result", "subtype": "success", "is_error": False}])
+        self._run()
+        self.assertEqual(fa._streamed_sid_file("cursor_proj").read_text().strip(), "s1")
