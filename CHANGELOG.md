@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.40.0
+
+### Improved
+
+- **Cursor tool and thinking lines read as room progress, not
+  stream noise.** `shellToolCall` / `readToolCall` become `Shell` /
+  `Read` with the path or command in parentheses; thinking deltas
+  coalesce into one trail line instead of one per token fragment.
+  Progress also recognises cursor's camelCase arg keys
+  (`path`, `globPattern`, `workingDirectory`).
+- **`room_status` names the harness and model.** Every queued /
+  working frame carries `engine`, `agent_version`, and `model` when
+  known, so the room can show "Working… · Cursor Agent · Auto"
+  before the first tool call. A mid-run model discovery re-sends
+  working with the real name.
+
 ## 0.39.0
 
 ### Added

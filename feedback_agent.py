@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.39.0"
+AGENT_VERSION      = "vroxy_dispatch 0.40.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -644,18 +644,32 @@ async def room_ask(ws, room_id: str, message_id: str | None, ask: dict | None) -
              room_id, message_id, ask["mode"], len(ask["options"]))
 
 
-async def room_status(ws, room_id: str, reply_to: str | None, state: str) -> None:
+async def room_status(ws, room_id: str, reply_to: str | None, state: str,
+                      *, model: str | None = None) -> None:
     """`queued` when it lands on the work queue, `working` when the
     worker picks it up.  One in-flight run at a time means a request
     can sit for twenty minutes before anything happens, and a room
     with no signal at all is indistinguishable from one where the
-    message never arrived."""
+    message never arrived.
+
+    Engine + agent version ride every status so the room can say
+    "Working… · Cursor Agent · Auto" before the first tool call —
+    without them a cursor run looks identical to a Claude one until
+    the finished `room_run` lands. Model is optional: known from a
+    prior run at `working`, then refreshed when the harness names it."""
     if not reply_to:
         return
-    await cable_send(ws, "message", {
+    payload = {
         "action": "room_status", "room_id": room_id,
         "reply_to": reply_to, "state": state,
-    })
+        "engine": DISPATCH_ENGINE,
+        "agent_version": AGENT_VERSION,
+    }
+    if TELEMETRY_ENABLED:
+        chosen = model if model is not None else _last_model
+        if chosen:
+            payload["model"] = chosen
+    await cable_send(ws, "message", payload)
 
 
 
@@ -1933,6 +1947,23 @@ def _cursor_usage(usage: dict) -> dict:
     return {k: v for k, v in mapped.items() if v is not None}
 
 
+def _cursor_tool_name(key: str | None, args: dict | None) -> str:
+    """`shellToolCall` → `Shell`, `readToolCall` → `Read`. MCP calls
+    keep the tool's own name when the wrapper is generic."""
+    raw = key or "tool"
+    if raw.endswith("ToolCall"):
+        raw = raw[: -len("ToolCall")]
+    if isinstance(args, dict):
+        mcp = args.get("toolName") or args.get("name")
+        if raw.lower() in ("mcp", "mcptool", "callmcp") and isinstance(mcp, str) and mcp.strip():
+            return mcp.strip()
+    if not raw:
+        return "tool"
+    if raw[0].islower():
+        return raw[0].upper() + raw[1:]
+    return raw
+
+
 def _cursor_shaped(event: dict):
     """`cursor-agent -p --output-format stream-json`, captured from a
     real run.  Close to the Claude shape with three differences:
@@ -1953,16 +1984,21 @@ def _cursor_shaped(event: dict):
             if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
                 out.append({"type": "text_delta", "text": block["text"]})
     elif etype == "thinking":
-        if event.get("text"):
+        # Deltas are tiny ("Listing files", " in /tmp"); completed has
+        # no text. Emit only deltas — ProgressTrail coalesces them.
+        if event.get("subtype") == "completed":
+            pass
+        elif event.get("text"):
             out.append({"type": "thinking", "text": event["text"]})
     elif etype == "tool_call" and event.get("subtype") == "started":
         call = event.get("tool_call") if isinstance(event.get("tool_call"), dict) else {}
         key = next((k for k, v in call.items()
                     if isinstance(v, dict) and "args" in v), None)
         body = call.get(key) or {} if key else {}
-        name = key[:-len("ToolCall")] if key and key.endswith("ToolCall") else (key or "tool")
-        out.append({"type": "tool_use", "name": name,
-                    "input": body.get("args") or {}})
+        args = body.get("args") or {}
+        out.append({"type": "tool_use",
+                    "name": _cursor_tool_name(key, args),
+                    "input": args})
     elif etype == "result":
         # `result.result` is every assistant text block CONCATENATED,
         # narration included — unlike Claude's, which is the final
@@ -2152,7 +2188,13 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
             if sid:
                 new_sid = sid
             if model:
-                _last_model = str(model)[:80]
+                reported = str(model)[:80]
+                if reported != _last_model:
+                    _last_model = reported
+                    try:
+                        on_event({"type": "model", "model": _last_model})
+                    except Exception:
+                        log.exception("on_event model raised")
 
             for out in events:
                 etype = out.get("type")
@@ -2266,7 +2308,7 @@ def run_agent_streamed(prompt: str, project: str, on_event,
 
 
 class ProgressTrail:
-    """Turns a Claude event stream into the lines a room should see.
+    """Turns a harness event stream into the lines a room should see.
 
     The subtle one is TEXT. A text block is narration when more work
     follows it and the ANSWER when nothing does — and which it is
@@ -2274,6 +2316,11 @@ class ProgressTrail:
     flushed as a trail line when a tool call or a thought comes next,
     dropped when the run ends, because by then it is the reply and
     saying it twice helps nobody.
+
+    Thinking is held the same way. Cursor ships it as many tiny
+    deltas ("Listing files", " in /tmp", " then saying done.") — one
+    trail line per delta made the room unreadable. Consecutive
+    thinking with no work between it collapses into one line.
 
     Before this, text was dropped either way, which threw away the
     most readable part of a run — "Now the view marker, the copy-link
@@ -2285,36 +2332,53 @@ class ProgressTrail:
         self._emit = emit
         self._text_max = text_max
         self._held: list[str] = []
+        self._held_kind: str | None = None
 
     def feed(self, event: dict) -> None:
         etype = event.get("type")
 
         if etype == "result":
-            self._held.clear()
+            # Held TEXT is the reply — drop it. Held THINKING is not,
+            # so flush it: a cursor run that reasons then answers would
+            # otherwise lose the last thought the moment the result
+            # lands.
+            if self._held_kind == "thinking":
+                self._flush()
+            else:
+                self._held.clear()
+                self._held_kind = None
             return
 
         if etype == "text_delta":
-            # Consecutive text with no work between it is one block of
-            # prose, not two lines.
             if event.get("text"):
+                if self._held_kind == "thinking":
+                    self._flush()
+                self._held_kind = "text"
+                self._held.append(event["text"])
+            return
+
+        if etype == "thinking":
+            if event.get("text"):
+                if self._held_kind == "text":
+                    self._flush()
+                self._held_kind = "thinking"
                 self._held.append(event["text"])
             return
 
         if etype == "tool_use":
             self._flush()
             self._emit("tool", _progress_line(event.get("name") or "tool", event.get("input")))
-        elif etype == "thinking":
-            self._flush()
-            self._emit("thinking", _one_line(event.get("text") or "", self._text_max))
         elif etype == "stalled":
             self._flush()
             self._emit("stalled", _stall_line(event))
 
     def _flush(self) -> None:
-        joined = " ".join(self._held).strip()
+        kind = self._held_kind or "text"
+        joined = "".join(self._held).strip() if kind == "thinking" else " ".join(self._held).strip()
         self._held.clear()
+        self._held_kind = None
         if joined:
-            self._emit("text", _one_line(joined, self._text_max))
+            self._emit(kind, _one_line(joined, self._text_max))
 
 
 def _one_line(text: str, limit: int) -> str:
@@ -3099,8 +3163,12 @@ def _progress_line(name: str, input_dict: dict | None) -> str:
     """One glanceable line: the tool and the argument that says what
     it touched.  A whole input dict on a chat line is unreadable, and
     the interesting part is almost always the path or the command."""
-    interesting = ("file_path", "path", "command", "pattern", "query",
-                   "url", "prompt", "description")
+    interesting = (
+        "file_path", "filePath", "path", "command", "pattern", "query",
+        "url", "prompt", "description", "glob", "glob_pattern",
+        "globPattern", "target_directory", "targetDirectory",
+        "working_directory", "workingDirectory", "toolName",
+    )
     detail = ""
     if isinstance(input_dict, dict):
         for key in interesting:
@@ -3566,7 +3634,14 @@ async def handle_room_message(ws, payload: dict) -> None:
     trail = ProgressTrail(emit, ROOM_PROGRESS_TEXT_MAX)
 
     def on_stream_event(event: dict) -> None:
-        if event.get("type") == "result":
+        etype = event.get("type")
+        if etype == "model":
+            fut = asyncio.run_coroutine_threadsafe(
+                room_status(ws, room_id, msg.get("hashid"), "working",
+                            model=event.get("model")), loop)
+            fut.add_done_callback(_log_future_error)
+            return
+        if etype == "result":
             result.update(event)
         trail.feed(event)
 

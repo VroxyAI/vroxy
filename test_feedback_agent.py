@@ -1490,6 +1490,20 @@ class ProgressTrailTest(unittest.TestCase):
         ])
         self.assertEqual(["text", "thinking"], [k for k, _ in got])
 
+    def test_consecutive_thinking_deltas_are_one_line(self):
+        # Cursor ships thinking as many tiny deltas. One trail line
+        # per delta made a cursor run look like spam.
+        got = self.run_trail([
+            {"type": "thinking", "text": "Listing files"},
+            {"type": "thinking", "text": " in /tmp"},
+            {"type": "thinking", "text": ", then saying done."},
+            {"type": "tool_use", "name": "Shell", "input": {"command": "ls"}},
+            {"type": "result"},
+        ])
+        self.assertEqual([("thinking",
+                           "Listing files in /tmp, then saying done."),
+                          ("tool", "Shell(ls)")], got)
+
     def test_an_answer_with_no_tool_calls_produces_no_trail_at_all(self):
         # A one-line answer is just a reply. A trail saying the same
         # thing under it would be the message twice.
@@ -1530,6 +1544,16 @@ class RoomStatusTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["room_status", "room_status"], [f["action"] for f in frames])
         self.assertEqual(["queued", "working"], [f["state"] for f in frames])
         self.assertEqual("ms123456", frames[0]["reply_to"])
+        for frame in frames:
+            self.assertEqual(frame["engine"], fa.DISPATCH_ENGINE)
+            self.assertEqual(frame["agent_version"], fa.AGENT_VERSION)
+
+    async def test_working_carries_an_explicit_model(self):
+        link = fa.CableLink()
+        await fa.room_status(link, "rm123456", "ms123456", "working",
+                             model="Auto")
+        frame = json.loads(json.loads(link.outbox[0])["data"])
+        self.assertEqual(frame["model"], "Auto")
 
     async def test_no_message_to_hang_it_on_means_no_frame(self):
         link = fa.CableLink()
@@ -2727,13 +2751,27 @@ class HarnessParserTest(unittest.TestCase):
         self.assertEqual(sid, "cur-1")
         self.assertEqual(events[0], {"type": "thinking", "text": "hmm"})
 
+    def test_cursor_ignores_a_thinking_completed_with_no_text(self):
+        events, _, _ = fa._cursor_shaped(
+            {"type": "thinking", "subtype": "completed", "session_id": "cur-1"})
+        self.assertEqual(events, [])
+
     def test_cursor_names_a_tool_from_the_key_that_wraps_it(self):
         events, _, _ = fa._cursor_shaped(
             {"type": "tool_call", "subtype": "started", "session_id": "cur-2",
              "tool_call": {"shellToolCall": {"args": {"command": "ls"}},
                            "toolCallId": "call-1", "hookAdditionalContexts": []}})
-        self.assertEqual(events[0], {"type": "tool_use", "name": "shell",
+        self.assertEqual(events[0], {"type": "tool_use", "name": "Shell",
                                      "input": {"command": "ls"}})
+
+    def test_cursor_titles_a_read_tool_and_keeps_its_path(self):
+        events, _, _ = fa._cursor_shaped(
+            {"type": "tool_call", "subtype": "started",
+             "tool_call": {"readToolCall": {
+                 "args": {"path": "/tmp/notes.txt"}}}})
+        self.assertEqual(events[0]["name"], "Read")
+        self.assertEqual(fa._progress_line(events[0]["name"], events[0]["input"]),
+                         "Read(/tmp/notes.txt)")
 
     def test_cursor_counts_a_tool_call_once_not_on_completion_too(self):
         events, _, _ = fa._cursor_shaped(
