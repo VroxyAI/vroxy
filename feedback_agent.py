@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.41.0"
+AGENT_VERSION      = "vroxy_dispatch 0.42.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1864,12 +1864,19 @@ def run_codex_streamed(prompt: str, project: str, on_event,
 # id comes back, and how one event becomes our normalised
 # {tool_use, text_delta, thinking, result}.
 #
-# VERIFIED AGAINST A REAL RUN: copilot (it rides the machine's gh
-# credential) and cursor (a logged-in cursor-agent, captured tool
-# calls, resume and all).  gemini, opencode and amp are written from
-# their --help surfaces and have never executed here for want of
-# provider credentials, so their parsers fall back to plain text
-# rather than dropping a turn on an unexpected shape.
+# VERIFIED AGAINST A REAL RUN: copilot (gh credential), cursor
+# (logged-in cursor-agent), and opencode (tool_use + text captured
+# on this box).  gemini's event names come from a real stream-json
+# run plus the CLI's own emitter (API key invalid here, so no
+# successful turn yet).  amp documents Claude-compatible
+# --stream-json but is not logged in on this box.
+
+def _title_tool(name: str | None) -> str:
+    raw = (name or "tool").strip() or "tool"
+    if raw[0].islower():
+        return raw[0].upper() + raw[1:]
+    return raw
+
 
 def _claude_shaped(event: dict):
     """Claude Code's stream-json.  amp copies it deliberately — its own
@@ -1904,6 +1911,47 @@ def _claude_shaped(event: dict):
                     "duration_ms": event.get("duration_ms"),
                     "is_error": bool(event.get("is_error")),
                     "final_text": final if isinstance(final, str) else None})
+    return out, sid, model
+
+
+def _gemini_shaped(event: dict):
+    """`gemini -p --output-format stream-json`.  Captured init /
+    message / result frames on this box; tool_use / assistant
+    message shapes read from the CLI's own stream emitter
+    (`tool_name` + `parameters`, `role: assistant` + `content`)."""
+    out: list[dict] = []
+    sid = event.get("session_id")
+    model = None
+    etype = event.get("type")
+
+    if etype == "init":
+        model = event.get("model")
+    elif etype == "message" and event.get("role") == "assistant":
+        content = event.get("content")
+        if isinstance(content, str) and content:
+            out.append({"type": "text_delta", "text": content})
+    elif etype == "tool_use":
+        out.append({"type": "tool_use",
+                    "name": event.get("tool_name") or "tool",
+                    "input": event.get("parameters")
+                    if isinstance(event.get("parameters"), dict) else {}})
+    elif etype == "result":
+        stats = event.get("stats") if isinstance(event.get("stats"), dict) else {}
+        usage = {}
+        for src, dst in (("input_tokens", "input_tokens"),
+                         ("output_tokens", "output_tokens"),
+                         ("inputTokens", "input_tokens"),
+                         ("outputTokens", "output_tokens"),
+                         ("cached_content_token_count", "cache_read_input_tokens"),
+                         ("total_tokens", "total_tokens")):
+            if stats.get(src) is not None:
+                usage[dst] = stats[src]
+        out.append({"type": "result",
+                    "usage": usage,
+                    "cost_usd": None,
+                    "duration_ms": stats.get("duration_ms") or stats.get("durationMs"),
+                    "is_error": event.get("status") != "success",
+                    "final_text": None})
     return out, sid, model
 
 
@@ -2020,25 +2068,33 @@ def _cursor_shaped(event: dict):
 
 
 def _opencode_shaped(event: dict):
-    """`opencode run --format json` documents only "raw JSON events".
-    Unverified: try the Claude shape, then fall back to any obvious
-    text so an unexpected event degrades to narration instead of
-    silence."""
-    out, sid, model = _claude_shaped(event)
-    if out or sid:
-        return out, sid, model
-
+    """`opencode run --format json`, captured on this box.  Events are
+    `{type, sessionID, part}` — `tool_use` carries the tool name on
+    `part.tool` and args on `part.state.input` (never the whole state,
+    which also holds the tool's output)."""
+    out: list[dict] = []
     sid = event.get("sessionID") or event.get("session_id") or event.get("sessionId")
-    part = event.get("part") if isinstance(event.get("part"), dict) else event
+    model = None
+    part = event.get("part") if isinstance(event.get("part"), dict) else {}
+    etype = event.get("type")
     ptype = part.get("type")
-    if ptype == "tool" or part.get("tool"):
+
+    if etype == "tool_use" or ptype == "tool" or part.get("tool"):
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        args = state.get("input") if isinstance(state.get("input"), dict) else {}
+        if not args and isinstance(part.get("input"), dict):
+            args = part["input"]
         out.append({"type": "tool_use",
-                    "name": part.get("tool") or part.get("name") or "",
-                    "input": part.get("state") or part.get("input") or {}})
-    elif ptype in ("text", "message") and part.get("text"):
-        out.append({"type": "text_delta", "text": part["text"]})
-    elif ptype == "reasoning" and part.get("text"):
-        out.append({"type": "thinking", "text": part["text"]})
+                    "name": _title_tool(part.get("tool") or part.get("name")),
+                    "input": args})
+    elif etype == "text" or ptype in ("text", "message"):
+        text = part.get("text") or event.get("text")
+        if text:
+            out.append({"type": "text_delta", "text": text})
+    elif etype in ("reasoning", "thinking") or ptype in ("reasoning", "thinking"):
+        thought = part.get("text") or event.get("text")
+        if thought:
+            out.append({"type": "thinking", "text": thought})
     return out, sid, model
 
 
@@ -2046,21 +2102,24 @@ HARNESS_SPECS = {
     "gemini": {
         "bin": "gemini",
         "label": "Gemini CLI",
-        "parse": _claude_shaped,
+        "parse": _gemini_shaped,
         "verified": False,
-        # --session-id takes a UUID we choose, so the id never has to
-        # be scraped back out of the stream.
+        # --skip-trust is required for headless runs outside a trusted
+        # folder; without it stream-json emits nothing and stderr
+        # says to pass the flag.  -r resumes by session id.
         "argv": lambda b, prompt, sid: (
-            [b, "-p", prompt, "-o", "stream-json", "--approval-mode", "yolo"]
+            [b, "--skip-trust", "-y", "-p", prompt, "-o", "stream-json"]
             + (["-r", sid] if sid else [])),
     },
     "opencode": {
         "bin": "opencode",
         "label": "OpenCode",
         "parse": _opencode_shaped,
-        "verified": False,
+        "verified": True,
+        # --auto approves tool permission prompts so a room turn
+        # cannot hang waiting on a TTY the agent does not have.
         "argv": lambda b, prompt, sid: (
-            [b, "run", "--format", "json"]
+            [b, "run", "--format", "json", "--auto"]
             + (["-s", sid] if sid else []) + [prompt]),
     },
     "amp": {

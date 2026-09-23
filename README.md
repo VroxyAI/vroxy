@@ -383,9 +383,13 @@ same way a second project gets its own. An unrecognised value raises
 at the first run rather than falling back, because a typo that
 silently ran the other model is worse than a loud failure.
 
-`gemini`, `copilot_cli`, `opencode` and `amp` also have runners, but
-only `claude`, `codex`, `cursor` and `copilot_cli` have ever executed
-here — the rest are written from their `--help` surfaces.
+`gemini`, `copilot_cli`, `opencode` and `amp` also have runners.
+`cursor` and `copilot_cli` were verified first; `opencode` now is
+too (real `--format json` capture on this box). Gemini's parser
+matches the CLI's stream-json emitter and a captured init/result
+frame, but stays unverified until a successful turn (API key).
+Amp still needs a login before its Claude-shaped `--stream-json`
+can be confirmed live.
 
 The engine is reported in the heartbeat as `meta.engine`, and the
 server registers this install as a `claude_code`, `codex` or `cursor`
@@ -670,10 +674,11 @@ catches a fix that shipped without a version bump, and an edit that
 was never committed.
 
 For a **manual** restart from inside a room turn (engine flip, hung
-cable, operator ask), use the `restart_dispatch` skill in
-`.claude/skills/restart_dispatch/` — never a bare
-`systemctl restart` from the harness. That skill is the operator-
-facing copy of the same delayed `systemd-run` recipe below.
+cable, operator ask), use the `restart_dispatch` skill —
+`.claude/skills/restart_dispatch/` (Claude / Cursor) and the same
+files under `.agents/skills/` (OpenCode / Amp / Gemini). Never a
+bare `systemctl restart` from the harness. That skill is the
+operator-facing copy of the same delayed `systemd-run` recipe below.
 
 When they differ:
 

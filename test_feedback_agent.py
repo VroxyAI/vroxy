@@ -2716,18 +2716,67 @@ class HarnessParserTest(unittest.TestCase):
             {"type": "assistant", "message": {"content": ["not-a-dict", None]}})
         self.assertEqual(events, [])
 
-    def test_opencode_falls_back_rather_than_dropping_a_turn(self):
+    def test_opencode_reads_text_from_its_part(self):
         events, sid, _ = fa._opencode_shaped(
-            {"sessionID": "oc-1", "part": {"type": "text", "text": "hello"}})
+            {"type": "text", "sessionID": "oc-1",
+             "part": {"type": "text", "text": "hello"}})
         self.assertEqual(sid, "oc-1")
         self.assertEqual(events[0], {"type": "text_delta", "text": "hello"})
 
-    def test_opencode_prefers_the_claude_shape_when_it_matches(self):
-        events, sid, _ = fa._opencode_shaped(
-            {"type": "assistant", "session_id": "oc-2",
-             "message": {"content": [{"type": "text", "text": "hi"}]}})
+    def test_opencode_names_a_tool_and_keeps_only_its_input(self):
+        events, sid, _ = fa._opencode_shaped({
+            "type": "tool_use", "sessionID": "oc-2",
+            "part": {"type": "tool", "tool": "read",
+                     "state": {"status": "completed",
+                               "input": {"filePath": "/tmp/a"},
+                               "output": "FILE CONTENTS"}}})
         self.assertEqual(sid, "oc-2")
-        self.assertEqual(events[0]["text"], "hi")
+        self.assertEqual(events[0],
+                         {"type": "tool_use", "name": "Read",
+                          "input": {"filePath": "/tmp/a"}})
+
+    def test_opencode_ignores_step_markers(self):
+        events, sid, _ = fa._opencode_shaped(
+            {"type": "step_start", "sessionID": "oc-3",
+             "part": {"type": "step-start"}})
+        self.assertEqual(sid, "oc-3")
+        self.assertEqual(events, [])
+
+    def test_gemini_reads_init_model_and_session(self):
+        events, sid, model = fa._gemini_shaped(
+            {"type": "init", "session_id": "g-1", "model": "auto"})
+        self.assertEqual(sid, "g-1")
+        self.assertEqual(model, "auto")
+        self.assertEqual(events, [])
+
+    def test_gemini_ignores_the_user_echo(self):
+        events, _, _ = fa._gemini_shaped(
+            {"type": "message", "role": "user", "content": "hi",
+             "session_id": "g-1"})
+        self.assertEqual(events, [])
+
+    def test_gemini_streams_assistant_content(self):
+        events, _, _ = fa._gemini_shaped(
+            {"type": "message", "role": "assistant", "content": "hello",
+             "delta": True, "session_id": "g-1"})
+        self.assertEqual(events[0], {"type": "text_delta", "text": "hello"})
+
+    def test_gemini_names_a_tool_from_tool_name(self):
+        events, _, _ = fa._gemini_shaped(
+            {"type": "tool_use", "tool_name": "read_file",
+             "tool_id": "t1", "parameters": {"path": "/a"}})
+        self.assertEqual(events[0],
+                         {"type": "tool_use", "name": "read_file",
+                          "input": {"path": "/a"}})
+
+    def test_gemini_marks_a_failed_result(self):
+        events, sid, _ = fa._gemini_shaped(
+            {"type": "result", "session_id": "g-2", "status": "error",
+             "error": {"type": "unknown", "message": "API key not valid"},
+             "stats": {}})
+        self.assertEqual(sid, "g-2")
+        self.assertTrue(events[0]["is_error"])
+        self.assertIsNone(events[0]["final_text"])
 
     def test_every_spec_builds_argv_with_and_without_a_session(self):
         for engine, spec in fa.HARNESS_SPECS.items():
@@ -2737,9 +2786,18 @@ class HarnessParserTest(unittest.TestCase):
             self.assertNotIn("SID", fresh, engine)
             self.assertIn("SID", resumed, engine)
 
+    def test_gemini_argv_skips_workspace_trust(self):
+        argv = fa.HARNESS_SPECS["gemini"]["argv"]("/bin/gemini", "PROMPT", None)
+        self.assertIn("--skip-trust", argv)
+        self.assertIn("stream-json", argv)
+
+    def test_opencode_argv_auto_approves_tools(self):
+        argv = fa.HARNESS_SPECS["opencode"]["argv"]("/bin/opencode", "PROMPT", None)
+        self.assertIn("--auto", argv)
+
     def test_only_harnesses_that_have_really_run_claim_to_be_verified(self):
         verified = {e for e, s in fa.HARNESS_SPECS.items() if s["verified"]}
-        self.assertEqual(verified, {"copilot_cli", "cursor"},
+        self.assertEqual(verified, {"copilot_cli", "cursor", "opencode"},
                          "a spec that has never run must not claim otherwise")
 
     # Captured from a real `cursor-agent -p --output-format stream-json`

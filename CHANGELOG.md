@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.42.0
+
+### Improved
+
+- **OpenCode and Gemini stream parsers match real CLI output.**
+  OpenCode tools land as `Read(…)` with args from `part.state.input`
+  (not the whole state blob); Gemini reads `init` / assistant
+  `message` / `tool_use` (`tool_name` + `parameters`) / `result`
+  instead of the Claude shape. Gemini argv now passes `--skip-trust`
+  so headless runs outside a trusted folder actually emit
+  stream-json; OpenCode gets `--auto` so tool prompts cannot hang
+  a room turn. OpenCode is marked verified from a live run on this
+  box; Gemini stays unverified until a successful turn (API key).
+
+### Added
+
+- **`restart_dispatch` skill mirrored under `.agents/skills/`** so
+  OpenCode / Amp / Gemini workspace skill roots find it, not only
+  Claude Code. `AGENTS.md` states the skill applies to every
+  `DISPATCH_ENGINE`.
+
 ## 0.41.0
 
 ### Added
