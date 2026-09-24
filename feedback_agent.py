@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.44.0"
+AGENT_VERSION      = "vroxy_dispatch 0.45.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1129,6 +1129,61 @@ def download_attachments(msg: dict) -> list[dict]:
     return got
 
 
+def _attachment_image_paths(attachments: list[dict] | None) -> list[str]:
+    """Local paths for images that a vision-capable CLI can take via `-i`."""
+    out: list[str] = []
+    for a in attachments or []:
+        path = a.get("path")
+        if not path:
+            continue
+        kind = (a.get("kind") or "").lower()
+        ctype = (a.get("content_type") or "").lower()
+        if kind == "image" or ctype.startswith("image/"):
+            out.append(str(path))
+    return out
+
+
+def _attachment_dirs(attachments: list[dict] | None) -> list[str]:
+    """Unique parent dirs of downloaded files — for `--add-dir` /
+    `--include-directories` so a harness whose workspace is the repo
+    can still open a screenshot under `~/.cache/vroxy-attachments`."""
+    dirs: list[str] = []
+    seen: set[str] = set()
+    for a in attachments or []:
+        path = a.get("path")
+        if not path:
+            continue
+        parent = str(Path(path).resolve().parent)
+        if parent in seen:
+            continue
+        seen.add(parent)
+        dirs.append(parent)
+    return dirs
+
+
+def attachment_cli_flags(engine: str, attachments: list[dict] | None) -> list[str]:
+    """Extra argv so room screenshots reach every harness the same way.
+
+    Codex takes images on the initial prompt (`-i`); Cursor and Gemini
+    need the cache dir added as a workspace root; Claude already has
+    full-FS permissions. Documents stay path-in-prompt for all of them."""
+    if not attachments:
+        return []
+    flags: list[str] = []
+    if engine == "codex":
+        for path in _attachment_image_paths(attachments):
+            flags += ["-i", path]
+        for d in _attachment_dirs(attachments):
+            flags += ["--add-dir", d]
+    elif engine == "cursor":
+        for d in _attachment_dirs(attachments):
+            flags += ["--add-dir", d]
+    elif engine == "gemini":
+        for d in _attachment_dirs(attachments):
+            flags += ["--include-directories", d]
+    return flags
+
+
 def build_room_prompt(payload: dict, attachments: list[dict] | None = None) -> str:
     """Compose the prompt for an `AdminFeedbackChannel` `room.message`
     event.  The envelope carries the room, the triggering message, and
@@ -1167,8 +1222,11 @@ def build_room_prompt(payload: dict, attachments: list[dict] | None = None) -> s
     if attachments:
         lines.append("")
         lines.append("## Attachments on that message")
-        lines.append("Already downloaded — read them with the Read tool; "
-                     "a screenshot is usually the point of the message.")
+        lines.append(
+            "Already downloaded to disk. Open the paths below with your "
+            "file/Read tools; images are also attached to this turn when "
+            "the harness supports it. A screenshot is usually the point "
+            "of the message.")
         for a in attachments:
             kind = a.get("kind") or "file"
             size = a.get("bytes") or a.get("byte_size") or 0
@@ -1609,6 +1667,7 @@ def run_claude_streamed(prompt: str, project: str, on_event,
                         allow_resume: bool = True,
                         session_key: str | None = None,
                         work_dir_override: Path | None = None,
+                        attachments: list[dict] | None = None,
                         cancel_key: str | None = None) -> str:
     """`claude -p ... --output-format stream-json` variant.
 
@@ -1808,6 +1867,8 @@ def run_claude_streamed(prompt: str, project: str, on_event,
         except Exception: log.exception("clearing session id failed")
         return run_claude_streamed(prompt, project, on_event,
                                    allow_resume=False, session_key=session_key,
+                                   work_dir_override=work_dir_override,
+                                   attachments=attachments,
                                    cancel_key=cancel_key)
 
     # A deliberate stop exits non-zero, so `failed` alone would throw
@@ -1837,6 +1898,7 @@ def run_codex_streamed(prompt: str, project: str, on_event,
                        allow_resume: bool = True,
                        session_key: str | None = None,
                        work_dir_override: Path | None = None,
+                       attachments: list[dict] | None = None,
                        cancel_key: str | None = None) -> str:
     """`codex exec --json` variant of [run_claude_streamed].
 
@@ -1875,9 +1937,12 @@ def run_codex_streamed(prompt: str, project: str, on_event,
     # its own sandbox inside the one this box already runs under, so
     # without the bypass every shell call comes back "Operation not
     # permitted" and the model reports failure instead of working.
+    # Room screenshots land under ~/.cache — `-i` puts pixels on the
+    # initial prompt; `--add-dir` lets tools open docs beside them.
     flags = ["--json", "--skip-git-repo-check",
              "--dangerously-bypass-approvals-and-sandbox",
              "-C", work_dir]
+    flags += attachment_cli_flags("codex", attachments)
     if resumed:
         argv = [codex_bin, "exec", "resume", stored_sid] + flags + [prompt]
     else:
@@ -2084,6 +2149,7 @@ def run_codex_streamed(prompt: str, project: str, on_event,
         return run_codex_streamed(prompt, project, on_event,
                                   allow_resume=False, session_key=session_key,
                                   work_dir_override=work_dir_override,
+                                  attachments=attachments,
                                   cancel_key=cancel_key)
 
     if new_sid and (not failed or cancelled or not produced_nothing):
@@ -2413,6 +2479,7 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
                          allow_resume: bool = True,
                          session_key: str | None = None,
                          work_dir_override: Path | None = None,
+                         attachments: list[dict] | None = None,
                          cancel_key: str | None = None) -> str:
     """One loop for every harness in HARNESS_SPECS.
 
@@ -2442,6 +2509,15 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
     resumed = bool(allow_resume and stored_sid)
 
     argv = spec["argv"](binpath, prompt, stored_sid if resumed else None)
+    extra = attachment_cli_flags(engine, attachments)
+    if extra:
+        # Prompt is last for cursor; for the others options can sit
+        # right after the binary. Either way keep the prompt itself
+        # intact — extras before it, never after.
+        if argv and argv[-1] == prompt:
+            argv = argv[:-1] + extra + [prompt]
+        else:
+            argv = argv[:1] + extra + argv[1:]
     log.info("Running streamed %s in %s (session=%s, resume=%s)",
              engine, work_dir, sid_file, resumed)
 
@@ -2568,6 +2644,7 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
         return run_harness_streamed(engine, prompt, project, on_event,
                                     allow_resume=False, session_key=session_key,
                                     work_dir_override=work_dir_override,
+                                    attachments=attachments,
                                     cancel_key=cancel_key)
 
     if new_sid and (not failed or cancelled or not produced_nothing):
@@ -2597,6 +2674,7 @@ def run_agent_streamed(prompt: str, project: str, on_event,
                        allow_resume: bool = True,
                        session_key: str | None = None,
                        work_dir_override: Path | None = None,
+                       attachments: list[dict] | None = None,
                        cancel_key: str | None = None) -> str:
     """Run whichever engine `DISPATCH_ENGINE` selects.
 
@@ -2614,7 +2692,7 @@ def run_agent_streamed(prompt: str, project: str, on_event,
             f"(expected one of: {known})")
     try:
         answer = runner(prompt, project, on_event, allow_resume, session_key,
-                        work_dir_override, cancel_key)
+                        work_dir_override, attachments, cancel_key)
     except Exception as exc:
         _note_engine_fault(str(exc))
         raise
@@ -4010,7 +4088,7 @@ async def handle_room_message(ws, payload: dict) -> None:
         )
         raw = await asyncio.to_thread(
             run_agent_streamed, prompt, PROJECT, on_stream_event,
-            allow_resume, session_key, None, msg.get("hashid"))
+            allow_resume, session_key, None, attachments, msg.get("hashid"))
     except subprocess.TimeoutExpired:
         await room_reply(ws, room_id, "⚠️ I timed out after 30 minutes.", msg.get("hashid"))
         result["is_error"] = True

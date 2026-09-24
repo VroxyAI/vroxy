@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.45.0
+
+### Improved
+- **Room screenshots reach every harness.** Downloads still land under
+  `~/.cache/vroxy-attachments`, but Codex now gets them via `-i` (plus
+  `--add-dir` for the cache folder), Cursor via `--add-dir`, and Gemini
+  via `--include-directories` — so a photo is not just a path the model
+  might fail to open outside the repo. Prompt wording is engine-agnostic
+  instead of "Read tool"-only. Claude already had full-FS access.
+
 ## 0.44.0
 
 ### Added

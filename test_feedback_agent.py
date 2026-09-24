@@ -649,10 +649,70 @@ class AttachmentTest(unittest.TestCase):
         ])
         self.assertIn("## Attachments on that message", prompt)
         self.assertIn("/tmp/shot.png", prompt)
-        self.assertIn("Read tool", prompt)
+        self.assertIn("file/Read tools", prompt)
+        self.assertNotIn("Read tool;", prompt)
 
     def test_no_attachments_omits_the_section(self):
         self.assertNotIn("## Attachments", fa.build_room_prompt(ROOM_PAYLOAD))
+
+    def test_codex_gets_image_flags_and_cache_dir(self):
+        shot = Path(self.tmp.name) / "shot.png"
+        shot.write_bytes(b"x")
+        doc = Path(self.tmp.name) / "notes.pdf"
+        doc.write_bytes(b"y")
+        atts = [
+            {"path": str(shot), "kind": "image", "content_type": "image/png"},
+            {"path": str(doc), "kind": "document", "content_type": "application/pdf"},
+        ]
+        flags = fa.attachment_cli_flags("codex", atts)
+        self.assertEqual(flags[0:2], ["-i", str(shot)])
+        self.assertIn("--add-dir", flags)
+        self.assertIn(str(shot.resolve().parent), flags)
+        self.assertNotIn(str(doc), flags)
+
+    def test_cursor_and_gemini_get_workspace_dir_flags(self):
+        shot = Path(self.tmp.name) / "shot.png"
+        shot.write_bytes(b"x")
+        atts = [{"path": str(shot), "kind": "image"}]
+        parent = str(shot.resolve().parent)
+        self.assertEqual(
+            fa.attachment_cli_flags("cursor", atts),
+            ["--add-dir", parent])
+        self.assertEqual(
+            fa.attachment_cli_flags("gemini", atts),
+            ["--include-directories", parent])
+        self.assertEqual(fa.attachment_cli_flags("claude", atts), [])
+        self.assertEqual(fa.attachment_cli_flags("opencode", atts), [])
+
+    def test_codex_stream_passes_images_on_argv(self):
+        shot = Path(self.tmp.name) / "ui.png"
+        shot.write_bytes(b"\x89PNG")
+        seen = {}
+        real_popen = fa.subprocess.Popen
+        real_bin = fa._resolve_codex_bin
+        real_sid = fa.SID_DIR
+        fa.SID_DIR = Path(self.tmp.name) / "sids"
+        fa.SID_DIR.mkdir()
+        fa._resolve_codex_bin = lambda: "/usr/bin/true"
+
+        def capture(argv, **kw):
+            seen["argv"] = argv
+            return _FakeProc([], 0)
+
+        fa.subprocess.Popen = capture
+        self.addCleanup(lambda: setattr(fa.subprocess, "Popen", real_popen))
+        self.addCleanup(lambda: setattr(fa, "_resolve_codex_bin", real_bin))
+        self.addCleanup(lambda: setattr(fa, "SID_DIR", real_sid))
+
+        fa.run_codex_streamed(
+            "look", "vroxy_web", lambda e: None,
+            work_dir_override=Path(self.tmp.name),
+            attachments=[{"path": str(shot), "kind": "image",
+                          "content_type": "image/png"}])
+        argv = seen["argv"]
+        self.assertIn("-i", argv)
+        self.assertIn(str(shot), argv)
+        self.assertIn("--add-dir", argv)
 
 
 class RoomProgressLineTest(unittest.TestCase):
@@ -2597,9 +2657,12 @@ class CancelRunTest(unittest.TestCase):
         # run_agent_streamed forwards positionally, so a cancel_key
         # inserted anywhere else silently shifts allow_resume into it.
         import inspect
-        for fn in (fa.run_claude_streamed, fa.run_codex_streamed, fa.run_agent_streamed):
+        for fn in (fa.run_claude_streamed, fa.run_codex_streamed,
+                   fa.run_harness_streamed, fa.run_agent_streamed):
             params = list(inspect.signature(fn).parameters)
             self.assertEqual(params[-1], "cancel_key", f"{fn.__name__} signature drifted")
+            self.assertEqual(params[-2], "attachments",
+                             f"{fn.__name__} must take attachments before cancel_key")
 
 
 class SessionRetirementTest(unittest.TestCase):
