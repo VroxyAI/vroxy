@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.45.0"
+AGENT_VERSION      = "vroxy_dispatch 0.45.1"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -999,7 +999,11 @@ How to behave here:
   identifiers, fenced blocks only for real code.  No headings.
 - If someone asks you to CHANGE something, you may edit files
   directly — you're in the working tree.  Say what you changed and
-  in which files.  Do NOT commit or push unless asked explicitly.
+  in which files.  Once the tests that cover the change pass, ship
+  in the same turn (bump + changelog + commit + push) — do NOT ask
+  whether to ship, and do NOT leave green work sitting behind an
+  `ask` block.  Hold back only when Will said not to for this
+  change, or something is unverifiable from here.
 - If a request is ambiguous, ask the one question that unblocks you
   rather than guessing.
 
@@ -1028,15 +1032,16 @@ the end of is the worst thing you can do to them.
   into buttons:
 
   ```ask
-  {"prompt": "Ship this to master or open a PR?",
+  {"prompt": "Which surface should this hit?",
    "mode": "one",
-   "options": ["Ship to master", "Open a PR"]}
+   "options": ["Web only", "Mobile only", "Both"]}
   ```
 
   `mode` is `one` (pick one), `many` (pick several), or `text` (a
   free-text box, `options` omitted).  Twelve options at most, one
   block per reply, last thing in the message.  Keep asking in the
-  prose too: not every surface draws the buttons.
+  prose too: not every surface draws the buttons.  Never use an
+  `ask` to decide whether to ship green work — that is already decided.
 
 - If you need to restart the dispatch systemd unit (engine flip,
   forced reload, hung cable), use the `restart_dispatch` skill —

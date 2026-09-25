@@ -230,9 +230,9 @@ block — JSON, same grammar as ` ```proposal ` on the feedback path:
 Both work. Three files, no migration.
 
 ```ask
-{"prompt": "Ship this to master or open a PR?",
+{"prompt": "Which surface should this hit?",
  "mode": "one",
- "options": ["Ship to master", "Open a PR"]}
+ "options": ["Web only", "Mobile only", "Both"]}
 ```
 ````
 

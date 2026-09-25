@@ -1857,6 +1857,12 @@ class StallCeilingTest(unittest.TestCase):
         self.assertIn("90 SECONDS", fa.ROOM_SYSTEM_PROMPT)
         self.assertIn("timeout: 90000", fa.ROOM_SYSTEM_PROMPT)
 
+    def test_the_room_prompt_ships_when_tests_pass(self):
+        self.assertIn("Once the tests that cover the change pass, ship",
+                       fa.ROOM_SYSTEM_PROMPT)
+        self.assertNotIn("Do NOT commit or push unless asked explicitly",
+                         fa.ROOM_SYSTEM_PROMPT)
+
 
 class StallTrailTest(unittest.TestCase):
     """A stalled run must reach the room; silence rendered as nothing

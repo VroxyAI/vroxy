@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.45.1
+
+### Fixed
+- Room system prompt: once the covering tests pass, ship in the same
+  turn — do not ask whether to ship, and do not leave green work
+  behind an `ask` block. The old "Do NOT commit unless asked" line
+  was overriding the workspace ship-always rule and parking finished
+  fixes.
+
 ## 0.45.0
 
 ### Improved
