@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.45.1"
+AGENT_VERSION      = "vroxy_dispatch 0.45.2"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -3162,6 +3162,40 @@ def promote_queued(message_hashid: str) -> bool:
     return bool(match)
 
 
+def drop_queued(message_hashid: str) -> bool:
+    """Remove one queued room task entirely. The room message stays;
+    the agent simply never picks it up. Distinct from pause (which
+    re-queues) and kill (which stops a live process)."""
+    if not message_hashid:
+        return False
+
+    set_paused(message_hashid, False)
+    _cancelled_messages.discard(message_hashid)
+
+    if _work_queue is None:
+        return False
+
+    items: list[tuple[str, dict]] = []
+    while not _work_queue.empty():
+        try:
+            items.append(_work_queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    kept: list[tuple[str, dict]] = []
+    dropped = False
+    for kind, payload in items:
+        msg = (payload.get("message") or {}) if kind == "room" else {}
+        if kind == "room" and msg.get("hashid") == message_hashid:
+            dropped = True
+            continue
+        kept.append((kind, payload))
+
+    for item in kept:
+        _work_queue.put_nowait(item)
+    return dropped
+
+
 def apply_queued_edit(room_hashid: str, message_hashid: str, body: str) -> bool:
     """Rewrite a queued room task whose message was edited.
 
@@ -4294,6 +4328,10 @@ async def process_stream(link: CableLink, ws) -> None:
                 mid = (msg.get("message") or {}).get("hashid")
                 moved = promote_queued(mid or "")
                 log.info("room work promoted message=%s moved=%s", mid, moved)
+            elif msg.get("type") == "room.drop":
+                mid = (msg.get("message") or {}).get("hashid")
+                removed = drop_queued(mid or "")
+                log.info("room work dropped message=%s removed=%s", mid, removed)
             elif msg.get("type") == "room.kill":
                 hashid = (msg.get("message") or {}).get("hashid")
                 killed = request_cancel(hashid)

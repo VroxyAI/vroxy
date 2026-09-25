@@ -2592,6 +2592,62 @@ class QueuedEditTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("fb", items[0][1]["message"]["body"])
 
 
+class DropQueuedTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        fa._work_queue = asyncio.Queue()
+        fa._paused_messages.clear()
+        fa._cancelled_messages.clear()
+
+    async def asyncTearDown(self):
+        fa._work_queue = None
+        fa._paused_messages.clear()
+        fa._cancelled_messages.clear()
+
+    def room_task(self, hashid, body="x"):
+        return ("room", {"message": {"hashid": hashid, "body": body}})
+
+    async def drain(self):
+        out = []
+        while not fa._work_queue.empty():
+            out.append(fa._work_queue.get_nowait())
+        return out
+
+    async def test_drop_removes_the_match_and_keeps_the_rest(self):
+        for hid in ("m0", "m1", "m2"):
+            fa._work_queue.put_nowait(self.room_task(hid))
+
+        self.assertTrue(fa.drop_queued("m1"))
+
+        items = await self.drain()
+        self.assertEqual(["m0", "m2"],
+                         [i[1]["message"]["hashid"] for i in items])
+
+    async def test_drop_clears_a_hold_flag(self):
+        fa.set_paused("m1", True)
+        fa._work_queue.put_nowait(self.room_task("m1"))
+
+        fa.drop_queued("m1")
+
+        self.assertFalse(fa.is_paused({"message": {"hashid": "m1"}}))
+        self.assertEqual([], await self.drain())
+
+    async def test_unknown_message_changes_nothing(self):
+        fa._work_queue.put_nowait(self.room_task("m1"))
+
+        self.assertFalse(fa.drop_queued("nope"))
+
+        items = await self.drain()
+        self.assertEqual(["m1"], [i[1]["message"]["hashid"] for i in items])
+
+    async def test_blank_hashid_never_empties_the_queue(self):
+        fa._work_queue.put_nowait(self.room_task("m1"))
+
+        self.assertFalse(fa.drop_queued(""))
+
+        items = await self.drain()
+        self.assertEqual(1, len(items))
+
+
 class PausedWorkTest(unittest.TestCase):
     """Holding a queued room task: the flag the worker consults, and
     the guarantee that holding is not the same as discarding."""

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.45.2
+
+### Added
+- **Drop from the agent queue** — `room.drop` removes one still-queued
+  task from the in-memory work queue (and clears any hold on it). The
+  room message stays; the agent never starts it. Distinct from pause
+  (re-queues) and kill (stops a live process).
+
 ## 0.45.1
 
 ### Fixed
