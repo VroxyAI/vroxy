@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.46.0
+
+### Added
+- **`/engine` / `/harness`** — show the current `DISPATCH_ENGINE` or
+  flip it (`/engine claude`, `/engine cursor`, …). Rewrites the unit
+  EnvironmentFile and schedules the same delayed restart self-update
+  uses, so a bare `systemctl restart` never kills the mid-reply
+  harness. Aliases: `claude_code` → `claude`, `cursor-agent` →
+  `cursor`, `copilot` → `copilot_cli`.
+
 ## 0.45.2
 
 ### Added

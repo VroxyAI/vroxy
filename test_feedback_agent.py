@@ -768,6 +768,81 @@ class RoomCommandTest(unittest.TestCase):
         for body in ("", "   ", "hello", "what about /reset?", "resetting the db"):
             self.assertIsNone(fa.room_command(body))
 
+    def test_engine_is_not_a_reset(self):
+        self.assertIsNone(fa.room_command("/engine cursor"))
+        self.assertIsNone(fa.room_command("/harness"))
+
+
+class EngineCommandTest(unittest.TestCase):
+    def test_recognizes_engine_and_harness(self):
+        self.assertEqual(("/engine", None), fa.engine_command("/engine"))
+        self.assertEqual(("/harness", None), fa.engine_command("  /HARNESS  "))
+        self.assertEqual(("/engine", "cursor"), fa.engine_command("/engine cursor"))
+        self.assertEqual(("/engine", "claude"),
+                         fa.engine_command("/engine claude please"))
+
+    def test_ordinary_messages_are_not_engine_commands(self):
+        for body in ("", "hello", "/reset", "flip /engine", "/engines"):
+            self.assertIsNone(fa.engine_command(body))
+
+    def test_normalize_aliases(self):
+        self.assertEqual("claude", fa.normalize_engine("claude_code"))
+        self.assertEqual("cursor", fa.normalize_engine("cursor-agent"))
+        self.assertEqual("copilot_cli", fa.normalize_engine("copilot"))
+        self.assertEqual("gemini", fa.normalize_engine("gemini"))
+
+    def test_known_engines_include_builtin_and_harness_specs(self):
+        names = fa.known_engines()
+        self.assertIn("claude", names)
+        self.assertIn("codex", names)
+        self.assertIn("cursor", names)
+        self.assertEqual(names, sorted(names))
+
+
+class SetDispatchEngineTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = Path(self.tmp.name) / "vroxy-dispatch"
+        self.env.write_text("FOO=1\nDISPATCH_ENGINE=claude\nBAR=2\n")
+        self._prev = os.environ.get("VROXY_DISPATCH_ENV_FILE")
+        os.environ["VROXY_DISPATCH_ENV_FILE"] = str(self.env)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        if self._prev is None:
+            os.environ.pop("VROXY_DISPATCH_ENV_FILE", None)
+        else:
+            os.environ["VROXY_DISPATCH_ENV_FILE"] = self._prev
+
+    def test_rewrites_existing_line(self):
+        ok, detail = fa.set_dispatch_engine("cursor")
+        self.assertTrue(ok, detail)
+        text = self.env.read_text()
+        self.assertIn("DISPATCH_ENGINE=cursor\n", text)
+        self.assertIn("FOO=1\n", text)
+        self.assertIn("BAR=2\n", text)
+        self.assertEqual(1, text.count("DISPATCH_ENGINE="))
+
+    def test_already_set_is_ok(self):
+        ok, detail = fa.set_dispatch_engine("claude")
+        self.assertTrue(ok)
+        self.assertIn("already", detail)
+
+    def test_unknown_engine_refused(self):
+        ok, detail = fa.set_dispatch_engine("nope")
+        self.assertFalse(ok)
+        self.assertIn("unknown", detail)
+        self.assertIn("DISPATCH_ENGINE=claude\n", self.env.read_text())
+
+    def test_alias_resolves(self):
+        ok, _ = fa.set_dispatch_engine("claude_code")
+        self.assertTrue(ok)
+        self.assertIn("DISPATCH_ENGINE=claude\n", self.env.read_text())
+        ok, _ = fa.set_dispatch_engine("cursor-agent")
+        self.assertTrue(ok)
+        self.assertIn("DISPATCH_ENGINE=cursor\n", self.env.read_text())
+
 
 class SplitRoomBodyTest(unittest.TestCase):
     def test_short_body_is_one_chunk(self):

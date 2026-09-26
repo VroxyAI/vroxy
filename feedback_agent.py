@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.45.2"
+AGENT_VERSION      = "vroxy_dispatch 0.46.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1466,6 +1466,7 @@ def clear_sessions(keys: list[str] | None = None) -> list[str]:
 
 # `/reset` and its aliases, matching bin/claude-chat's vocabulary.
 RESET_COMMANDS = {"/reset", "/clear", "/new"}
+ENGINE_COMMANDS = {"/engine", "/harness"}
 
 
 def room_command(body: str) -> str | None:
@@ -1476,6 +1477,90 @@ def room_command(body: str) -> str | None:
         return None
     head = token[0].lower()
     return head if head in RESET_COMMANDS else None
+
+
+ENGINE_ALIASES = {
+    "claude_code": "claude",
+    "claude-code": "claude",
+    "cursor-agent": "cursor",
+    "cursor_agent": "cursor",
+    "copilot": "copilot_cli",
+    "github-copilot": "copilot_cli",
+    "github_copilot": "copilot_cli",
+}
+
+
+def engine_command(body: str) -> tuple[str, str | None] | None:
+    """Leading `/engine` / `/harness`, optionally with a target name.
+
+    Returns `(cmd, arg)` where `arg` is None for status, or the
+    requested engine slug. Unknown leading tokens return None so the
+    rest of the message still reaches the agent."""
+    parts = (body or "").strip().split(maxsplit=1)
+    if not parts:
+        return None
+    head = parts[0].lower()
+    if head not in ENGINE_COMMANDS:
+        return None
+    arg = None
+    if len(parts) > 1:
+        arg = parts[1].strip().split(maxsplit=1)[0].lower() or None
+    return head, arg
+
+
+def normalize_engine(name: str) -> str:
+    raw = (name or "").strip().lower()
+    return ENGINE_ALIASES.get(raw, raw)
+
+
+def known_engines() -> list[str]:
+    return sorted({"claude", "codex", *HARNESS_SPECS.keys()})
+
+
+def engine_env_path() -> Path:
+    return Path(os.environ.get(
+        "VROXY_DISPATCH_ENV_FILE", "/etc/default/vroxy-dispatch"))
+
+
+def set_dispatch_engine(engine: str) -> tuple[bool, str]:
+    """Rewrite DISPATCH_ENGINE in the unit's EnvironmentFile.
+
+    Returns (ok, detail). Needs write access (or passwordless sudo)
+    on that file — same bar schedule_restart already assumes."""
+    path = engine_env_path()
+    engine = normalize_engine(engine)
+    if engine not in known_engines():
+        return False, f"unknown engine {engine!r} (want one of: {', '.join(known_engines())})"
+    try:
+        text = path.read_text()
+    except OSError as e:
+        return False, f"could not read {path}: {e}"
+
+    line = f"DISPATCH_ENGINE={engine}"
+    if re.search(r"(?m)^DISPATCH_ENGINE=", text):
+        new_text = re.sub(r"(?m)^DISPATCH_ENGINE=.*$", line, text, count=1)
+    else:
+        new_text = text.rstrip() + "\n" + line + "\n"
+
+    if new_text == text:
+        return True, f"already {engine}"
+
+    try:
+        path.write_text(new_text)
+        return True, str(path)
+    except OSError:
+        pass
+
+    cmd = ["sudo", "-n", "tee", str(path)]
+    try:
+        proc = subprocess.run(cmd, input=new_text, capture_output=True,
+                              text=True, timeout=15)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return False, detail or f"sudo tee {path} failed"
+    return True, str(path)
 
 
 @contextlib.contextmanager
@@ -2916,18 +3001,24 @@ def self_compiles() -> tuple[bool, str]:
 
 
 def write_restart_notice(room_id: str | None, reply_to: str | None,
-                         to_version: str) -> None:
+                         to_version: str, *,
+                         engine_from: str | None = None,
+                         engine_to: str | None = None) -> None:
     """What the NEXT process needs to know to report back.  In-memory
     state does not survive the restart it describes."""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        RESTART_NOTICE_PATH.write_text(json.dumps({
+        payload = {
             "room_id":      room_id,
             "reply_to":     reply_to,
             "from_version": AGENT_VERSION,
             "to_version":   to_version,
             "at":           time.time(),
-        }), encoding="utf-8")
+        }
+        if engine_from and engine_to:
+            payload["engine_from"] = engine_from
+            payload["engine_to"] = engine_to
+        RESTART_NOTICE_PATH.write_text(json.dumps(payload), encoding="utf-8")
     except OSError as e:
         log.warning("could not write the restart notice: %s", e)
 
@@ -3000,6 +3091,74 @@ def _exit_and_let_systemd_restart(reason: str) -> tuple[bool, str]:
     # and gives the frames already sent time to reach the wire.
     time.sleep(1)
     os._exit(70)
+
+
+async def handle_engine_command(ws, room_id: str, target: str | None,
+                                reply_to: str | None) -> None:
+    """`/engine` / `/harness` — show or flip DISPATCH_ENGINE.
+
+    A flip rewrites the unit EnvironmentFile and schedules the same
+    delayed restart self-update uses, so the harness mid-reply is
+    not killed by a bare systemctl restart."""
+    current = DISPATCH_ENGINE
+    available = known_engines()
+    if not target:
+        listed = ", ".join(f"`{e}`" for e in available)
+        await room_reply(
+            ws, room_id,
+            f"Harness is `{current}`. Available: {listed}.\n"
+            f"Flip with `/engine <name>` — restarts this unit in a few seconds.",
+            reply_to)
+        return
+
+    wanted = normalize_engine(target)
+    if wanted not in available:
+        listed = ", ".join(f"`{e}`" for e in available)
+        await room_reply(
+            ws, room_id,
+            f"Unknown harness `{target}`. Want one of: {listed}.",
+            reply_to)
+        return
+
+    if wanted == current:
+        await room_reply(
+            ws, room_id,
+            f"Already on `{current}` — nothing to flip.",
+            reply_to)
+        return
+
+    ok, detail = await asyncio.to_thread(set_dispatch_engine, wanted)
+    if not ok:
+        await room_reply(
+            ws, room_id,
+            f"⚠️ Couldn't set `DISPATCH_ENGINE={wanted}`: {detail}",
+            reply_to)
+        return
+
+    clear_sessions()
+    await room_reply(
+        ws, room_id,
+        f"🔄 Flipping harness `{current}` → `{wanted}` — restarting, "
+        f"back in a few seconds.",
+        reply_to)
+    write_restart_notice(room_id, reply_to, AGENT_VERSION,
+                         engine_from=current, engine_to=wanted)
+    ok, detail = await asyncio.to_thread(schedule_restart)
+    if ok:
+        log.info("engine flip %s → %s; restart scheduled (%s)",
+                 current, wanted, detail)
+        return
+
+    log.error("engine flip wrote env but restart failed: %s", detail)
+    with contextlib.suppress(OSError):
+        RESTART_NOTICE_PATH.unlink()
+    await room_reply(
+        ws, room_id,
+        f"⚠️ Wrote `DISPATCH_ENGINE={wanted}` but couldn't restart "
+        f"({detail}). Still answering as `{current}` until "
+        f"`sudo systemctl restart {SERVICE_UNIT}` — or use the "
+        f"restart_dispatch skill.",
+        reply_to)
 
 
 async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
@@ -3344,8 +3503,14 @@ async def announce_restart(link) -> None:
     was = notice.get("from_version") or "an earlier build"
     sha = head_sha(_SELF_FILES[0].parent)[:7]
     now = f"{AGENT_VERSION}{f' ({sha})' if sha else ''}"
-    await room_reply(link, notice["room_id"],
-                     f"✅ Back up on {now} — was {was}.", notice.get("reply_to"))
+    engine_from = notice.get("engine_from")
+    engine_to = notice.get("engine_to") or DISPATCH_ENGINE
+    if engine_from and engine_to and engine_from != engine_to:
+        body = (f"✅ Back up on {now} ({engine_to}) — was {was} "
+                f"({engine_from}).")
+    else:
+        body = f"✅ Back up on {now} — was {was}."
+    await room_reply(link, notice["room_id"], body, notice.get("reply_to"))
 
 
 # ── Main event loop ───────────────────────────────────────────────
@@ -4068,6 +4233,11 @@ async def handle_room_message(ws, payload: dict) -> None:
                          "🧹 Fresh session — I've forgotten this room's history."
                          if removed else
                          "🧹 Already on a fresh session (nothing to clear).")
+        return
+
+    eng = engine_command(body)
+    if eng:
+        await handle_engine_command(ws, room_id, eng[1], msg.get("hashid"))
         return
 
     # Fetched before the prompt is built so the paths can go in it,
