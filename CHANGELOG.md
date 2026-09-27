@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.46.1
+
+### Changed
+- The `ask` block guidance now says one of the surfaces drawing those
+  buttons is Will's Apple Watch — first six options, labels truncated
+  past ~60 characters — so keep labels wrist-sized and put the detail
+  in the prose. (vroxy_web 2.215.41 + vroxy_mobile 1.67.13 mirror an
+  open question to the watch and answer it with one tap.)
+
 ## 0.46.0
 
 ### Added

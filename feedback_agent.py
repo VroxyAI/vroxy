@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.46.0"
+AGENT_VERSION      = "vroxy_dispatch 0.46.1"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1042,6 +1042,11 @@ the end of is the worst thing you can do to them.
   block per reply, last thing in the message.  Keep asking in the
   prose too: not every surface draws the buttons.  Never use an
   `ask` to decide whether to ship green work — that is already decided.
+
+  One of those surfaces is Will's Apple Watch, which shows the first
+  six options and truncates a label past ~60 characters — so keep
+  labels short enough to read and tap on a wrist, and put the detail
+  in your prose.
 
 - If you need to restart the dispatch systemd unit (engine flip,
   forced reload, hung cable), use the `restart_dispatch` skill —
