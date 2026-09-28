@@ -781,9 +781,18 @@ class EngineCommandTest(unittest.TestCase):
         self.assertEqual(("/engine", "claude"),
                          fa.engine_command("/engine claude please"))
 
+    def test_a_bare_engine_slug_is_a_flip(self):
+        """RoomAsk taps post the option label as the message body —
+        `cursor`, not `/engine cursor` — and that still has to flip."""
+        self.assertEqual(("/engine", "cursor"), fa.engine_command("cursor"))
+        self.assertEqual(("/engine", "claude"), fa.engine_command("claude"))
+        self.assertEqual(("/engine", "copilot_cli"),
+                         fa.engine_command("copilot"))
+
     def test_ordinary_messages_are_not_engine_commands(self):
-        for body in ("", "hello", "/reset", "flip /engine", "/engines"):
-            self.assertIsNone(fa.engine_command(body))
+        for body in ("", "hello", "/reset", "flip /engine", "/engines",
+                     "use cursor please", "cursor agent"):
+            self.assertIsNone(fa.engine_command(body), body)
 
     def test_normalize_aliases(self):
         self.assertEqual("claude", fa.normalize_engine("claude_code"))

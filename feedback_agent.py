@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.46.1"
+AGENT_VERSION      = "vroxy_dispatch 0.46.2"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1500,17 +1500,26 @@ def engine_command(body: str) -> tuple[str, str | None] | None:
 
     Returns `(cmd, arg)` where `arg` is None for status, or the
     requested engine slug. Unknown leading tokens return None so the
-    rest of the message still reaches the agent."""
+    rest of the message still reaches the agent.
+
+    A bare known-engine slug (whole body, one token) also counts —
+    that is what a RoomAsk tap posts when `/harness` offered the
+    menu, and it must flip rather than wake the LLM on the word
+    `cursor`."""
     parts = (body or "").strip().split(maxsplit=1)
     if not parts:
         return None
     head = parts[0].lower()
-    if head not in ENGINE_COMMANDS:
-        return None
-    arg = None
-    if len(parts) > 1:
-        arg = parts[1].strip().split(maxsplit=1)[0].lower() or None
-    return head, arg
+    if head in ENGINE_COMMANDS:
+        arg = None
+        if len(parts) > 1:
+            arg = parts[1].strip().split(maxsplit=1)[0].lower() or None
+        return head, arg
+    if len(parts) == 1 and not head.startswith("/"):
+        wanted = normalize_engine(head)
+        if wanted in known_engines() and (wanted == head or head in ENGINE_ALIASES):
+            return "/engine", wanted
+    return None
 
 
 def normalize_engine(name: str) -> str:
@@ -3102,18 +3111,30 @@ async def handle_engine_command(ws, room_id: str, target: str | None,
                                 reply_to: str | None) -> None:
     """`/engine` / `/harness` — show or flip DISPATCH_ENGINE.
 
-    A flip rewrites the unit EnvironmentFile and schedules the same
-    delayed restart self-update uses, so the harness mid-reply is
-    not killed by a bare systemctl restart."""
+    Bare (no target) posts a RoomAsk of the other available engines
+    so web / phone / watch can tap one. A flip rewrites the unit
+    EnvironmentFile and schedules the same delayed restart
+    self-update uses, so the harness mid-reply is not killed by a
+    bare systemctl restart."""
     current = DISPATCH_ENGINE
     available = known_engines()
     if not target:
-        listed = ", ".join(f"`{e}`" for e in available)
-        await room_reply(
+        choices = [e for e in available if e != current]
+        if not choices:
+            await room_reply(
+                ws, room_id,
+                f"Harness is `{current}`. No other harnesses available on this unit.",
+                reply_to)
+            return
+        posted = await post_room_reply(
             ws, room_id,
-            f"Harness is `{current}`. Available: {listed}.\n"
-            f"Flip with `/engine <name>` — restarts this unit in a few seconds.",
+            [f"Harness is `{current}`. Pick one to flip — restarts this unit in a few seconds."],
             reply_to)
+        await room_ask(ws, room_id, posted, {
+            "prompt": "Flip to which harness?",
+            "mode": "one",
+            "options": [{"label": e, "value": e} for e in choices],
+        })
         return
 
     wanted = normalize_engine(target)

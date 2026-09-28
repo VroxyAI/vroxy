@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.46.2
+
+### Changed
+- Bare `/engine` / `/harness` now posts a RoomAsk of the other available
+  harnesses (tap on web / phone / watch) instead of a prose list. A tap
+  posts the engine slug as the message body; that bare slug is now
+  recognized as a flip the same way `/engine <name>` is.
+
 ## 0.46.1
 
 ### Changed
