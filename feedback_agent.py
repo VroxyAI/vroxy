@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.46.2"
+AGENT_VERSION      = "vroxy_dispatch 0.46.3"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -883,17 +883,17 @@ async def room_ask(ws, room_id: str, message_id: str | None, ask: dict | None) -
     means no question; the prose fallback already carries it."""
     if not message_id or not ask:
         return
+    options = ask.get("options") or []
     await cable_send(ws, "message", {
         "action":     "room_ask",
         "room_id":    room_id,
         "message_id": message_id,
         "prompt":     ask["prompt"],
         "mode":       ask["mode"],
-        "options":    ask["options"],
+        "options":    options,
     })
     log.info("Room ask sent room=%s message=%s mode=%s options=%d",
-             room_id, message_id, ask["mode"], len(ask["options"]))
-
+             room_id, message_id, ask["mode"], len(options))
 
 async def room_status(ws, room_id: str, reply_to: str | None, state: str,
                       *, model: str | None = None) -> None:
@@ -1575,6 +1575,548 @@ def set_dispatch_engine(engine: str) -> tuple[bool, str]:
         detail = (proc.stderr or proc.stdout or "").strip()
         return False, detail or f"sudo tee {path} failed"
     return True, str(path)
+
+
+LOGINABLE_ENGINES = ("claude", "cursor", "codex")
+LOGIN_TIMEOUT_SECONDS = 15 * 60
+_LOGIN_URL_RE = re.compile(r"https?://[^\s\]\>\)\"\'<>]+")
+_LOGIN_DEVICE_CODE_RE = re.compile(r"\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b")
+
+_login_state: dict | None = None
+
+
+def login_command(body: str) -> tuple[str, str | None] | None:
+    """Leading `/login`, optionally with `cancel` or an engine slug."""
+    parts = (body or "").strip().split(maxsplit=1)
+    if not parts:
+        return None
+    head = parts[0].lower()
+    if head != "/login":
+        return None
+    arg = None
+    if len(parts) > 1:
+        arg = parts[1].strip().split(maxsplit=1)[0].lower() or None
+    return head, arg
+
+
+def looks_like_login_code(body: str) -> bool:
+    """Heuristic for a Claude OAuth paste (`code#state`) so ordinary
+    room chatter during a login does not get fed to the CLI."""
+    text = (body or "").strip()
+    if not text or "\n" in text or text.startswith("/"):
+        return False
+    if "#" in text and len(text) >= 20:
+        return True
+    return " " not in text and len(text) >= 16
+
+
+def extract_login_url(text: str) -> str | None:
+    match = _LOGIN_URL_RE.search(text or "")
+    if not match:
+        return None
+    return match.group(0).rstrip(").,;]'\"")
+
+
+def extract_device_code(text: str) -> str | None:
+    match = _LOGIN_DEVICE_CODE_RE.search(text or "")
+    return match.group(1) if match else None
+
+
+def _resolve_login_bin(engine: str) -> str:
+    engine = normalize_engine(engine)
+    if engine == "claude":
+        return _resolve_claude_bin()
+    if engine == "codex":
+        return _resolve_codex_bin()
+    if engine == "cursor":
+        from shutil import which
+        override = os.environ.get("CURSOR_BIN")
+        if override:
+            return override
+        on_path = which("cursor-agent")
+        if on_path:
+            return on_path
+        for guess in (Path.home() / ".local/bin/cursor-agent",
+                      Path("/usr/local/bin/cursor-agent")):
+            if guess.is_file() and os.access(guess, os.X_OK):
+                return str(guess)
+        raise FileNotFoundError(
+            "`cursor-agent` binary not found. Set CURSOR_BIN or put it on PATH.")
+    raise ValueError(f"login not supported for {engine!r}")
+
+
+def _login_argv(engine: str, binpath: str) -> list[str]:
+    if engine == "claude":
+        return [binpath, "auth", "login"]
+    if engine == "cursor":
+        return [binpath, "login"]
+    if engine == "codex":
+        return [binpath, "login", "--device-auth"]
+    raise ValueError(f"login not supported for {engine!r}")
+
+
+def _bust_login_caches() -> None:
+    global _quota_cache, _harness_cache
+    _quota_cache = None
+    _harness_cache = None
+
+
+def _clear_login_state(expected: dict | None = None) -> None:
+    global _login_state
+    if expected is None or _login_state is expected:
+        _login_state = None
+
+
+async def _read_login_output(proc, predicate, timeout: float) -> tuple[str, bool]:
+    buf = ""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate(buf):
+            return buf, True
+        if proc.returncode is not None:
+            return buf, predicate(buf)
+        try:
+            chunk = await asyncio.wait_for(proc.stdout.read(256), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+        if not chunk:
+            return buf, predicate(buf)
+        buf += chunk.decode("utf-8", errors="replace")
+    return buf, predicate(buf)
+
+
+async def _kill_login_proc(proc) -> None:
+    """SIGTERM/SIGKILL an asyncio subprocess started with
+    start_new_session=True. Distinct from `_kill_process_tree`, which
+    talks to a blocking `Popen`."""
+    if proc.returncode is not None:
+        return
+    for sig, grace in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        if proc.returncode is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.send_signal(sig)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace)
+            return
+        except asyncio.TimeoutError:
+            continue
+
+
+async def cancel_login(ws, room_id: str, reply_to: str | None = None) -> bool:
+    state = _login_state
+    if not state:
+        await room_reply(ws, room_id, "No harness login in progress.", reply_to)
+        return False
+    state["cancel"] = True
+    code_event = state.get("code_event")
+    if code_event is not None:
+        code_event.set()
+    proc = state.get("proc")
+    if proc is not None and proc.returncode is None:
+        await _kill_login_proc(proc)
+    _clear_login_state(state)
+    await room_reply(
+        ws, room_id,
+        f"Login for `{state.get('engine')}` cancelled.",
+        reply_to)
+    return True
+
+
+async def feed_login_code(ws, room_id: str, code: str,
+                          reply_to: str | None = None) -> bool:
+    state = _login_state
+    if not state or not state.get("waiting_code"):
+        return False
+    if state.get("room_id") != room_id:
+        return False
+    state["code"] = (code or "").strip()
+    state["waiting_code"] = False
+    event = state.get("code_event")
+    if event is not None:
+        event.set()
+    await room_reply(
+        ws, room_id,
+        f"Got the code — finishing `{state.get('engine')}` login…",
+        reply_to)
+    return True
+
+
+def claim_pending_login(link, msg: dict) -> bool:
+    """Claim a room.message that belongs to an in-flight login so it
+    never sits behind an agent turn on the work queue."""
+    state = _login_state
+    if not state:
+        return False
+    room_id = (msg.get("room") or {}).get("hashid")
+    if not room_id or room_id != state.get("room_id"):
+        return False
+    body = ((msg.get("message") or {}).get("body") or "").strip()
+    reply_to = (msg.get("message") or {}).get("hashid")
+    cmd = login_command(body)
+    if cmd and cmd[1] == "cancel":
+        asyncio.create_task(cancel_login(link, room_id, reply_to))
+        return True
+    if state.get("waiting_code") and looks_like_login_code(body):
+        asyncio.create_task(feed_login_code(link, room_id, body, reply_to))
+        return True
+    return False
+
+
+async def handle_login_command(ws, room_id: str, target: str | None,
+                               reply_to: str | None) -> None:
+    """`/login` — start a harness device/OAuth login from the room.
+
+    Bare posts a RoomAsk of Claude / Cursor / Codex. Claude needs the
+    browser code pasted back (RoomAsk text); Cursor is URL-only;
+    Codex shows a URL + device code entered on OpenAI's site."""
+    if target == "cancel":
+        await cancel_login(ws, room_id, reply_to)
+        return
+
+    if not target:
+        if _login_state:
+            await room_reply(
+                ws, room_id,
+                f"Already logging in `{_login_state.get('engine')}`. "
+                f"`/login cancel` to abort, or wait it out.",
+                reply_to)
+            return
+        posted = await post_room_reply(
+            ws, room_id,
+            ["Which harness should sign in on this box? "
+             "The URL lands in the room — for Claude you paste the "
+             "code back; Cursor and Codex finish in the browser."],
+            reply_to)
+        await room_ask(ws, room_id, posted, {
+            "prompt": "Sign in which harness?",
+            "mode": "one",
+            "options": [
+                {"label": "Claude", "value": "/login claude"},
+                {"label": "Cursor", "value": "/login cursor"},
+                {"label": "Codex", "value": "/login codex"},
+            ],
+        })
+        return
+
+    engine = normalize_engine(target)
+    if engine not in LOGINABLE_ENGINES:
+        listed = ", ".join(f"`{e}`" for e in LOGINABLE_ENGINES)
+        await room_reply(
+            ws, room_id,
+            f"Don't know how to log in `{target}`. Want one of: {listed}.",
+            reply_to)
+        return
+
+    if _login_state:
+        await room_reply(
+            ws, room_id,
+            f"Already logging in `{_login_state.get('engine')}`. "
+            f"`/login cancel` first.",
+            reply_to)
+        return
+
+    try:
+        binpath = _resolve_login_bin(engine)
+    except FileNotFoundError as e:
+        await room_reply(ws, room_id, f"⚠️ {e}", reply_to)
+        return
+
+    asyncio.create_task(
+        _drive_login(ws, room_id, engine, binpath, reply_to),
+        name=f"login-{engine}")
+
+
+async def _drive_login(ws, room_id: str, engine: str, binpath: str,
+                       reply_to: str | None) -> None:
+    global _login_state
+    env = os.environ.copy()
+    if engine == "cursor":
+        env["NO_OPEN_BROWSER"] = "1"
+    argv = _login_argv(engine, binpath)
+    log.info("starting harness login engine=%s argv=%s", engine, argv)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+    except Exception as e:
+        await room_reply(
+            ws, room_id,
+            f"⚠️ Couldn't start `{engine}` login: {type(e).__name__}: {e}",
+            reply_to)
+        return
+
+    state = {
+        "engine": engine,
+        "room_id": room_id,
+        "proc": proc,
+        "waiting_code": False,
+        "code_event": asyncio.Event(),
+        "code": None,
+        "cancel": False,
+        "started_at": time.monotonic(),
+    }
+    _login_state = state
+
+    try:
+        if engine == "claude":
+            await _drive_claude_login(ws, room_id, state, reply_to)
+        elif engine == "cursor":
+            await _drive_url_poll_login(
+                ws, room_id, state, reply_to,
+                label="Cursor",
+                hint="Open the link, approve in the browser — I'll watch "
+                     "for it to finish. `/login cancel` aborts.")
+        else:
+            await _drive_codex_login(ws, room_id, state, reply_to)
+    except Exception as e:
+        log.exception("login drive failed engine=%s", engine)
+        with contextlib.suppress(Exception):
+            await room_reply(
+                ws, room_id,
+                f"⚠️ `{engine}` login crashed: {type(e).__name__}: {e}",
+                reply_to)
+    finally:
+        if proc.returncode is None:
+            await _kill_login_proc(proc)
+        _clear_login_state(state)
+
+
+async def _drive_claude_login(ws, room_id: str, state: dict,
+                              reply_to: str | None) -> None:
+    proc = state["proc"]
+    buf, ok = await _read_login_output(
+        proc, lambda t: bool(extract_login_url(t)), timeout=60)
+    if state.get("cancel"):
+        return
+    url = extract_login_url(buf)
+    if not url:
+        detail = _one_line(buf, 240) or "no URL printed"
+        await room_reply(
+            ws, room_id,
+            f"⚠️ Claude login didn't print a URL ({detail}).",
+            reply_to)
+        return
+
+    posted = await post_room_reply(
+        ws, room_id,
+        [f"**Claude login** — open this link, then paste the code "
+         f"back here (or `/login cancel`):\n{url}"],
+        reply_to)
+    state["waiting_code"] = True
+    await room_ask(ws, room_id, posted, {
+        "prompt": "Paste the Claude login code",
+        "mode": "text",
+        "options": [],
+    })
+
+    try:
+        await asyncio.wait_for(
+            state["code_event"].wait(), timeout=LOGIN_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        await room_reply(
+            ws, room_id,
+            "⚠️ Claude login timed out waiting for the code "
+            f"({LOGIN_TIMEOUT_SECONDS // 60}m).",
+            reply_to)
+        return
+
+    if state.get("cancel"):
+        return
+    code = (state.get("code") or "").strip()
+    if not code:
+        await room_reply(ws, room_id, "⚠️ No code received — login aborted.",
+                         reply_to)
+        return
+
+    try:
+        proc.stdin.write((code + "\n").encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
+    except Exception as e:
+        await room_reply(
+            ws, room_id,
+            f"⚠️ Couldn't feed the code to Claude: {type(e).__name__}: {e}",
+            reply_to)
+        return
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=120)
+    except asyncio.TimeoutError:
+        await room_reply(
+            ws, room_id,
+            "⚠️ Claude accepted the code but never exited — killing it.",
+            reply_to)
+        return
+
+    rest = ""
+    try:
+        chunk = await asyncio.wait_for(proc.stdout.read(), timeout=1.0)
+        if chunk:
+            rest = chunk.decode("utf-8", errors="replace")
+    except (asyncio.TimeoutError, Exception):
+        pass
+    combined = buf + rest
+    if proc.returncode == 0:
+        _bust_login_caches()
+        await room_reply(
+            ws, room_id,
+            "✅ Claude is signed in on this box.",
+            reply_to)
+    else:
+        detail = _one_line(combined, 240) or f"exit {proc.returncode}"
+        await room_reply(
+            ws, room_id,
+            f"⚠️ Claude login failed ({detail}).",
+            reply_to)
+
+
+async def _drive_url_poll_login(ws, room_id: str, state: dict,
+                                reply_to: str | None, *, label: str,
+                                hint: str) -> None:
+    proc = state["proc"]
+    buf, ok = await _read_login_output(
+        proc, lambda t: bool(extract_login_url(t)), timeout=60)
+    if state.get("cancel"):
+        return
+    url = extract_login_url(buf)
+    if not url:
+        detail = _one_line(buf, 240) or "no URL printed"
+        await room_reply(
+            ws, room_id,
+            f"⚠️ {label} login didn't print a URL ({detail}).",
+            reply_to)
+        return
+
+    await room_reply(
+        ws, room_id,
+        f"**{label} login** — {hint}\n{url}",
+        reply_to)
+
+    deadline = time.monotonic() + LOGIN_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if state.get("cancel"):
+            return
+        if proc.returncode is not None:
+            break
+        try:
+            chunk = await asyncio.wait_for(proc.stdout.read(256), timeout=2.0)
+        except asyncio.TimeoutError:
+            continue
+        if chunk:
+            buf += chunk.decode("utf-8", errors="replace")
+        elif proc.returncode is not None:
+            break
+    else:
+        if proc.returncode is None:
+            await room_reply(
+                ws, room_id,
+                f"⚠️ {label} login timed out "
+                f"({LOGIN_TIMEOUT_SECONDS // 60}m).",
+                reply_to)
+            return
+
+    if state.get("cancel"):
+        return
+    if proc.returncode is None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+
+    if proc.returncode == 0:
+        _bust_login_caches()
+        await room_reply(
+            ws, room_id,
+            f"✅ {label} is signed in on this box.",
+            reply_to)
+    else:
+        detail = _one_line(buf, 240) or f"exit {proc.returncode}"
+        await room_reply(
+            ws, room_id,
+            f"⚠️ {label} login failed ({detail}).",
+            reply_to)
+
+
+async def _drive_codex_login(ws, room_id: str, state: dict,
+                             reply_to: str | None) -> None:
+    proc = state["proc"]
+
+    def ready(text: str) -> bool:
+        return bool(extract_login_url(text) and extract_device_code(text))
+
+    buf, ok = await _read_login_output(proc, ready, timeout=60)
+    if state.get("cancel"):
+        return
+    url = extract_login_url(buf)
+    code = extract_device_code(buf)
+    if not url or not code:
+        detail = _one_line(buf, 240) or "no URL/code printed"
+        await room_reply(
+            ws, room_id,
+            f"⚠️ Codex login didn't print a device code ({detail}).",
+            reply_to)
+        return
+
+    await room_reply(
+        ws, room_id,
+        f"**Codex login** — open the link and enter this one-time code "
+        f"on OpenAI's site (not back here). `/login cancel` aborts.\n"
+        f"{url}\n"
+        f"Code: `{code}`",
+        reply_to)
+
+    deadline = time.monotonic() + LOGIN_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if state.get("cancel"):
+            return
+        if proc.returncode is not None:
+            break
+        try:
+            chunk = await asyncio.wait_for(proc.stdout.read(256), timeout=2.0)
+        except asyncio.TimeoutError:
+            continue
+        if chunk:
+            buf += chunk.decode("utf-8", errors="replace")
+        elif proc.returncode is not None:
+            break
+    else:
+        if proc.returncode is None:
+            await room_reply(
+                ws, room_id,
+                f"⚠️ Codex login timed out "
+                f"({LOGIN_TIMEOUT_SECONDS // 60}m).",
+                reply_to)
+            return
+
+    if state.get("cancel"):
+        return
+    if proc.returncode is None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+
+    if proc.returncode == 0:
+        _bust_login_caches()
+        await room_reply(
+            ws, room_id,
+            "✅ Codex is signed in on this box.",
+            reply_to)
+    else:
+        detail = _one_line(buf, 240) or f"exit {proc.returncode}"
+        await room_reply(
+            ws, room_id,
+            f"⚠️ Codex login failed ({detail}).",
+            reply_to)
 
 
 @contextlib.contextmanager
@@ -4261,6 +4803,11 @@ async def handle_room_message(ws, payload: dict) -> None:
                          "🧹 Already on a fresh session (nothing to clear).")
         return
 
+    login = login_command(body)
+    if login:
+        await handle_login_command(ws, room_id, login[1], msg.get("hashid"))
+        return
+
     eng = engine_command(body)
     if eng:
         await handle_engine_command(ws, room_id, eng[1], msg.get("hashid"))
@@ -4498,6 +5045,8 @@ async def process_stream(link: CableLink, ws) -> None:
             elif msg.get("type") == "approve.requested":
                 await _work_queue.put(("approve", msg))
             elif msg.get("type") == "room.message":
+                if claim_pending_login(link, msg):
+                    continue
                 if msg.get("fast_lane") and _current_work is not None:
                     # Main lane is busy — answer in parallel on a
                     # fresh non-resuming session so a question does

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.46.3
+
+### Added
+- **`/login [claude|cursor|codex]`** — start a harness OAuth / device
+  login from the room. Bare `/login` offers a RoomAsk of the three.
+  Claude prints a URL then asks for the browser code via a text
+  RoomAsk (paste from phone/watch). Cursor posts a deep-link URL and
+  polls until the browser finishes. Codex posts the OpenAI device URL
+  **and** the one-time code (enter it on the site, not back here).
+  `/login cancel` aborts an in-flight login. Codes waiting for Claude
+  are claimed off the work queue so they never sit behind a build.
+
 ## 0.46.2
 
 ### Changed

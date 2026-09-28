@@ -808,6 +808,58 @@ class EngineCommandTest(unittest.TestCase):
         self.assertEqual(names, sorted(names))
 
 
+class LoginCommandTest(unittest.TestCase):
+    def test_recognizes_login_and_args(self):
+        self.assertEqual(("/login", None), fa.login_command("/login"))
+        self.assertEqual(("/login", "claude"), fa.login_command("/login claude"))
+        self.assertEqual(("/login", "cancel"),
+                         fa.login_command("  /LOGIN cancel now"))
+        self.assertEqual(("/login", "cursor"),
+                         fa.login_command("/login cursor please"))
+
+    def test_ordinary_messages_are_not_login_commands(self):
+        for body in ("", "login", "/logout", "please /login", "/logins"):
+            self.assertIsNone(fa.login_command(body), body)
+
+    def test_extract_login_url(self):
+        text = ("Open a browser and navigate to this link: "
+                "https://cursor.com/loginDeepControl?challenge=abc&uuid=1 "
+                "then wait")
+        self.assertEqual(
+            "https://cursor.com/loginDeepControl?challenge=abc&uuid=1",
+            fa.extract_login_url(text))
+        self.assertIsNone(fa.extract_login_url("no link here"))
+
+    def test_extract_device_code(self):
+        text = ("Enter this one-time code (expires in 15 minutes)\n"
+                "   1VSL-SHQQD\n")
+        self.assertEqual("1VSL-SHQQD", fa.extract_device_code(text))
+        self.assertIsNone(fa.extract_device_code("no code"))
+
+    def test_looks_like_login_code(self):
+        self.assertTrue(fa.looks_like_login_code(
+            "AbCdEfGhIjKlMnOp#QrStUvWxYz0123456789"))
+        self.assertTrue(fa.looks_like_login_code("a" * 20))
+        self.assertFalse(fa.looks_like_login_code("short"))
+        self.assertFalse(fa.looks_like_login_code("/login cancel"))
+        self.assertFalse(fa.looks_like_login_code("hello there everyone"))
+        self.assertFalse(fa.looks_like_login_code("line1\nline2"))
+
+    def test_login_argv_per_engine(self):
+        self.assertEqual(
+            ["/bin/claude", "auth", "login"],
+            fa._login_argv("claude", "/bin/claude"))
+        self.assertEqual(
+            ["/bin/cursor-agent", "login"],
+            fa._login_argv("cursor", "/bin/cursor-agent"))
+        self.assertEqual(
+            ["/bin/codex", "login", "--device-auth"],
+            fa._login_argv("codex", "/bin/codex"))
+
+    def test_loginable_engines_are_the_three_with_device_flows(self):
+        self.assertEqual(("claude", "cursor", "codex"), fa.LOGINABLE_ENGINES)
+
+
 class SetDispatchEngineTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
