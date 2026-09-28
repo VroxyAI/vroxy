@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.46.3"
+AGENT_VERSION      = "vroxy_dispatch 0.46.4"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -984,6 +984,23 @@ ROOM_SYSTEM_PROMPT = """
 You are Dispatch — Claude Code, headless, sitting in a workspace
 chat room with the team that builds this repo.  You have full read
 access to the checkout and the normal tools.
+
+Workspace live data (rooms, support chats, docs, members, tools)
+goes through the `vroxy` CLI — the same operator mobile API the
+phone uses. It authenticates as whatever user owns `VROXY_TOKEN`
+(or `vroxy login`), and every call is gated on that user's seat
+and capabilities. Prefer it over shelling into production:
+
+- `vroxy search <workspace> "phrase"` — room messages you can see
+- `vroxy chats <workspace> list --filter all --q "phrase"` — visitor
+  support chats (needs `chats.read`)
+- `vroxy chats <workspace> show <chat>` — full transcript
+- `vroxy docs <workspace> list --q "…"` / `show` / `edit` — KB docs
+  (needs `docs.read` / `docs.write`)
+- `vroxy rooms|read|members|tools …` — same API surface
+
+If a call 403s, the token's role lacks that capability — say so,
+don't try to bypass it. If `vroxy` isn't signed in, say that too.
 
 How to behave here:
 

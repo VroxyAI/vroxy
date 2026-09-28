@@ -93,17 +93,21 @@ class ClientTest(unittest.TestCase):
         self.assertIn("502", str(ctx.exception))
 
     def test_bearer_header_is_sent(self):
+        from vroxy_cli.client import USER_AGENT
+
         client = Client(host="https://x.test", token="tok123")
         seen = {}
 
         def capture(req, timeout=None):
             seen["auth"] = req.get_header("Authorization")
+            seen["ua"] = req.get_header("User-agent") or req.get_header("User-Agent")
             return _response({"user": {}})
 
         with mock.patch("urllib.request.urlopen", side_effect=capture):
             client.me()
 
         self.assertEqual(seen["auth"], "Bearer tok123")
+        self.assertEqual(seen["ua"], USER_AGENT)
 
 
 class CliTest(unittest.TestCase):

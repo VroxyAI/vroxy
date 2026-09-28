@@ -242,6 +242,57 @@ def cmd_tools(args):
         return _emit(args, result, lambda: print("Deleted."))
 
 
+def cmd_search(args):
+    """Room-message search across joined rooms in a workspace."""
+    client = _client(args)
+    rows = client.search_rooms(args.workspace, args.query, limit=args.limit)
+
+    def plain():
+        if not rows:
+            print("No matches.")
+            return
+        for r in rows:
+            when = (r.get("created_at") or "")[:16].replace("T", " ")
+            room = r.get("room_name") or r.get("room_id") or "?"
+            who = r.get("sender_name") or "?"
+            body = (r.get("body") or "").replace("\n", " ")
+            if len(body) > 120:
+                body = body[:117] + "…"
+            print(f"#{room}  {when}  {who}: {body}")
+
+    return _emit(args, rows, plain)
+
+
+def cmd_chats(args):
+    client = _client(args)
+    action = args.action
+
+    if action == "list":
+        payload = client.chats(
+            args.workspace, filter=args.filter, q=args.q, page=args.page
+        )
+        rows = payload.get("chats", [])
+
+        def plain():
+            if not rows:
+                print("No chats.")
+                return
+            for c in rows:
+                title = (c.get("title") or "(untitled)")[:60]
+                preview = (c.get("preview") or "").replace("\n", " ")
+                if len(preview) > 80:
+                    preview = preview[:77] + "…"
+                print(f"{c.get('id'):<12} {title}")
+                if preview:
+                    print(f"             {preview}")
+
+        return _emit(args, payload, plain)
+
+    if action == "show":
+        payload = client.chat(args.workspace, args.chat)
+        return _emit(args, payload, lambda: print(json.dumps(payload, indent=2)))
+
+
 def _tool_params(raw):
     params = []
     for item in raw or []:
@@ -336,6 +387,26 @@ def build_parser():
     make.add_argument("--param", action="append", metavar="NAME=DESCRIPTION")
     make.add_argument("--follow-origin", action="store_true", dest="follow_origin")
     tools.set_defaults(func=cmd_tools)
+
+    search = sub.add_parser(
+        "search", help="Search messages across rooms you have joined"
+    )
+    search.add_argument("workspace")
+    search.add_argument("query")
+    search.add_argument("--limit", type=int, default=20)
+    search.set_defaults(func=cmd_search)
+
+    chats = sub.add_parser("chats", help="Visitor support chats in a workspace")
+    chats.add_argument("workspace")
+    chats_sub = chats.add_subparsers(dest="action", required=True)
+    chats_list = chats_sub.add_parser("list")
+    chats_list.add_argument(
+        "--filter", choices=["open", "awaiting_human", "all"], default="open"
+    )
+    chats_list.add_argument("--q", help="Loose search across title, visitor, messages")
+    chats_list.add_argument("--page", type=int)
+    chats_sub.add_parser("show").add_argument("chat")
+    chats.set_defaults(func=cmd_chats, filter="open", q=None, page=None)
 
     return p
 

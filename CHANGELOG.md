@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.46.4
+
+### Added
+- **Room agent → operator mobile API.** The room prompt now tells the
+  harness to use the `vroxy` CLI for live workspace data (rooms,
+  chats, docs, members, tools). Same API as the phone; gated on the
+  token owner's seat and capabilities — not a new permission surface.
+- **`vroxy search <workspace> "…"`** — room-message search across
+  joined rooms (`GET …/rooms/search`).
+- **`vroxy chats <workspace> list|show`** — visitor support chats,
+  including `--q` once the matching mobile endpoint ships.
+
+### Fixed
+- CLI requests identify as `vroxy-cli/<version>` so Cloudflare stops
+  1010-banning Python-urllib's default User-Agent.
+
 ## 0.46.3
 
 ### Added

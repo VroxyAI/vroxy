@@ -19,6 +19,10 @@ import urllib.request
 DEFAULT_HOST = "https://vroxy.ai"
 API_BASE = "/api/mobile/v1"
 TIMEOUT = 30
+# Cloudflare's bot score bans Python-urllib's default UA (error 1010).
+# Identify as the vroxy CLI so the zone can allowlist us without
+# pretending to be a browser.
+USER_AGENT = f"vroxy-cli/{__import__('vroxy_cli.version', fromlist=['VERSION']).VERSION} (+https://vroxy.ai)"
 
 
 class VroxyError(Exception):
@@ -39,6 +43,7 @@ class Client:
         req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Content-Type", "application/json")
         req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", USER_AGENT)
         if authed:
             if not self.token:
                 raise VroxyError("Not signed in. Run: vroxy login")
@@ -158,6 +163,19 @@ class Client:
 
     def delete_tool(self, workspace, tool):
         return self._request("DELETE", f"/workspaces/{workspace}/tools/{tool}")
+
+    def search_rooms(self, workspace, q, limit=20):
+        query = _query({"q": q, "limit": limit})
+        return self._request(
+            "GET", f"/workspaces/{workspace}/rooms/search{query}"
+        ).get("results", [])
+
+    def chats(self, workspace, filter="open", q=None, page=None):
+        query = _query({"filter": filter, "q": q, "page": page})
+        return self._request("GET", f"/workspaces/{workspace}/chats{query}")
+
+    def chat(self, workspace, chat):
+        return self._request("GET", f"/workspaces/{workspace}/chats/{chat}")
 
 
 def _compact(fields):
