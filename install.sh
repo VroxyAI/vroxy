@@ -49,16 +49,77 @@ python_setup_hint() {
   local ver
   ver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 3)"
   if command -v apt-get >/dev/null 2>&1; then
-    printf 'sudo apt install python3-venv python3-pip python%s-venv' "$ver"
+    printf 'sudo apt install python3 python3-venv python3-pip python%s-venv' "$ver"
   elif command -v dnf >/dev/null 2>&1; then
-    printf 'sudo dnf install python3-pip'
+    printf 'sudo dnf install python3 python3-pip'
   elif command -v apk >/dev/null 2>&1; then
-    printf 'sudo apk add py3-pip py3-virtualenv'
+    printf 'sudo apk add python3 py3-pip py3-virtualenv'
   elif command -v brew >/dev/null 2>&1; then
     printf 'brew install python'
   else
     printf "install your distro's python3 venv and pip packages"
   fi
+}
+
+# Root, or passwordless sudo: we can install the packages ourselves
+# rather than dying with a hint the operator has to copy-paste.
+can_install_packages() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    return 0
+  fi
+  command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null
+}
+
+run_pkg() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    env DEBIAN_FRONTEND=noninteractive "$@"
+  else
+    sudo DEBIAN_FRONTEND=noninteractive "$@"
+  fi
+}
+
+apt_install_python_pkgs() {
+  local ver pkgs
+  say "Installing the Python packages this installer needs…"
+  run_pkg apt-get update -qq || die "apt-get update failed"
+  pkgs=(python3 python3-venv python3-pip)
+  run_pkg apt-get install -y -qq "${pkgs[@]}" ||
+    die "could not install ${pkgs[*]}. Fix it with: $(python_setup_hint)"
+  ver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+  if [[ -n "$ver" ]]; then
+    run_pkg apt-get install -y -qq "python${ver}-venv" 2>/dev/null || true
+  fi
+}
+
+# Distros that ship python3 without ensurepip leave a half-made
+# venv behind; probe in a temp dir so we never trust that debris.
+python_venv_works() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  local probe
+  probe="$(mktemp -d "${TMPDIR:-/tmp}/vroxy-venv-probe.XXXXXX")"
+  if python3 -m venv "$probe" >/dev/null 2>&1 && venv_usable "$probe"; then
+    rm -rf "$probe"
+    return 0
+  fi
+  rm -rf "$probe"
+  return 1
+}
+
+# Install python3 + venv/pip via apt when we can (root or passwordless
+# sudo). VROXY_INSTALL_NO_APT=1 keeps unit tests from touching apt.
+ensure_python_toolchain() {
+  if python_venv_works; then
+    return 0
+  fi
+  if [[ "${VROXY_INSTALL_NO_APT:-}" != "1" ]] &&
+     command -v apt-get >/dev/null 2>&1 && can_install_packages; then
+    apt_install_python_pkgs
+    python_venv_works && return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    die "missing required command: python3. Fix it with: $(python_setup_hint) — then run ./install.sh again."
+  fi
+  die "python3 can't create a virtualenv with pip on this machine. Fix it with: $(python_setup_hint) — then run ./install.sh again."
 }
 
 venv_usable() { [[ -x "$1/bin/python" ]] && "$1/bin/python" -m pip --version >/dev/null 2>&1; }
@@ -104,7 +165,7 @@ bootstrap_if_piped() {
 
 # ── venv ──────────────────────────────────────────────────────────
 ensure_venv() {
-  need python3
+  ensure_python_toolchain
   make_venv "$HERE/.venv"
   say "Installing Python dependencies…"
   # `python -m pip`, never the `pip` script: its shebang hardcodes the
@@ -369,7 +430,7 @@ remove_instance() {
 # ordinary command and has no business needing root.  pipx when it is
 # there (its own venv, no clashes), pip --user otherwise.
 install_cli() {
-  need python3
+  ensure_python_toolchain
   if command -v pipx >/dev/null 2>&1; then
     pipx install --force "$HERE" >/dev/null || die "pipx install failed"
   elif python3 -m pip --version >/dev/null 2>&1 &&

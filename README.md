@@ -34,7 +34,12 @@ Either half on its own:
 The CLI goes in via `pipx` when you have it, `pip install --user`
 when you don't, and its own venv when the system python is externally
 managed (PEP 668, which is most current distros). All three end with
-`vroxy` on your PATH.
+`vroxy` on your PATH. On Debian/Ubuntu, if `python3` or
+`python3-venv` is missing and the installer can use root or
+passwordless sudo, it installs those packages itself and continues.
+
+To prove a fresh box can install: `./tests/docker_install_doctor.sh`
+(needs docker; runs `--cli` inside a bare `ubuntu:24.04`).
 
 ## The CLI
 

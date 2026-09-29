@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.48.2
+
+### Fixed
+- `install.sh` on a bare Debian/Ubuntu box (no `python3`, or python
+  without `python3-venv` / pip) now installs the packages itself when
+  running as root or with passwordless sudo, then continues — instead
+  of dying with a hint the operator has to copy-paste. A machine
+  without apt still gets the same named fix command as before.
+- `tests/docker_install_doctor.sh` runs `./install.sh --cli` end to
+  end inside a fresh `ubuntu:24.04` container for three cases: bare
+  image, python3 only, and python3+venv already present. Unit tests
+  cover the new toolchain helpers with `VROXY_INSTALL_NO_APT=1`.
+
 ## 0.48.1
 
 ### Fixed

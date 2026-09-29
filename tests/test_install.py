@@ -9,11 +9,15 @@ import unittest
 from pathlib import Path
 
 INSTALL_SH = Path(__file__).resolve().parent.parent / "install.sh"
+DOCTOR_SH = Path(__file__).resolve().parent / "docker_install_doctor.sh"
 
 
-def run_sourced(snippet, path_dirs=(), timeout=85):
+def run_sourced(snippet, path_dirs=(), env_extra=None, timeout=85):
     env = dict(os.environ)
     env["PATH"] = os.pathsep.join([*map(str, path_dirs), env.get("PATH", "")])
+    env["VROXY_INSTALL_NO_APT"] = "1"
+    if env_extra:
+        env.update(env_extra)
     script = f'source "{INSTALL_SH}"\n{snippet}\n'
     return subprocess.run(["bash", "-c", script], env=env, capture_output=True,
                           text=True, timeout=timeout)
@@ -95,6 +99,27 @@ class InstallScriptTest(unittest.TestCase):
         result = run_sourced("python_setup_hint")
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertTrue(result.stdout.strip())
+        self.assertIn("python3", result.stdout)
+
+    def test_ensure_python_toolchain_refuses_without_apt_when_venv_broken(self):
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        fake_python3_without_ensurepip(bindir)
+
+        result = run_sourced("ensure_python_toolchain", path_dirs=[bindir])
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("can't create a virtualenv with pip", result.stderr)
+        self.assertIn("python3-venv", result.stderr)
+
+    def test_ensure_python_toolchain_is_a_no_op_when_venv_works(self):
+        result = run_sourced("ensure_python_toolchain; echo ok")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("ok", result.stdout.strip())
+
+    def test_doctor_script_is_executable(self):
+        self.assertTrue(DOCTOR_SH.is_file())
+        self.assertTrue(os.access(DOCTOR_SH, os.X_OK), f"{DOCTOR_SH} must be executable")
 
 
 if __name__ == "__main__":
