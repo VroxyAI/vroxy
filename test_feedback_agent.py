@@ -17,6 +17,7 @@ os.environ.setdefault("LOG_FILE", "")
 
 import asyncio
 import subprocess
+import sys
 import time
 import tempfile
 import shutil
@@ -2619,6 +2620,483 @@ class QuotaProbeTest(unittest.TestCase):
         finally:
             fa.probe_quotas = real
             fa._quota_cache = None
+
+
+def _git_out(args, cwd):
+    return subprocess.run(["git"] + args, cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _agent_source(version):
+    return f'AGENT_VERSION = "vroxy_dispatch {version}"\n'
+
+
+class ReleaseRepoTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.origin = root / "origin.git"
+        self.publisher = root / "publisher"
+        self.checkout = root / "vroxy_dispatch"
+        _git(["init", "-q", "--bare", "-b", "main", str(self.origin)], root)
+        _git(["clone", "-q", str(self.origin), str(self.publisher)], root)
+        for repo in (self.publisher,):
+            _git(["config", "user.email", "t@example.test"], repo)
+            _git(["config", "user.name", "Test"], repo)
+        (self.publisher / "feedback_agent.py").write_text(_agent_source("1.0.0"))
+        (self.publisher / "requirements.txt").write_text("websockets>=12.0,<14\n")
+        _git(["add", "."], self.publisher)
+        _git(["commit", "-qm", "1.0.0"], self.publisher)
+        _git(["push", "-q", "origin", "main"], self.publisher)
+        _git(["clone", "-q", str(self.origin), str(self.checkout)], root)
+        _git(["config", "user.email", "t@example.test"], self.checkout)
+        _git(["config", "user.name", "Test"], self.checkout)
+
+        self.installs = []
+        saved_install = fa.install_dependencies
+        fa.install_dependencies = lambda root: (self.installs.append(root), (True, ""))[1]
+        self.addCleanup(setattr, fa, "install_dependencies", saved_install)
+        saved_flags = (fa._restart_scheduled, fa._restart_pending)
+        self.addCleanup(self._restore_flags, saved_flags)
+        fa._restart_scheduled = False
+        fa._restart_pending = None
+
+    def _restore_flags(self, saved):
+        fa._restart_scheduled, fa._restart_pending = saved
+
+    def release(self, version, requirements=None, extra=None):
+        (self.publisher / "feedback_agent.py").write_text(_agent_source(version))
+        if requirements is not None:
+            (self.publisher / "requirements.txt").write_text(requirements)
+        if extra:
+            (self.publisher / extra[0]).write_text(extra[1])
+        _git(["add", "."], self.publisher)
+        _git(["commit", "-qm", version], self.publisher)
+        _git(["push", "-q", "origin", "main"], self.publisher)
+        return _git_out(["rev-parse", "HEAD"], self.publisher)
+
+    def head(self):
+        return _git_out(["rev-parse", "HEAD"], self.checkout)
+
+    def apply(self, sha, latest=""):
+        return fa.apply_update(sha, latest, self.checkout)
+
+
+class ApplyUpdateTest(ReleaseRepoTestCase):
+    def test_the_happy_path_fast_forwards_to_exactly_the_pinned_sha(self):
+        pinned = self.release("1.0.1")
+        self.release("1.0.2")
+
+        result = self.apply(pinned, "1.0.1")
+
+        self.assertEqual("updated", result["status"], result)
+        self.assertEqual(pinned, self.head(), "never the branch tip — the pinned sha")
+        self.assertEqual("1.0.0", result["from_version"])
+        self.assertEqual("1.0.1", result["to_version"])
+        self.assertEqual([], self.installs, "requirements did not change")
+
+    def test_dependencies_reinstall_only_when_requirements_change(self):
+        sha = self.release("1.0.1", requirements="websockets>=13.0,<14\n")
+
+        result = self.apply(sha)
+
+        self.assertEqual("updated", result["status"], result)
+        self.assertEqual(1, len(self.installs))
+
+    def test_a_pyproject_change_also_reinstalls(self):
+        sha = self.release("1.0.1", extra=("pyproject.toml", "[project]\nname='x'\n"))
+        self.assertEqual("updated", self.apply(sha)["status"])
+        self.assertEqual(1, len(self.installs))
+
+    def test_a_failed_dependency_install_rolls_back(self):
+        before = self.head()
+        sha = self.release("1.0.1", requirements="nope==0\n")
+        fa.install_dependencies = lambda root: (False, "no matching distribution")
+
+        result = self.apply(sha)
+
+        self.assertEqual("failed", result["status"])
+        self.assertIn("no matching distribution", result["reason"])
+        self.assertEqual(before, self.head())
+
+    def test_a_release_that_does_not_compile_rolls_back(self):
+        before = self.head()
+        (self.publisher / "feedback_agent.py").write_text(
+            _agent_source("1.0.1") + "def broken(:\n")
+        _git(["commit", "-qam", "broken"], self.publisher)
+        _git(["push", "-q", "origin", "main"], self.publisher)
+        sha = _git_out(["rev-parse", "HEAD"], self.publisher)
+
+        result = self.apply(sha)
+
+        self.assertEqual("failed", result["status"])
+        self.assertIn("does not compile", result["reason"])
+        self.assertEqual(before, self.head())
+
+    def test_a_dirty_tracked_file_is_refused(self):
+        sha = self.release("1.0.1")
+        before = self.head()
+        (self.checkout / "requirements.txt").write_text("local edit\n")
+
+        result = self.apply(sha)
+
+        self.assertEqual("refused", result["status"])
+        self.assertIn("uncommitted", result["reason"])
+        self.assertEqual(before, self.head())
+        self.assertEqual("local edit\n", (self.checkout / "requirements.txt").read_text())
+
+    def test_an_untracked_file_does_not_block_the_update(self):
+        sha = self.release("1.0.1")
+        (self.checkout / "scratch.txt").write_text("mine\n")
+
+        result = self.apply(sha)
+
+        self.assertEqual("updated", result["status"], result)
+        self.assertEqual("mine\n", (self.checkout / "scratch.txt").read_text())
+
+    def test_an_untracked_file_the_release_would_overwrite_fails_without_clobbering(self):
+        sha = self.release("1.0.1", extra=("new_file.py", "released\n"))
+        (self.checkout / "new_file.py").write_text("mine\n")
+        before = self.head()
+
+        result = self.apply(sha)
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual(before, self.head())
+        self.assertEqual("mine\n", (self.checkout / "new_file.py").read_text())
+
+    def test_a_non_fast_forward_is_refused(self):
+        sha = self.release("1.0.1")
+        (self.checkout / "local.txt").write_text("x\n")
+        _git(["add", "local.txt"], self.checkout)
+        _git(["commit", "-qm", "local"], self.checkout)
+        before = self.head()
+
+        result = self.apply(sha)
+
+        self.assertEqual("refused", result["status"])
+        self.assertIn("fast-forward", result["reason"])
+        self.assertEqual(before, self.head())
+
+    def test_an_unknown_sha_is_refused(self):
+        result = self.apply("f" * 40)
+        self.assertEqual("refused", result["status"])
+        self.assertIn("not a commit", result["reason"])
+
+    def test_a_sha_that_is_not_on_the_origin_branch_is_refused(self):
+        _git(["checkout", "-qb", "side"], self.publisher)
+        (self.publisher / "side.txt").write_text("x\n")
+        _git(["add", "."], self.publisher)
+        _git(["commit", "-qm", "side"], self.publisher)
+        _git(["push", "-q", "origin", "side"], self.publisher)
+        sha = _git_out(["rev-parse", "HEAD"], self.publisher)
+
+        result = self.apply(sha)
+
+        self.assertEqual("refused", result["status"])
+        self.assertIn("origin/main", result["reason"])
+
+    def test_a_malformed_sha_is_refused_before_touching_git(self):
+        for bad in ("", "abc123", "main", "g" * 40):
+            self.assertEqual("refused", self.apply(bad)["status"], bad)
+
+    def test_already_there_is_up_to_date(self):
+        result = self.apply(self.head())
+        self.assertEqual("up_to_date", result["status"])
+
+    def test_an_older_release_is_up_to_date(self):
+        old = self.head()
+        new = self.release("1.0.1")
+        self.assertEqual("updated", self.apply(new)["status"])
+        self.assertEqual("up_to_date", self.apply(old)["status"])
+
+    def test_a_detached_head_is_refused(self):
+        sha = self.release("1.0.1")
+        _git(["checkout", "-q", "--detach"], self.checkout)
+        self.assertEqual("refused", self.apply(sha)["status"])
+
+    def test_a_pending_restart_is_refused(self):
+        sha = self.release("1.0.1")
+        fa._restart_scheduled = True
+        self.assertEqual("refused", self.apply(sha)["status"])
+
+    def test_credentials_in_git_output_are_scrubbed(self):
+        self.assertEqual("fatal: https://***@github.com/x",
+                         fa._scrub("fatal: https://user:tok3n@github.com/x"))
+
+
+def update_results(link):
+    found = []
+    for frame in link.outbox:
+        data = json.loads(json.loads(frame)["data"])
+        if data.get("action") == "update_result":
+            found.append(data)
+    return found
+
+
+class PerformUpdateTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        ReleaseRepoTestCase.setUp(self)
+        saved_checkout = fa.DISPATCH_CHECKOUT
+        fa.DISPATCH_CHECKOUT = self.checkout
+        self.addCleanup(setattr, fa, "DISPATCH_CHECKOUT", saved_checkout)
+        self.restarts = []
+        saved_schedule = fa.schedule_restart
+        fa.schedule_restart = lambda: (self.restarts.append(1), (True, "unit-test"))[1]
+        self.addCleanup(setattr, fa, "schedule_restart", saved_schedule)
+        saved_work = fa._current_work
+        fa._current_work = None
+        self.addCleanup(setattr, fa, "_current_work", saved_work)
+
+    async def test_updated_reports_then_restarts_through_the_existing_path(self):
+        sha = self.release("1.0.1")
+        link = fa.CableLink()
+
+        await fa.perform_update(link, sha, "1.0.1")
+
+        results = update_results(link)
+        self.assertEqual(1, len(results))
+        self.assertEqual("updated", results[0]["status"])
+        self.assertEqual("1.0.0", results[0]["from_version"])
+        self.assertEqual("1.0.1", results[0]["to_version"])
+        self.assertEqual([1], self.restarts)
+        self.assertTrue(fa._restart_scheduled)
+        self.assertEqual([], sent_bodies(link), "the server posts the room line, not dispatch")
+
+    async def test_a_busy_worker_defers_the_restart_to_after_its_task(self):
+        sha = self.release("1.0.1")
+        fa._current_work = ("room", {})
+        link = fa.CableLink()
+
+        await fa.perform_update(link, sha, "1.0.1")
+
+        self.assertEqual([], self.restarts)
+        self.assertIsNotNone(fa._restart_pending)
+        fa._current_work = None
+        await fa.restart_if_self_updated(link, "room", {"room": {"hashid": "r"}})
+        self.assertEqual([1], self.restarts)
+        self.assertEqual([], sent_bodies(link))
+
+    async def test_refused_is_reported_and_nothing_restarts(self):
+        sha = self.release("1.0.1")
+        (self.checkout / "requirements.txt").write_text("dirty\n")
+        link = fa.CableLink()
+
+        await fa.perform_update(link, sha, "1.0.1")
+
+        self.assertEqual("refused", update_results(link)[0]["status"])
+        self.assertEqual([], self.restarts)
+
+
+class AutoUpdateTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        ReleaseRepoTestCase.setUp(self)
+        state = Path(self.tmp.name) / "state"
+        saved = (fa.DISPATCH_CHECKOUT, fa.STATE_DIR, fa.UPDATE_ATTEMPTS_PATH,
+                 fa.AUTO_UPDATE_ENABLED, fa._current_work, fa._latest_release,
+                 fa.schedule_restart, fa.AGENT_VERSION)
+        self.addCleanup(self._restore, saved)
+        fa.DISPATCH_CHECKOUT = self.checkout
+        fa.STATE_DIR = state
+        fa.UPDATE_ATTEMPTS_PATH = state / "update-attempts.json"
+        fa.AUTO_UPDATE_ENABLED = False
+        fa._current_work = None
+        fa.AGENT_VERSION = "vroxy_dispatch 1.0.0"
+        self.restarts = []
+        fa.schedule_restart = lambda: (self.restarts.append(1), (True, "unit-test"))[1]
+
+    def _restore(self, saved):
+        (fa.DISPATCH_CHECKOUT, fa.STATE_DIR, fa.UPDATE_ATTEMPTS_PATH,
+         fa.AUTO_UPDATE_ENABLED, fa._current_work, fa._latest_release,
+         fa.schedule_restart, fa.AGENT_VERSION) = saved
+
+    def frame(self, sha, severity="minor", latest="1.0.1"):
+        return {"type": "version.current", "latest": latest,
+                "release_sha": sha, "severity": severity}
+
+    async def run_frame(self, link, msg):
+        task = fa.handle_update_frame(link, msg)
+        if task is not None:
+            await task
+        return task
+
+    async def test_off_by_default_it_only_remembers_the_release(self):
+        sha = self.release("1.0.1")
+        link = fa.CableLink()
+
+        self.assertIsNone(await self.run_frame(link, self.frame(sha)))
+
+        self.assertEqual(sha, fa._latest_release["release_sha"])
+        self.assertNotEqual(sha, self.head())
+        self.assertEqual([], link.outbox)
+
+    async def test_the_default_is_off(self):
+        env = dict(os.environ)
+        env.pop("DISPATCH_AUTO_UPDATE", None)
+        code = "import feedback_agent as fa; print(fa.AUTO_UPDATE_ENABLED)"
+        out = subprocess.run([sys.executable, "-c", code], cwd=Path(fa.__file__).parent,
+                             env={**env, "LOG_FILE": ""}, capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual("False", out.stdout.strip(), out.stderr)
+
+    async def test_on_and_minor_applies(self):
+        fa.AUTO_UPDATE_ENABLED = True
+        sha = self.release("1.0.1")
+        link = fa.CableLink()
+
+        self.assertIsNotNone(await self.run_frame(link, self.frame(sha)))
+
+        self.assertEqual(sha, self.head())
+        self.assertEqual("updated", update_results(link)[0]["status"])
+        self.assertEqual([1], self.restarts)
+
+    async def test_on_and_patch_applies(self):
+        fa.AUTO_UPDATE_ENABLED = True
+        sha = self.release("1.0.1")
+        await self.run_frame(fa.CableLink(), self.frame(sha, severity="patch"))
+        self.assertEqual(sha, self.head())
+
+    async def test_major_never_auto_applies(self):
+        fa.AUTO_UPDATE_ENABLED = True
+        sha = self.release("2.0.0")
+        link = fa.CableLink()
+
+        self.assertIsNone(await self.run_frame(link, self.frame(sha, "major", "2.0.0")))
+
+        self.assertNotEqual(sha, self.head())
+        self.assertEqual([], link.outbox)
+
+    async def test_busy_with_a_work_item_waits(self):
+        fa.AUTO_UPDATE_ENABLED = True
+        fa._current_work = ("room", {})
+        sha = self.release("1.0.1")
+
+        self.assertIsNone(await self.run_frame(fa.CableLink(), self.frame(sha)))
+        self.assertEqual([], fa.load_update_attempts(), "a busy skip is not an attempt")
+
+    async def test_a_refused_sha_is_not_retried_every_heartbeat(self):
+        fa.AUTO_UPDATE_ENABLED = True
+        sha = self.release("1.0.1")
+        (self.checkout / "requirements.txt").write_text("dirty\n")
+        link = fa.CableLink()
+
+        await self.run_frame(link, self.frame(sha))
+        await self.run_frame(link, self.frame(sha))
+        await self.run_frame(link, self.frame(sha))
+
+        self.assertEqual(1, len(update_results(link)))
+        self.assertEqual("refused", update_results(link)[0]["status"])
+        self.assertIn(sha, json.loads(fa.UPDATE_ATTEMPTS_PATH.read_text()))
+
+    async def test_a_release_no_newer_than_ours_is_left_alone(self):
+        fa.AUTO_UPDATE_ENABLED = True
+        fa.AGENT_VERSION = "vroxy_dispatch 1.0.1"
+        sha = self.release("1.0.1")
+        self.assertIsNone(await self.run_frame(fa.CableLink(), self.frame(sha)))
+
+    async def test_a_new_release_after_a_refused_one_is_still_tried(self):
+        fa.AUTO_UPDATE_ENABLED = True
+        fa.record_update_attempt("a" * 40)
+        sha = self.release("1.0.1")
+        await self.run_frame(fa.CableLink(), self.frame(sha))
+        self.assertEqual(sha, self.head())
+
+
+class UpdateRequestedRoutingTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        ReleaseRepoTestCase.setUp(self)
+        saved = (fa.DISPATCH_CHECKOUT, fa.schedule_restart, fa._current_work, fa.DISPATCH_ENGINE)
+        self.addCleanup(self._restore, saved)
+        fa.DISPATCH_CHECKOUT = self.checkout
+        fa._current_work = None
+        fa.DISPATCH_ENGINE = "claude"
+        fa.schedule_restart = lambda: (True, "unit-test")
+
+    def _restore(self, saved):
+        (fa.DISPATCH_CHECKOUT, fa.schedule_restart, fa._current_work,
+         fa.DISPATCH_ENGINE) = saved
+
+    def frame(self, sha, kind="claude_code"):
+        return {"type": "update.requested", "latest": "1.0.1", "release_sha": sha,
+                "agent": {"kind": kind, "name": "Agent"},
+                "requested_by": {"name": "Will"}}
+
+    async def test_a_request_for_another_engine_is_left_alone(self):
+        sha = self.release("1.0.1")
+        link = fa.CableLink()
+
+        self.assertIsNone(fa.handle_update_frame(link, self.frame(sha, kind="codex")))
+
+        self.assertNotEqual(sha, self.head())
+        self.assertEqual([], link.outbox)
+
+    async def test_a_request_for_this_engine_applies_even_with_auto_update_off(self):
+        sha = self.release("1.0.1")
+        link = fa.CableLink()
+        saved = fa.AUTO_UPDATE_ENABLED
+        fa.AUTO_UPDATE_ENABLED = False
+        try:
+            await fa.handle_update_frame(link, self.frame(sha))
+        finally:
+            fa.AUTO_UPDATE_ENABLED = saved
+
+        self.assertEqual(sha, self.head())
+        self.assertEqual("updated", update_results(link)[0]["status"])
+
+    async def test_a_human_request_still_honours_the_refusals(self):
+        sha = self.release("2.0.0")
+        (self.checkout / "requirements.txt").write_text("dirty\n")
+        link = fa.CableLink()
+
+        await fa.handle_update_frame(link, self.frame(sha))
+
+        self.assertEqual("refused", update_results(link)[0]["status"])
+
+    async def test_process_stream_routes_the_frame(self):
+        sha = self.release("1.0.1")
+        link = fa.CableLink()
+        saved_queue, saved_hb = fa._work_queue, fa.heartbeat_forever
+        fa._work_queue = asyncio.Queue()
+
+        async def no_heartbeat(_ws):
+            return None
+
+        fa.heartbeat_forever = no_heartbeat
+
+        class Stream:
+            def __init__(self, frames):
+                self.frames = [json.dumps({"message": f}) for f in frames]
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.frames:
+                    raise StopAsyncIteration
+                return self.frames.pop(0)
+
+            async def send(self, _frame):
+                return None
+
+        try:
+            await fa.process_stream(link, Stream([self.frame(sha, kind="codex"),
+                                                  self.frame(sha)]))
+            await asyncio.gather(*list(fa._update_tasks))
+        finally:
+            fa._work_queue, fa.heartbeat_forever = saved_queue, saved_hb
+
+        self.assertEqual(sha, self.head())
+        self.assertEqual(1, len(update_results(link)), "only the frame for this engine runs")
+
+
+class ReleaseVersionsTest(unittest.TestCase):
+    def test_the_cli_and_the_package_carry_the_agent_version(self):
+        from vroxy_cli.version import VERSION
+        number = fa._version_number(fa.AGENT_VERSION)
+        pyproject = (Path(fa.__file__).parent / "pyproject.toml").read_text()
+        self.assertEqual(number, VERSION)
+        self.assertIn(f'version = "{number}"', pyproject)
 
 
 if __name__ == "__main__":

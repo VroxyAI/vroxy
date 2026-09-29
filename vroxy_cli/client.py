@@ -12,6 +12,8 @@ their capability. The CLI is a client, not a new permission surface.
 
 import json
 import os
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +25,9 @@ TIMEOUT = 30
 # Identify as the vroxy CLI so the zone can allowlist us without
 # pretending to be a browser.
 USER_AGENT = f"vroxy-cli/{__import__('vroxy_cli.version', fromlist=['VERSION']).VERSION} (+https://vroxy.ai)"
+CLIENT_ID = f"vroxy-cli/{__import__('vroxy_cli.version', fromlist=['VERSION']).VERSION}"
+LATEST_HEADER = "X-Vroxy-Client-Latest"
+NOTICE_INTERVAL_SECONDS = 24 * 60 * 60
 
 
 class VroxyError(Exception):
@@ -44,6 +49,7 @@ class Client:
         req.add_header("Content-Type", "application/json")
         req.add_header("Accept", "application/json")
         req.add_header("User-Agent", USER_AGENT)
+        req.add_header("X-Vroxy-Client", CLIENT_ID)
         if authed:
             if not self.token:
                 raise VroxyError("Not signed in. Run: vroxy login")
@@ -52,7 +58,9 @@ class Client:
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 raw = resp.read().decode()
+                announce_if_newer(_header(resp, LATEST_HEADER))
         except urllib.error.HTTPError as e:
+            announce_if_newer(_header(e, LATEST_HEADER))
             raw = e.read().decode()
             payload = _safe_json(raw)
             message = payload.get("error") or f"HTTP {e.code}"
@@ -183,6 +191,49 @@ class Client:
     def targets(self, workspace, page=None):
         query = _query({"page": page})
         return self._request("GET", f"/workspaces/{workspace}/dispatch_targets{query}")
+
+
+def _header(response, name):
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        return headers.get(name)
+    except AttributeError:
+        return None
+
+
+def _version_tuple(text):
+    parts = str(text or "").strip().split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def announce_if_newer(latest, now=None, stream=None):
+    from . import config
+    from .version import VERSION
+
+    theirs, ours = _version_tuple(latest), _version_tuple(VERSION)
+    if not theirs or not ours or theirs <= ours:
+        return False
+    now = time.time() if now is None else now
+    try:
+        shown = float(config.load_notice().get("shown_at") or 0)
+    except (TypeError, ValueError):
+        shown = 0
+    if now - shown < NOTICE_INTERVAL_SECONDS:
+        return False
+    try:
+        config.save_notice({"shown_at": now, "latest": str(latest).strip()})
+    except OSError:
+        return False
+    print(
+        f"vroxy {str(latest).strip()} is available (you have {VERSION}) "
+        f"— update the vroxy_dispatch checkout",
+        file=stream or sys.stderr,
+    )
+    return True
 
 
 def _compact(fields):

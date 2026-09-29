@@ -368,6 +368,7 @@ attached to a User instead of a Tenant.
 | `PROJECT`               | `vroxy_web`                       |
 | `DISPATCH_ENGINE`       | `claude` (or `codex`, `cursor`)     |
 | `DISPATCH_TELEMETRY`    | `1` (set `0` to stop reporting the box) |
+| `DISPATCH_AUTO_UPDATE`  | `0` (set `1` to apply patch/minor releases on its own) |
 | `CLAUDE_CHAT_BIN`       | `./bin/claude-chat`                 |
 | `CODEX_BIN`             | `codex` on PATH                     |
 | `CLAUDE_STREAM`         | `1` (set `0` to skip streamed path) |
@@ -378,6 +379,41 @@ attached to a User instead of a Tenant.
 | `VROXY_DISPATCH_UNIT`   | `vroxy-dispatch-feedback-agent.service` |
 | `VROXY_DISPATCH_RESTART_DELAY` | `5` (seconds before a self-restart fires) |
 | `VROXY_DISPATCH_STATE_DIR` | `~/.cache/vroxy-dispatch`        |
+
+## Updating from a release
+
+The server answers heartbeats with a `version.current` frame naming the
+latest release, its commit sha and its severity (`patch` / `minor` /
+`major`). Dispatch updates the checkout it runs from in two cases:
+
+- **Someone pressed "Update now"** at `/w/…/dispatch` (an
+  `update.requested` frame addressed to this agent). Always attempted.
+- **`DISPATCH_AUTO_UPDATE=1`** and the release is `patch` or `minor`,
+  newer than the running version, and no task is in flight. A `major`
+  release never applies itself. Each release sha is tried at most once
+  — attempts are remembered in `$VROXY_DISPATCH_STATE_DIR/update-attempts.json`,
+  so a refused or failed release is not retried on every heartbeat.
+
+An update is `git fetch origin` then `git merge --ff-only <release sha>`
+— exactly the pinned commit, never the branch tip, never `git pull`. It
+is REFUSED when the sha is malformed, unknown, not on
+`origin/<current branch>`, when HEAD is detached, when a tracked file
+has uncommitted changes, or when the branch has commits the release
+does not (not a fast-forward). Untracked files do not block it: git's
+own merge refuses to overwrite one, which reports `failed` and leaves
+it untouched. When `requirements.txt` or `pyproject.toml` changed, it
+runs `python -m pip install --quiet -r requirements.txt` with the
+interpreter dispatch runs under (the venv install.sh made). A failed
+install, or a release that does not byte-compile, is rolled back to the
+previous commit. Every git and pip call is bounded by the 90 s stall
+cap.
+
+Dispatch reports the outcome with the `update_result` cable action
+(`updated` / `up_to_date` / `refused` / `failed`, a reason, from and to
+versions); the server posts the room line. An `updated` checkout then
+restarts through the same self-restart path a self-edit uses, after
+the task in flight if there is one, so queued work is spooled and
+replayed.
 
 ## Which CLI does the work
 

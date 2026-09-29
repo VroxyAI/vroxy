@@ -176,6 +176,7 @@ LOG_FILE=${HERE}/log/dispatch-${id}.log
 LOG_LEVEL=INFO
 PYTHONUNBUFFERED=1
 PATH=${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
+# DISPATCH_AUTO_UPDATE=0
 ENVFILE
   [[ -z "${DISPATCH_ENGINE:-}" ]] \
     || echo "DISPATCH_ENGINE=${DISPATCH_ENGINE}" | sudo tee -a "$env_file" >/dev/null

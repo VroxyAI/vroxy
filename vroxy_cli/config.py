@@ -33,6 +33,27 @@ def save(host, token, email=None):
     return CREDENTIALS
 
 
+def notice_path():
+    return CONFIG_DIR / "update-notice.json"
+
+
+def load_notice():
+    try:
+        state = json.loads(notice_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def save_notice(state):
+    path = notice_path()
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path.touch(mode=0o600, exist_ok=True)
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    path.write_text(json.dumps(state) + "\n")
+    return path
+
+
 def clear():
     try:
         CREDENTIALS.unlink()

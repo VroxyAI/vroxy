@@ -419,5 +419,92 @@ class ReadClientTest(unittest.TestCase):
             self.assertEqual(self.capture(call)["url"], f"https://x.test/api/mobile/v1{path}")
 
 
+class _HeaderResponse(BytesIO):
+    def __init__(self, payload, headers):
+        super().__init__(json.dumps(payload).encode())
+        self.headers = headers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class VersionHeaderTest(unittest.TestCase):
+    def setUp(self):
+        from pathlib import Path
+        self.dir = Path(tempfile.mkdtemp())
+        for name, value in (("CONFIG_DIR", self.dir),
+                            ("CREDENTIALS", self.dir / "credentials.json")):
+            patcher = mock.patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.seen = []
+
+    def serve(self, latest):
+        def fake(req, timeout=None):
+            self.seen.append(req)
+            headers = {"X-Vroxy-Client-Latest": latest} if latest else {}
+            return _HeaderResponse({"workspaces": []}, headers)
+        return mock.patch("urllib.request.urlopen", side_effect=fake)
+
+    def run_cli(self, latest, now=None):
+        out, err = StringIO(), StringIO()
+        config.save("https://x.test", "tok")
+        clock = mock.patch("vroxy_cli.client.time.time", return_value=now or 1_000_000.0)
+        with self.serve(latest), clock, mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            main(["--json", "workspaces"])
+        return out.getvalue(), err.getvalue()
+
+    def test_every_request_names_the_client_and_its_version(self):
+        with self.serve(None):
+            Client(host="https://x.test", token="t").workspaces()
+        from vroxy_cli.version import VERSION
+        self.assertEqual(self.seen[0].get_header("X-vroxy-client"), f"vroxy-cli/{VERSION}")
+
+    def test_the_header_rides_unauthenticated_calls_too(self):
+        with self.serve(None):
+            Client(host="https://x.test").login("a@b.co", "pw")
+        self.assertTrue(self.seen[0].get_header("X-vroxy-client").startswith("vroxy-cli/"))
+
+    def test_a_newer_release_is_announced_once_on_stderr_never_stdout(self):
+        out, err = self.run_cli("99.0.0")
+
+        self.assertIn("vroxy 99.0.0 is available (you have", err)
+        self.assertIn("update the vroxy_dispatch checkout", err)
+        self.assertEqual(1, len(err.strip().splitlines()))
+        self.assertNotIn("available", out)
+        json.loads(out)
+
+        _, again = self.run_cli("99.0.0", now=1_000_000.0 + 3600)
+        self.assertEqual("", again, "once per 24h, not once per command")
+
+        _, next_day = self.run_cli("99.0.0", now=1_000_000.0 + 24 * 3600 + 1)
+        self.assertIn("99.0.0 is available", next_day)
+
+    def test_the_remembered_notice_is_not_world_readable(self):
+        self.run_cli("99.0.0")
+        mode = stat.S_IMODE(os.stat(config.notice_path()).st_mode)
+        self.assertEqual(mode, 0o600, f"notice file was {oct(mode)}")
+
+    def test_same_or_older_or_garbage_says_nothing(self):
+        from vroxy_cli.version import VERSION
+        for latest in (VERSION, "0.0.1", "not-a-version", "1.2", ""):
+            _, err = self.run_cli(latest)
+            self.assertEqual("", err, latest)
+        self.assertFalse(config.notice_path().exists())
+
+    def test_an_error_response_can_still_carry_the_notice(self):
+        headers = {"X-Vroxy-Client-Latest": "99.0.0"}
+        error = urllib.error.HTTPError("http://x", 403, "err", headers,
+                                       BytesIO(json.dumps({"error": "nope"}).encode()))
+        err = StringIO()
+        with mock.patch("urllib.request.urlopen", side_effect=error), mock.patch("sys.stderr", err):
+            with self.assertRaises(VroxyError):
+                Client(host="https://x.test", token="t").me()
+        self.assertIn("99.0.0 is available", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

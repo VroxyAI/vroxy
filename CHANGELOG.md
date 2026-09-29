@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.48.0
+
+### Added
+- Dispatch updates its own checkout from a release: `update.requested`
+  ("Update now" at `/w/…/dispatch`) always tries, and
+  `DISPATCH_AUTO_UPDATE=1` (default off) applies patch/minor releases
+  from the `version.current` frame while idle — never a major, and each
+  release sha at most once. `git fetch` + `git merge --ff-only <sha>`
+  to exactly the pinned commit; refused on a dirty tracked file, a
+  detached HEAD, a sha not on `origin/<branch>`, or a non-fast-forward.
+  Deps reinstall when `requirements.txt` / `pyproject.toml` changed; a
+  failed install or a non-compiling release rolls back. The outcome
+  goes to the server as `update_result`, then the existing self-restart
+  path runs.
+- The `vroxy` CLI sends `X-Vroxy-Client: vroxy-cli/<version>` and, when
+  the server's `X-Vroxy-Client-Latest` is newer, prints one line to
+  stderr at most once a day (remembered in `update-notice.json`, 0600).
+
+### Changed
+- The CLI version (`vroxy_cli/version.py`) and `pyproject.toml` now
+  carry the same number as `AGENT_VERSION` (they were 0.35.0 / 0.45.2);
+  a test keeps the three in step.
+
 ## 0.47.0
 
 ### Added

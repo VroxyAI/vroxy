@@ -107,6 +107,8 @@ _last_model: str | None = None
 # it.  Opting out has to mean the data stops existing.
 TELEMETRY_ENABLED = os.environ.get(
     "DISPATCH_TELEMETRY", "1").strip().lower() not in ("0", "false", "no", "off")
+AUTO_UPDATE_ENABLED = os.environ.get(
+    "DISPATCH_AUTO_UPDATE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Self-update: dispatch edits its own checkout often enough that a
 # run can leave the process running code that no longer exists on
@@ -132,6 +134,8 @@ RESTART_NOTICE_PATH = STATE_DIR / "restart-notice.json"
 # so anything still on it when systemd stops the unit is gone with no
 # trace — the asker just never hears back.
 WORK_SPOOL_PATH = STATE_DIR / "work-spool.json"
+UPDATE_ATTEMPTS_PATH = STATE_DIR / "update-attempts.json"
+UPDATE_ATTEMPTS_MAX = 20
 WORK_SPOOL_MAX = 50
 # Replaying a question from an hour ago is worse than dropping it:
 # the answer arrives with no context and the asker has moved on.
@@ -141,7 +145,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.47.0"
+AGENT_VERSION      = "vroxy_dispatch 0.48.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -3828,6 +3832,284 @@ async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
                          reply_to)
 
 
+DISPATCH_CHECKOUT = Path(__file__).resolve().parent
+AUTO_UPDATE_SEVERITIES = ("patch", "minor")
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_CREDENTIAL_IN_URL_RE = re.compile(r"://[^/@\s]+@")
+_latest_release: dict | None = None
+_update_lock = threading.Lock()
+_update_tasks: set[asyncio.Task] = set()
+
+
+def _version_number(text: str) -> str:
+    found = re.search(r"(\d+(?:\.\d+)*)\s*$", text or "")
+    return found.group(1) if found else ""
+
+
+def _version_tuple(text: str) -> tuple[int, ...] | None:
+    number = _version_number(text)
+    if not number:
+        return None
+    return tuple(int(part) for part in number.split("."))
+
+
+def _version_in(path: Path) -> str:
+    try:
+        found = _AGENT_VERSION_RE.search(path.read_text(encoding="utf-8"))
+    except OSError:
+        return ""
+    return _version_number(found.group(1)) if found else ""
+
+
+def _scrub(text: str, limit: int = 400) -> str:
+    cleaned = _CREDENTIAL_IN_URL_RE.sub("://***@", text or "").strip()
+    return cleaned[-limit:]
+
+
+def _git_update(args: list[str], cwd: Path) -> tuple[int, str, str]:
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                           text=True, timeout=STALL_SECONDS)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"git {args[0]} timed out after {STALL_SECONDS}s"
+    except OSError as e:
+        return 127, "", f"{type(e).__name__}: {e}"
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def install_dependencies(root: Path) -> tuple[bool, str]:
+    cmd = [sys.executable, "-m", "pip", "install", "--quiet",
+           "-r", str(root / "requirements.txt")]
+    try:
+        r = subprocess.run(cmd, cwd=root, capture_output=True, text=True,
+                           timeout=STALL_SECONDS)
+    except subprocess.TimeoutExpired:
+        return False, f"pip install timed out after {STALL_SECONDS}s"
+    except OSError as e:
+        return False, f"{type(e).__name__}: {e}"
+    return r.returncode == 0, (r.stderr or r.stdout or "").strip()
+
+
+def compiles_at(path: Path) -> tuple[bool, str]:
+    try:
+        r = subprocess.run([sys.executable, "-m", "py_compile", str(path)],
+                           capture_output=True, text=True, timeout=STALL_SECONDS)
+    except subprocess.TimeoutExpired:
+        return False, f"py_compile timed out after {STALL_SECONDS}s"
+    return r.returncode == 0, (r.stderr or r.stdout or "").strip()
+
+
+DEPENDENCY_FILES = ("requirements.txt", "pyproject.toml")
+
+
+def apply_update(release_sha: str, latest: str = "",
+                 checkout: Path | None = None) -> dict:
+    if not _update_lock.acquire(blocking=False):
+        return {"status": "refused", "reason": "an update is already running"}
+    try:
+        return _apply_update(release_sha, latest, checkout or DISPATCH_CHECKOUT)
+    finally:
+        _update_lock.release()
+
+
+def _apply_update(release_sha: str, latest: str, checkout: Path) -> dict:
+    sha = (release_sha or "").strip().lower()
+    rc, root_out, err = _git_update(["rev-parse", "--show-toplevel"], checkout)
+    if rc != 0:
+        return {"status": "failed", "reason": f"not a git checkout: {_scrub(err)}"}
+    root = Path(root_out)
+    agent_file = root / "feedback_agent.py"
+    from_version = _version_in(agent_file) or _version_number(AGENT_VERSION)
+    result = {"from_version": from_version, "to_version": from_version}
+
+    def refused(reason: str) -> dict:
+        return {**result, "status": "refused", "reason": reason}
+
+    def failed(reason: str, stderr: str = "") -> dict:
+        detail = f"{reason}: {_scrub(stderr)}" if stderr else reason
+        return {**result, "status": "failed", "reason": detail}
+
+    if not _SHA_RE.match(sha):
+        return refused(f"release sha {release_sha!r} is not a 40-character hex commit id")
+    if _restart_scheduled:
+        return refused("a restart is already pending")
+
+    rc, branch, err = _git_update(["symbolic-ref", "--quiet", "--short", "HEAD"], root)
+    if rc != 0 or not branch:
+        return refused("the checkout is on a detached HEAD, not a branch")
+
+    rc, _, err = _git_update(["fetch", "--quiet", "origin"], root)
+    if rc != 0:
+        return failed("git fetch origin failed", err)
+
+    rc, _, _ = _git_update(["cat-file", "-e", f"{sha}^{{commit}}"], root)
+    if rc != 0:
+        return refused(f"{sha[:12]} is not a commit known to origin")
+    rc, _, _ = _git_update(["merge-base", "--is-ancestor", sha, f"origin/{branch}"], root)
+    if rc != 0:
+        return refused(f"{sha[:12]} is not on origin/{branch}")
+
+    rc, old_head, err = _git_update(["rev-parse", "HEAD"], root)
+    if rc != 0:
+        return failed("could not read HEAD", err)
+    rc, _, _ = _git_update(["merge-base", "--is-ancestor", sha, "HEAD"], root)
+    if rc == 0:
+        return {**result, "status": "up_to_date",
+                "reason": f"already at or past {latest or sha[:12]}"}
+
+    rc, dirty, err = _git_update(["status", "--porcelain", "--untracked-files=no"], root)
+    if rc != 0:
+        return failed("git status failed", err)
+    if dirty:
+        count = len(dirty.splitlines())
+        return refused(f"the checkout has uncommitted changes to {count} tracked file(s)")
+
+    rc, _, _ = _git_update(["merge-base", "--is-ancestor", "HEAD", sha], root)
+    if rc != 0:
+        return refused(f"{branch} has commits that {sha[:12]} does not — not a fast-forward")
+
+    rc, changed, err = _git_update(["diff", "--name-only", old_head, sha, "--",
+                                    *DEPENDENCY_FILES], root)
+    if rc != 0:
+        return failed("git diff failed", err)
+
+    rc, _, err = _git_update(["merge", "--ff-only", "--quiet", sha], root)
+    if rc != 0:
+        return failed("git merge --ff-only failed", err)
+
+    def roll_back(reason: str, detail: str) -> dict:
+        back, _, back_err = _git_update(["reset", "--keep", old_head], root)
+        if back != 0:
+            return failed(f"{reason}, and rolling back to {old_head[:12]} failed",
+                          f"{detail} / {back_err}")
+        return failed(f"{reason}; rolled back to {old_head[:12]}", detail)
+
+    if changed:
+        ok, detail = install_dependencies(root)
+        if not ok:
+            return roll_back("installing dependencies failed", detail)
+
+    ok, detail = compiles_at(agent_file)
+    if not ok:
+        return roll_back(f"{sha[:12]} does not compile", detail)
+
+    to_version = _version_in(agent_file) or latest or sha[:12]
+    log.info("updated the checkout %s → %s (%s)", from_version, to_version, sha[:12])
+    return {"status": "updated", "reason": f"fast-forwarded to {sha[:12]}",
+            "from_version": from_version, "to_version": to_version,
+            "dependencies_installed": bool(changed)}
+
+
+async def send_update_result(link, result: dict) -> None:
+    await cable_send(link, "message", {
+        "action":       "update_result",
+        "status":       result.get("status"),
+        "reason":       result.get("reason") or "",
+        "from_version": result.get("from_version") or _version_number(AGENT_VERSION),
+        "to_version":   result.get("to_version") or "",
+    })
+
+
+async def restart_after_update(link) -> None:
+    global _restart_pending
+    if _restart_pending is None:
+        _restart_pending = {"room_id": None, "reply_to": None}
+    if _current_work is not None:
+        log.info("update applied — restarting once the current task finishes")
+        return
+    await restart_if_self_updated(link, "update", {})
+
+
+async def perform_update(link, release_sha: str, latest: str = "", *,
+                         announce_up_to_date: bool = True) -> dict:
+    try:
+        result = await asyncio.to_thread(apply_update, release_sha, latest)
+    except Exception as e:
+        log.exception("update to %s crashed", release_sha)
+        result = {"status": "failed", "reason": _scrub(f"{type(e).__name__}: {e}")}
+    log.info("update %s: %s", result.get("status"), result.get("reason"))
+    if result.get("status") != "up_to_date" or announce_up_to_date:
+        await send_update_result(link, result)
+    if result.get("status") == "updated":
+        await restart_after_update(link)
+    return result
+
+
+def load_update_attempts() -> list[str]:
+    try:
+        attempts = json.loads(UPDATE_ATTEMPTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [a for a in attempts if isinstance(a, str)] if isinstance(attempts, list) else []
+
+
+def record_update_attempt(sha: str) -> None:
+    attempts = [a for a in load_update_attempts() if a != sha] + [sha]
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        UPDATE_ATTEMPTS_PATH.write_text(
+            json.dumps(attempts[-UPDATE_ATTEMPTS_MAX:]), encoding="utf-8")
+    except OSError as e:
+        log.warning("could not record the update attempt: %s", e)
+
+
+def note_latest_release(msg: dict) -> None:
+    global _latest_release
+    _latest_release = {
+        "latest":      str(msg.get("latest") or ""),
+        "release_sha": str(msg.get("release_sha") or "").strip().lower(),
+        "severity":    str(msg.get("severity") or "none"),
+        "at":          time.time(),
+    }
+
+
+def auto_update_due(msg: dict) -> bool:
+    if not AUTO_UPDATE_ENABLED:
+        return False
+    if (msg.get("severity") or "") not in AUTO_UPDATE_SEVERITIES:
+        return False
+    if _current_work is not None or _restart_scheduled or _update_lock.locked():
+        return False
+    sha = str(msg.get("release_sha") or "").strip().lower()
+    if not _SHA_RE.match(sha):
+        return False
+    ours, theirs = _version_tuple(AGENT_VERSION), _version_tuple(str(msg.get("latest") or ""))
+    if ours and theirs and theirs <= ours:
+        return False
+    return sha not in load_update_attempts()
+
+
+def _spawn_update(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _update_tasks.add(task)
+    task.add_done_callback(_update_tasks.discard)
+    return task
+
+
+def handle_update_frame(link, msg: dict) -> asyncio.Task | None:
+    kind = msg.get("type")
+    if kind == "version.current":
+        note_latest_release(msg)
+        if not auto_update_due(msg):
+            return None
+        sha = str(msg.get("release_sha") or "").strip().lower()
+        record_update_attempt(sha)
+        log.info("auto-updating to %s (%s, %s)", msg.get("latest"), sha[:12], msg.get("severity"))
+        return _spawn_update(perform_update(
+            link, sha, str(msg.get("latest") or ""), announce_up_to_date=False))
+    if kind == "update.requested":
+        if not _is_ours(msg):
+            agent = msg.get("agent") or {}
+            log.info("update.requested for %s (%s) — not this engine (%s), leaving it",
+                     agent.get("name"), agent.get("kind"), DISPATCH_ENGINE)
+            return None
+        who = (msg.get("requested_by") or {}).get("name") or "someone"
+        log.info("update to %s requested by %s", msg.get("latest"), who)
+        return _spawn_update(perform_update(
+            link, str(msg.get("release_sha") or ""), str(msg.get("latest") or "")))
+    return None
+
+
 # ── Surviving a stop ──────────────────────────────────────────────
 # systemd stops a unit by killing its whole cgroup.  Whatever the
 # worker was running dies with it, and whatever was still queued dies
@@ -5115,6 +5397,8 @@ async def process_stream(link: CableLink, ws) -> None:
                                      edited.get("hashid"), edited.get("body") or ""):
                     log.info("queued task updated after an edit message=%s",
                              edited.get("hashid"))
+            elif msg.get("type") in ("version.current", "update.requested"):
+                handle_update_frame(link, msg)
             elif msg.get("type") == "room_reply.posted":
                 note_posted_message(msg.get("room_id"), msg.get("message_id"))
             else:
