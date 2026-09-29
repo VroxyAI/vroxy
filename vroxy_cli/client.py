@@ -58,9 +58,9 @@ class Client:
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 raw = resp.read().decode()
-                announce_if_newer(_header(resp, LATEST_HEADER))
+                _notice_quietly(resp)
         except urllib.error.HTTPError as e:
-            announce_if_newer(_header(e, LATEST_HEADER))
+            _notice_quietly(e)
             raw = e.read().decode()
             payload = _safe_json(raw)
             message = payload.get("error") or f"HTTP {e.code}"
@@ -203,11 +203,21 @@ def _header(response, name):
         return None
 
 
+def _notice_quietly(response):
+    try:
+        announce_if_newer(_header(response, LATEST_HEADER))
+    except Exception:
+        return
+
+
 def _version_tuple(text):
     parts = str(text or "").strip().split(".")
-    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+    if len(parts) != 3 or not all(p.isascii() and p.isdigit() for p in parts):
         return None
-    return tuple(int(p) for p in parts)
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return None
 
 
 def announce_if_newer(latest, now=None, stream=None):

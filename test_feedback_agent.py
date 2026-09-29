@@ -2654,9 +2654,14 @@ class ReleaseRepoTestCase(unittest.TestCase):
         _git(["config", "user.name", "Test"], self.checkout)
 
         self.installs = []
-        saved_install = fa.install_dependencies
-        fa.install_dependencies = lambda root: (self.installs.append(root), (True, ""))[1]
-        self.addCleanup(setattr, fa, "install_dependencies", saved_install)
+        self.live_venv = self.checkout / ".venv"
+        self.live_venv.mkdir()
+        (self.live_venv / "marker").write_text("old")
+        saved_venv = (fa.build_staging_venv, fa.running_venv, fa.INSTALL_ID)
+        self.addCleanup(self._restore_venv, saved_venv)
+        fa.build_staging_venv = self.fake_staging
+        fa.running_venv = lambda: self.live_venv
+        fa.INSTALL_ID = "install-a"
         saved_flags = (fa._restart_scheduled, fa._restart_pending)
         self.addCleanup(self._restore_flags, saved_flags)
         fa._restart_scheduled = False
@@ -2664,6 +2669,16 @@ class ReleaseRepoTestCase(unittest.TestCase):
 
     def _restore_flags(self, saved):
         fa._restart_scheduled, fa._restart_pending = saved
+
+    def _restore_venv(self, saved):
+        fa.build_staging_venv, fa.running_venv, fa.INSTALL_ID = saved
+
+    def fake_staging(self, root, requirements):
+        self.installs.append(requirements)
+        staging = Path(root) / ".venv.next"
+        staging.mkdir()
+        (staging / "marker").write_text("new")
+        return True, ""
 
     def release(self, version, requirements=None, extra=None):
         (self.publisher / "feedback_agent.py").write_text(_agent_source(version))
@@ -2703,22 +2718,61 @@ class ApplyUpdateTest(ReleaseRepoTestCase):
 
         self.assertEqual("updated", result["status"], result)
         self.assertEqual(1, len(self.installs))
+        self.assertIn("websockets>=13.0", self.installs[0], "the RELEASE's requirements")
+        self.assertEqual("new", (self.live_venv / "marker").read_text())
+        self.assertEqual("old", (self.checkout / ".venv.prev" / "marker").read_text())
+        self.assertFalse((self.checkout / ".venv.next").exists())
+
+    def test_only_one_previous_venv_is_kept(self):
+        self.assertEqual("updated", self.apply(self.release("1.0.1", requirements="a\n"))["status"])
+        self.assertEqual("updated", self.apply(self.release("1.0.2", requirements="b\n"))["status"])
+        siblings = sorted(p.name for p in self.checkout.iterdir() if p.name.startswith(".venv"))
+        self.assertEqual([".venv", ".venv.prev"], siblings)
+
+    def test_changed_dependencies_outside_the_checkout_venv_are_refused(self):
+        sha = self.release("1.0.1", requirements="websockets==13.1\n")
+        fa.running_venv = lambda: Path("/usr")
+        before = self.head()
+
+        result = self.apply(sha)
+
+        self.assertEqual("refused", result["status"])
+        self.assertIn("install.sh --update", result["reason"])
+        self.assertEqual(before, self.head())
 
     def test_a_pyproject_change_also_reinstalls(self):
         sha = self.release("1.0.1", extra=("pyproject.toml", "[project]\nname='x'\n"))
         self.assertEqual("updated", self.apply(sha)["status"])
         self.assertEqual(1, len(self.installs))
 
-    def test_a_failed_dependency_install_rolls_back(self):
+    def test_a_failed_dependency_install_changes_nothing(self):
         before = self.head()
         sha = self.release("1.0.1", requirements="nope==0\n")
-        fa.install_dependencies = lambda root: (False, "no matching distribution")
+        fa.build_staging_venv = lambda root, req: (False, "no matching distribution")
 
         result = self.apply(sha)
 
         self.assertEqual("failed", result["status"])
         self.assertIn("no matching distribution", result["reason"])
         self.assertEqual(before, self.head())
+        self.assertEqual("old", (self.live_venv / "marker").read_text())
+        self.assertFalse((self.checkout / ".venv.prev").exists())
+
+    def test_a_release_that_fails_after_staging_leaves_the_live_venv_alone(self):
+        before = self.head()
+        (self.publisher / "feedback_agent.py").write_text(
+            _agent_source("1.0.1") + "def broken(:\n")
+        (self.publisher / "requirements.txt").write_text("changed\n")
+        _git(["commit", "-qam", "broken"], self.publisher)
+        _git(["push", "-q", "origin", "main"], self.publisher)
+
+        result = self.apply(_git_out(["rev-parse", "HEAD"], self.publisher))
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual(before, self.head())
+        self.assertEqual("old", (self.live_venv / "marker").read_text())
+        self.assertFalse((self.checkout / ".venv.next").exists())
+        self.assertFalse((self.checkout / ".venv.prev").exists())
 
     def test_a_release_that_does_not_compile_rolls_back(self):
         before = self.head()
@@ -2821,9 +2875,112 @@ class ApplyUpdateTest(ReleaseRepoTestCase):
         fa._restart_scheduled = True
         self.assertEqual("refused", self.apply(sha)["status"])
 
+    def test_a_replace_ref_cannot_stand_in_for_the_pinned_commit(self):
+        pinned = self.release("1.0.1")
+        (self.publisher / "feedback_agent.py").write_text(_agent_source("6.6.6"))
+        _git(["commit", "-qam", "evil"], self.publisher)
+        _git(["push", "-q", "origin", "HEAD:refs/heads/evil"], self.publisher)
+        evil = _git_out(["rev-parse", "HEAD"], self.publisher)
+        _git(["fetch", "-q", "origin"], self.checkout)
+        _git(["replace", pinned, evil], self.checkout)
+        before = self.head()
+
+        result = self.apply(pinned)
+
+        self.assertEqual("refused", result["status"])
+        self.assertIn("refs/replace", result["reason"])
+        self.assertEqual(before, self.head())
+        self.assertIn("1.0.0", (self.checkout / "feedback_agent.py").read_text())
+
+    def test_the_pin_is_rechecked_with_replace_objects_disabled(self):
+        pinned = self.release("1.0.1")
+        env_seen = []
+        real = fa.subprocess.run
+
+        def spy(cmd, *a, **kw):
+            if cmd and cmd[0] == "git":
+                env_seen.append((kw.get("env") or {}).get("GIT_NO_REPLACE_OBJECTS"))
+                self.assertIn("core.hooksPath=/dev/null", cmd)
+                self.assertIn("core.fsmonitor=false", cmd)
+            return real(cmd, *a, **kw)
+
+        fa.subprocess.run = spy
+        try:
+            result = self.apply(pinned)
+        finally:
+            fa.subprocess.run = real
+        self.assertEqual("updated", result["status"], result)
+        self.assertTrue(env_seen)
+        self.assertEqual({"1"}, set(env_seen))
+        self.assertEqual(pinned, self.head())
+
+    def test_a_planted_post_merge_hook_never_runs(self):
+        pinned = self.release("1.0.1")
+        canary = Path(self.tmp.name) / "hook-ran"
+        hook = self.checkout / ".git" / "hooks" / "post-merge"
+        hook.write_text(f"#!/bin/sh\ntouch {canary}\n")
+        hook.chmod(0o755)
+        hooks_dir = Path(self.tmp.name) / "evil-hooks"
+        hooks_dir.mkdir()
+        for name in ("post-merge", "reference-transaction", "post-checkout"):
+            planted = hooks_dir / name
+            planted.write_text(f"#!/bin/sh\ntouch {canary}\n")
+            planted.chmod(0o755)
+        _git(["config", "core.hooksPath", str(hooks_dir)], self.checkout)
+        _git(["config", "core.fsmonitor", f"touch {canary}"], self.checkout)
+
+        result = self.apply(pinned)
+
+        self.assertEqual("updated", result["status"], result)
+        self.assertFalse(canary.exists(), "a hook or fsmonitor ran during the update")
+
+    def test_a_local_filter_driver_is_refused(self):
+        pinned = self.release("1.0.1")
+        _git(["config", "filter.evil.smudge", "sh -c 'touch /tmp/x'"], self.checkout)
+        result = self.apply(pinned)
+        self.assertEqual("refused", result["status"])
+        self.assertIn("filter/merge drivers", result["reason"])
+
+    def test_another_process_holding_the_lock_is_refused(self):
+        pinned = self.release("1.0.1")
+        lock = self.checkout / ".git" / fa.UPDATE_LOCK_NAME
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl,os,sys,time\n"
+             f"fd=os.open({str(lock)!r},os.O_RDWR|os.O_CREAT,0o600)\n"
+             "fcntl.flock(fd,fcntl.LOCK_EX)\nprint('held',flush=True)\ntime.sleep(30)\n"],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.kill)
+        self.assertEqual("held", holder.stdout.readline().strip())
+
+        result = self.apply(pinned)
+
+        self.assertEqual("refused", result["status"])
+        self.assertIn("another update is running", result["reason"])
+        holder.kill()
+        holder.wait(timeout=10)
+        self.assertEqual("updated", self.apply(pinned)["status"])
+
     def test_credentials_in_git_output_are_scrubbed(self):
-        self.assertEqual("fatal: https://***@github.com/x",
-                         fa._scrub("fatal: https://user:tok3n@github.com/x"))
+        cases = {
+            "fatal: https://user:tok3n@github.com/x": "tok3n",
+            "fatal: https://x-access-token:p@ss@word@github.com/x": "word",
+            "remote: ghp_abcdefghijklmnopqrstuvwxyz0123456789 rejected": "ghp_",
+            "remote: github_pat_11ABCDEFG0123456789_abcdefghijkl bad": "github_pat_",
+            "gho_ABCDEFGHIJKLMNOPQRSTUV expired": "gho_",
+            "token pypi-AgEIcHlwaS5vcmcCJGFiY2RlZg rejected": "pypi-",
+            "Authorization: Bearer abc.def.ghi-jkl": "abc.def",
+            "header was Bearer sk-live-0123456789abcdef": "sk-live",
+        }
+        for raw, secret in cases.items():
+            self.assertNotIn(secret, fa._scrub(raw), raw)
+        self.assertIn("github.com/x", fa._scrub("fatal: https://a:b@c@github.com/x"))
+
+    def test_a_reason_is_the_last_300_characters(self):
+        reason = fa._reason("git fetch origin failed", "x" * 1000 + "the end")
+        self.assertEqual(300, len(reason))
+        self.assertTrue(reason.endswith("the end"))
 
 
 def update_results(link):
@@ -2860,6 +3017,8 @@ class PerformUpdateTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual("updated", results[0]["status"])
         self.assertEqual("1.0.0", results[0]["from_version"])
         self.assertEqual("1.0.1", results[0]["to_version"])
+        self.assertEqual({"install_id": "install-a"}, results[0]["agent"])
+        self.assertEqual({"install_id": "install-a"}, results[0]["meta"])
         self.assertEqual([1], self.restarts)
         self.assertTrue(fa._restart_scheduled)
         self.assertEqual([], sent_bodies(link), "the server posts the room line, not dispatch")
@@ -2995,6 +3154,13 @@ class AutoUpdateTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTestCase):
         sha = self.release("1.0.1")
         self.assertIsNone(await self.run_frame(fa.CableLink(), self.frame(sha)))
 
+    async def test_attempts_are_written_atomically(self):
+        for n in range(3):
+            fa.record_update_attempt(f"{n}" * 40)
+        self.assertEqual(["0" * 40, "1" * 40, "2" * 40], fa.load_update_attempts())
+        leftovers = [p.name for p in fa.STATE_DIR.iterdir() if p.name.endswith(".tmp")]
+        self.assertEqual([], leftovers)
+
     async def test_a_new_release_after_a_refused_one_is_still_tried(self):
         fa.AUTO_UPDATE_ENABLED = True
         fa.record_update_attempt("a" * 40)
@@ -3006,32 +3172,53 @@ class AutoUpdateTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTestCase):
 class UpdateRequestedRoutingTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         ReleaseRepoTestCase.setUp(self)
-        saved = (fa.DISPATCH_CHECKOUT, fa.schedule_restart, fa._current_work, fa.DISPATCH_ENGINE)
+        saved = (fa.DISPATCH_CHECKOUT, fa.schedule_restart, fa._current_work,
+                 fa._deferred_update, fa._work_queue)
         self.addCleanup(self._restore, saved)
         fa.DISPATCH_CHECKOUT = self.checkout
         fa._current_work = None
-        fa.DISPATCH_ENGINE = "claude"
-        fa.schedule_restart = lambda: (True, "unit-test")
+        fa._deferred_update = None
+        self.restarts = []
+        fa.schedule_restart = lambda: (self.restarts.append(1), (True, "unit-test"))[1]
 
     def _restore(self, saved):
         (fa.DISPATCH_CHECKOUT, fa.schedule_restart, fa._current_work,
-         fa.DISPATCH_ENGINE) = saved
+         fa._deferred_update, fa._work_queue) = saved
 
-    def frame(self, sha, kind="claude_code"):
+    def frame(self, sha, install_id="install-a", kind="claude_code"):
+        agent = {"hashid": "agt12345", "kind": kind, "name": "Agent"}
+        if install_id is not None:
+            agent["install_id"] = install_id
         return {"type": "update.requested", "latest": "1.0.1", "release_sha": sha,
-                "agent": {"kind": kind, "name": "Agent"},
-                "requested_by": {"name": "Will"}}
+                "agent": agent, "requested_by": {"name": "Will"}}
 
-    async def test_a_request_for_another_engine_is_left_alone(self):
+    async def test_two_agents_of_the_same_engine_only_the_named_one_acts(self):
         sha = self.release("1.0.1")
         link = fa.CableLink()
 
-        self.assertIsNone(fa.handle_update_frame(link, self.frame(sha, kind="codex")))
-
+        self.assertIsNone(fa.handle_update_frame(link, self.frame(sha, install_id="install-b")))
         self.assertNotEqual(sha, self.head())
         self.assertEqual([], link.outbox)
 
-    async def test_a_request_for_this_engine_applies_even_with_auto_update_off(self):
+        await fa.handle_update_frame(link, self.frame(sha, install_id="install-a"))
+        self.assertEqual(sha, self.head())
+
+    async def test_a_frame_without_an_install_id_is_ignored(self):
+        sha = self.release("1.0.1")
+        link = fa.CableLink()
+        with self.assertLogs(fa.log, level="INFO") as logs:
+            self.assertIsNone(fa.handle_update_frame(link, self.frame(sha, install_id=None)))
+        self.assertTrue(any("not this install" in line for line in logs.output))
+        self.assertNotEqual(sha, self.head())
+        self.assertEqual([], link.outbox)
+
+    async def test_an_install_without_an_id_never_acts(self):
+        sha = self.release("1.0.1")
+        fa.INSTALL_ID = ""
+        self.assertIsNone(fa.handle_update_frame(fa.CableLink(), self.frame(sha, install_id="")))
+        self.assertNotEqual(sha, self.head())
+
+    async def test_a_request_for_this_install_applies_even_with_auto_update_off(self):
         sha = self.release("1.0.1")
         link = fa.CableLink()
         saved = fa.AUTO_UPDATE_ENABLED
@@ -3042,7 +3229,10 @@ class UpdateRequestedRoutingTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTe
             fa.AUTO_UPDATE_ENABLED = saved
 
         self.assertEqual(sha, self.head())
-        self.assertEqual("updated", update_results(link)[0]["status"])
+        result = update_results(link)[0]
+        self.assertEqual("updated", result["status"])
+        self.assertEqual({"install_id": "install-a"}, result["agent"])
+        self.assertEqual({"install_id": "install-a"}, result["meta"])
 
     async def test_a_human_request_still_honours_the_refusals(self):
         sha = self.release("2.0.0")
@@ -3053,10 +3243,58 @@ class UpdateRequestedRoutingTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTe
 
         self.assertEqual("refused", update_results(link)[0]["status"])
 
+    async def test_a_request_while_busy_waits_and_says_nothing_until_applied(self):
+        sha = self.release("1.0.1")
+        fa._current_work = ("room", {})
+        link = fa.CableLink()
+
+        self.assertIsNone(fa.handle_update_frame(link, self.frame(sha)))
+        self.assertEqual([], link.outbox)
+        self.assertNotEqual(sha, self.head())
+
+        fa._current_work = None
+        await fa.run_deferred_update(link)
+        self.assertEqual(sha, self.head())
+        self.assertEqual("updated", update_results(link)[0]["status"])
+        self.assertIsNone(fa._deferred_update)
+
+    async def test_the_worker_applies_it_after_the_task_and_before_the_next(self):
+        sha = self.release("1.0.1")
+        link = fa.CableLink()
+        fa._work_queue = asyncio.Queue()
+        heads = []
+        second = asyncio.Event()
+
+        async def handler(_link, payload):
+            if payload.get("n") == 1:
+                self.assertIsNone(fa.handle_update_frame(link, self.frame(sha)))
+                heads.append(self.head())
+            else:
+                second.set()
+
+        original, fa.handle_room_message = fa.handle_room_message, handler
+        worker = asyncio.create_task(fa.worker_loop(link))
+        try:
+            await fa._work_queue.put(("room", {"n": 1}))
+            await fa._work_queue.put(("room", {"n": 2}))
+            for _ in range(200):
+                if self.restarts:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            worker.cancel()
+            fa.handle_room_message = original
+
+        self.assertNotEqual(sha, heads[0], "not applied mid-task")
+        self.assertEqual(sha, self.head())
+        self.assertEqual("updated", update_results(link)[0]["status"])
+        self.assertEqual([1], self.restarts)
+        self.assertFalse(second.is_set(), "the next task waits for the restart")
+
     async def test_process_stream_routes_the_frame(self):
         sha = self.release("1.0.1")
         link = fa.CableLink()
-        saved_queue, saved_hb = fa._work_queue, fa.heartbeat_forever
+        saved_hb = fa.heartbeat_forever
         fa._work_queue = asyncio.Queue()
 
         async def no_heartbeat(_ws):
@@ -3080,14 +3318,14 @@ class UpdateRequestedRoutingTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTe
                 return None
 
         try:
-            await fa.process_stream(link, Stream([self.frame(sha, kind="codex"),
+            await fa.process_stream(link, Stream([self.frame(sha, install_id="install-b"),
                                                   self.frame(sha)]))
             await asyncio.gather(*list(fa._update_tasks))
         finally:
-            fa._work_queue, fa.heartbeat_forever = saved_queue, saved_hb
+            fa.heartbeat_forever = saved_hb
 
         self.assertEqual(sha, self.head())
-        self.assertEqual(1, len(update_results(link)), "only the frame for this engine runs")
+        self.assertEqual(1, len(update_results(link)), "only the frame for this install runs")
 
 
 class ReleaseVersionsTest(unittest.TestCase):

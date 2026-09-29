@@ -57,6 +57,7 @@ import functools
 import logging
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -3834,9 +3835,38 @@ async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
 
 DISPATCH_CHECKOUT = Path(__file__).resolve().parent
 AUTO_UPDATE_SEVERITIES = ("patch", "minor")
+UPDATE_REASON_MAX = 300
+UPDATE_LOCK_NAME = "vroxy-dispatch-update.lock"
+VENV_DIR_NAME = ".venv"
+VENV_STAGING_NAME = ".venv.next"
+VENV_PREVIOUS_NAME = ".venv.prev"
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_CREDENTIAL_IN_URL_RE = re.compile(r"://[^/@\s]+@")
+_SECRET_PATTERNS = (
+    re.compile(r"://\S*@"),
+    re.compile(r"(?i)\bauthorization\s*[:=]\s*(?:\S+\s+)?\S+"),
+    re.compile(r"(?i)\b(?:bearer|basic|token)\s+[A-Za-z0-9._~+/=\-]{8,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{10,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{10,}"),
+    re.compile(r"\bpypi-[A-Za-z0-9_\-]{10,}"),
+)
+_GIT_HARDENING = (
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false",
+    "-c", "core.pager=cat",
+    "-c", "fetch.recurseSubmodules=false",
+    "-c", "submodule.recurse=false",
+    "-c", "gc.auto=0",
+    "-c", "maintenance.auto=false",
+)
+_GIT_HARDENED_ENV = {
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_GRAFT_FILE": os.devnull,
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
+_CONFIG_DRIVERS_RE = r"^(filter|merge)\..*\.(clean|smudge|process|driver)$"
 _latest_release: dict | None = None
+_deferred_update: dict | None = None
 _update_lock = threading.Lock()
 _update_tasks: set[asyncio.Task] = set()
 
@@ -3850,7 +3880,10 @@ def _version_tuple(text: str) -> tuple[int, ...] | None:
     number = _version_number(text)
     if not number:
         return None
-    return tuple(int(part) for part in number.split("."))
+    try:
+        return tuple(int(part) for part in number.split("."))
+    except ValueError:
+        return None
 
 
 def _version_in(path: Path) -> str:
@@ -3861,15 +3894,24 @@ def _version_in(path: Path) -> str:
     return _version_number(found.group(1)) if found else ""
 
 
-def _scrub(text: str, limit: int = 400) -> str:
-    cleaned = _CREDENTIAL_IN_URL_RE.sub("://***@", text or "").strip()
-    return cleaned[-limit:]
+def _scrub(text: str) -> str:
+    cleaned = text or ""
+    for pattern in _SECRET_PATTERNS:
+        cleaned = pattern.sub(lambda m: "://***@" if m.group(0).startswith("://") else "***",
+                              cleaned)
+    return cleaned.strip()
+
+
+def _reason(summary: str, detail: str = "") -> str:
+    text = f"{summary}: {detail.strip()}" if detail and detail.strip() else summary
+    return _scrub(text)[-UPDATE_REASON_MAX:]
 
 
 def _git_update(args: list[str], cwd: Path) -> tuple[int, str, str]:
+    env = {**os.environ, **_GIT_HARDENED_ENV}
     try:
-        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
-                           text=True, timeout=STALL_SECONDS)
+        r = subprocess.run(["git", *_GIT_HARDENING, *args], cwd=cwd, env=env,
+                           capture_output=True, text=True, timeout=STALL_SECONDS)
     except subprocess.TimeoutExpired:
         return 124, "", f"git {args[0]} timed out after {STALL_SECONDS}s"
     except OSError as e:
@@ -3877,26 +3919,78 @@ def _git_update(args: list[str], cwd: Path) -> tuple[int, str, str]:
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
-def install_dependencies(root: Path) -> tuple[bool, str]:
-    cmd = [sys.executable, "-m", "pip", "install", "--quiet",
-           "-r", str(root / "requirements.txt")]
+@contextlib.contextmanager
+def _checkout_update_lock(root: Path):
+    import fcntl
+    rc, common, _ = _git_update(["rev-parse", "--git-common-dir"], root)
+    git_dir = (root / common).resolve() if rc == 0 and common else root / ".git"
+    fd = os.open(str(git_dir / UPDATE_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        r = subprocess.run(cmd, cwd=root, capture_output=True, text=True,
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def running_venv() -> Path:
+    return Path(sys.prefix)
+
+
+def _run_bounded(cmd: list[str], cwd: Path) -> tuple[bool, str]:
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                            timeout=STALL_SECONDS)
     except subprocess.TimeoutExpired:
-        return False, f"pip install timed out after {STALL_SECONDS}s"
+        return False, f"{Path(cmd[0]).name} {cmd[2] if len(cmd) > 2 else ''} " \
+                      f"timed out after {STALL_SECONDS}s"
     except OSError as e:
         return False, f"{type(e).__name__}: {e}"
     return r.returncode == 0, (r.stderr or r.stdout or "").strip()
 
 
-def compiles_at(path: Path) -> tuple[bool, str]:
+def build_staging_venv(root: Path, requirements: str) -> tuple[bool, str]:
+    staging = root / VENV_STAGING_NAME
+    shutil.rmtree(staging, ignore_errors=True)
+    ok, detail = _run_bounded([sys.executable, "-m", "venv", str(staging)], root)
+    if not ok:
+        shutil.rmtree(staging, ignore_errors=True)
+        return False, f"creating {VENV_STAGING_NAME}: {detail}"
+    pinned = staging / "requirements.txt"
+    pinned.write_text(requirements, encoding="utf-8")
+    ok, detail = _run_bounded(
+        [str(staging / "bin" / "python"), "-m", "pip", "install", "--quiet",
+         "--disable-pip-version-check", "--only-binary", ":all:", "-r", str(pinned)], root)
+    if not ok:
+        shutil.rmtree(staging, ignore_errors=True)
+        return False, f"installing dependencies: {detail}"
+    return True, ""
+
+
+def swap_staging_venv(root: Path) -> tuple[bool, str]:
+    live, staging, previous = (root / VENV_DIR_NAME, root / VENV_STAGING_NAME,
+                               root / VENV_PREVIOUS_NAME)
     try:
-        r = subprocess.run([sys.executable, "-m", "py_compile", str(path)],
-                           capture_output=True, text=True, timeout=STALL_SECONDS)
-    except subprocess.TimeoutExpired:
-        return False, f"py_compile timed out after {STALL_SECONDS}s"
-    return r.returncode == 0, (r.stderr or r.stdout or "").strip()
+        shutil.rmtree(previous, ignore_errors=True)
+        if live.exists():
+            os.replace(live, previous)
+        os.replace(staging, live)
+    except OSError as e:
+        if not live.exists() and previous.exists():
+            with contextlib.suppress(OSError):
+                os.replace(previous, live)
+        return False, f"{type(e).__name__}: {e}"
+    return True, ""
+
+
+def compiles_at(path: Path) -> tuple[bool, str]:
+    return _run_bounded([sys.executable, "-m", "py_compile", str(path)], path.parent)
 
 
 DEPENDENCY_FILES = ("requirements.txt", "pyproject.toml")
@@ -3905,40 +3999,52 @@ DEPENDENCY_FILES = ("requirements.txt", "pyproject.toml")
 def apply_update(release_sha: str, latest: str = "",
                  checkout: Path | None = None) -> dict:
     if not _update_lock.acquire(blocking=False):
-        return {"status": "refused", "reason": "an update is already running"}
+        return {"status": "refused", "reason": "another update is running"}
     try:
-        return _apply_update(release_sha, latest, checkout or DISPATCH_CHECKOUT)
+        rc, root_out, err = _git_update(["rev-parse", "--show-toplevel"],
+                                        checkout or DISPATCH_CHECKOUT)
+        if rc != 0:
+            return {"status": "failed", "reason": _reason("not a git checkout", err)}
+        root = Path(root_out)
+        with _checkout_update_lock(root) as held:
+            if not held:
+                return {"status": "refused", "reason": "another update is running"}
+            return _apply_update(release_sha, latest, root)
     finally:
         _update_lock.release()
 
 
-def _apply_update(release_sha: str, latest: str, checkout: Path) -> dict:
+def _apply_update(release_sha: str, latest: str, root: Path) -> dict:
     sha = (release_sha or "").strip().lower()
-    rc, root_out, err = _git_update(["rev-parse", "--show-toplevel"], checkout)
-    if rc != 0:
-        return {"status": "failed", "reason": f"not a git checkout: {_scrub(err)}"}
-    root = Path(root_out)
     agent_file = root / "feedback_agent.py"
     from_version = _version_in(agent_file) or _version_number(AGENT_VERSION)
     result = {"from_version": from_version, "to_version": from_version}
 
     def refused(reason: str) -> dict:
-        return {**result, "status": "refused", "reason": reason}
+        return {**result, "status": "refused", "reason": _reason(reason)}
 
     def failed(reason: str, stderr: str = "") -> dict:
-        detail = f"{reason}: {_scrub(stderr)}" if stderr else reason
-        return {**result, "status": "failed", "reason": detail}
+        return {**result, "status": "failed", "reason": _reason(reason, stderr)}
 
     if not _SHA_RE.match(sha):
         return refused(f"release sha {release_sha!r} is not a 40-character hex commit id")
     if _restart_scheduled:
         return refused("a restart is already pending")
 
+    rc, replaced, err = _git_update(["for-each-ref", "--format=%(refname)", "refs/replace/"], root)
+    if rc != 0:
+        return failed("git for-each-ref failed", err)
+    if replaced:
+        return refused("the checkout has refs/replace/* objects, which could stand in for the pinned commit")
+    rc, drivers, _ = _git_update(["config", "--local", "--get-regexp", _CONFIG_DRIVERS_RE], root)
+    if rc == 0 and drivers:
+        return refused("the checkout's .git/config defines filter/merge drivers that would run during the merge")
+
     rc, branch, err = _git_update(["symbolic-ref", "--quiet", "--short", "HEAD"], root)
     if rc != 0 or not branch:
         return refused("the checkout is on a detached HEAD, not a branch")
 
-    rc, _, err = _git_update(["fetch", "--quiet", "origin"], root)
+    rc, _, err = _git_update(["fetch", "--quiet", "--no-recurse-submodules", "origin"], root)
     if rc != 0:
         return failed("git fetch origin failed", err)
 
@@ -3955,7 +4061,7 @@ def _apply_update(release_sha: str, latest: str, checkout: Path) -> dict:
     rc, _, _ = _git_update(["merge-base", "--is-ancestor", sha, "HEAD"], root)
     if rc == 0:
         return {**result, "status": "up_to_date",
-                "reason": f"already at or past {latest or sha[:12]}"}
+                "reason": _reason(f"already at or past {latest or sha[:12]}")}
 
     rc, dirty, err = _git_update(["status", "--porcelain", "--untracked-files=no"], root)
     if rc != 0:
@@ -3968,45 +4074,74 @@ def _apply_update(release_sha: str, latest: str, checkout: Path) -> dict:
     if rc != 0:
         return refused(f"{branch} has commits that {sha[:12]} does not — not a fast-forward")
 
-    rc, changed, err = _git_update(["diff", "--name-only", old_head, sha, "--",
-                                    *DEPENDENCY_FILES], root)
+    rc, changed, err = _git_update(["diff", "--no-ext-diff", "--no-textconv", "--name-only",
+                                    old_head, sha, "--", *DEPENDENCY_FILES], root)
     if rc != 0:
         return failed("git diff failed", err)
 
-    rc, _, err = _git_update(["merge", "--ff-only", "--quiet", sha], root)
+    staged = False
+    if changed:
+        live = root / VENV_DIR_NAME
+        if running_venv().resolve() != live.resolve():
+            return refused(f"dependencies changed but this process is not running from "
+                           f"{live} — run install.sh --update")
+        rc, requirements, err = _git_update(["show", f"{sha}:requirements.txt"], root)
+        if rc != 0:
+            return failed("could not read the release's requirements.txt", err)
+        ok, detail = build_staging_venv(root, requirements + "\n")
+        if not ok:
+            return failed("building the staging venv failed; nothing changed", detail)
+        staged = True
+
+    def discard_staging() -> None:
+        if staged:
+            shutil.rmtree(root / VENV_STAGING_NAME, ignore_errors=True)
+
+    rc, _, err = _git_update(["merge", "--ff-only", "--quiet", "--no-verify", sha], root)
     if rc != 0:
+        discard_staging()
         return failed("git merge --ff-only failed", err)
 
     def roll_back(reason: str, detail: str) -> dict:
+        discard_staging()
         back, _, back_err = _git_update(["reset", "--keep", old_head], root)
         if back != 0:
             return failed(f"{reason}, and rolling back to {old_head[:12]} failed",
                           f"{detail} / {back_err}")
         return failed(f"{reason}; rolled back to {old_head[:12]}", detail)
 
-    if changed:
-        ok, detail = install_dependencies(root)
-        if not ok:
-            return roll_back("installing dependencies failed", detail)
+    rc, new_head, err = _git_update(["rev-parse", "HEAD"], root)
+    if rc != 0 or new_head != sha:
+        return roll_back("HEAD is not the pinned commit after the merge", new_head or err)
+    rc, dirty, err = _git_update(["status", "--porcelain", "--untracked-files=no"], root)
+    if rc != 0 or dirty:
+        return roll_back("the working tree does not match the pinned commit", dirty or err)
 
     ok, detail = compiles_at(agent_file)
     if not ok:
         return roll_back(f"{sha[:12]} does not compile", detail)
 
+    if staged:
+        ok, detail = swap_staging_venv(root)
+        if not ok:
+            return roll_back("swapping in the new venv failed", detail)
+
     to_version = _version_in(agent_file) or latest or sha[:12]
     log.info("updated the checkout %s → %s (%s)", from_version, to_version, sha[:12])
-    return {"status": "updated", "reason": f"fast-forwarded to {sha[:12]}",
+    return {"status": "updated", "reason": _reason(f"fast-forwarded to {sha[:12]}"),
             "from_version": from_version, "to_version": to_version,
-            "dependencies_installed": bool(changed)}
+            "dependencies_installed": staged}
 
 
 async def send_update_result(link, result: dict) -> None:
     await cable_send(link, "message", {
         "action":       "update_result",
         "status":       result.get("status"),
-        "reason":       result.get("reason") or "",
+        "reason":       _reason(result.get("reason") or ""),
         "from_version": result.get("from_version") or _version_number(AGENT_VERSION),
         "to_version":   result.get("to_version") or "",
+        "agent":        {"install_id": INSTALL_ID},
+        "meta":         {"install_id": INSTALL_ID},
     })
 
 
@@ -4026,13 +4161,22 @@ async def perform_update(link, release_sha: str, latest: str = "", *,
         result = await asyncio.to_thread(apply_update, release_sha, latest)
     except Exception as e:
         log.exception("update to %s crashed", release_sha)
-        result = {"status": "failed", "reason": _scrub(f"{type(e).__name__}: {e}")}
+        result = {"status": "failed", "reason": _reason(f"{type(e).__name__}: {e}")}
     log.info("update %s: %s", result.get("status"), result.get("reason"))
     if result.get("status") != "up_to_date" or announce_up_to_date:
         await send_update_result(link, result)
     if result.get("status") == "updated":
         await restart_after_update(link)
     return result
+
+
+async def run_deferred_update(link) -> dict | None:
+    global _deferred_update
+    request, _deferred_update = _deferred_update, None
+    if request is None:
+        return None
+    log.info("applying the update requested while busy (%s)", request.get("latest"))
+    return await perform_update(link, request["release_sha"], request["latest"])
 
 
 def load_update_attempts() -> list[str]:
@@ -4045,11 +4189,15 @@ def load_update_attempts() -> list[str]:
 
 def record_update_attempt(sha: str) -> None:
     attempts = [a for a in load_update_attempts() if a != sha] + [sha]
+    tmp = UPDATE_ATTEMPTS_PATH.with_name(
+        f"{UPDATE_ATTEMPTS_PATH.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        UPDATE_ATTEMPTS_PATH.write_text(
-            json.dumps(attempts[-UPDATE_ATTEMPTS_MAX:]), encoding="utf-8")
+        tmp.write_text(json.dumps(attempts[-UPDATE_ATTEMPTS_MAX:]), encoding="utf-8")
+        os.replace(tmp, UPDATE_ATTEMPTS_PATH)
     except OSError as e:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
         log.warning("could not record the update attempt: %s", e)
 
 
@@ -4079,6 +4227,12 @@ def auto_update_due(msg: dict) -> bool:
     return sha not in load_update_attempts()
 
 
+def update_addressed_to_me(msg: dict) -> bool:
+    agent = msg.get("agent")
+    wanted = str(agent.get("install_id") or "").strip() if isinstance(agent, dict) else ""
+    return bool(wanted) and bool(INSTALL_ID) and wanted == INSTALL_ID
+
+
 def _spawn_update(coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _update_tasks.add(task)
@@ -4087,6 +4241,7 @@ def _spawn_update(coro) -> asyncio.Task:
 
 
 def handle_update_frame(link, msg: dict) -> asyncio.Task | None:
+    global _deferred_update
     kind = msg.get("type")
     if kind == "version.current":
         note_latest_release(msg)
@@ -4098,15 +4253,21 @@ def handle_update_frame(link, msg: dict) -> asyncio.Task | None:
         return _spawn_update(perform_update(
             link, sha, str(msg.get("latest") or ""), announce_up_to_date=False))
     if kind == "update.requested":
-        if not _is_ours(msg):
-            agent = msg.get("agent") or {}
-            log.info("update.requested for %s (%s) — not this engine (%s), leaving it",
-                     agent.get("name"), agent.get("kind"), DISPATCH_ENGINE)
+        agent = msg.get("agent") if isinstance(msg.get("agent"), dict) else {}
+        if not update_addressed_to_me(msg):
+            log.info("update.requested for install_id=%s (%s) — not this install (%s), leaving it",
+                     agent.get("install_id") or "none", agent.get("name"), INSTALL_ID or "none")
             return None
         who = (msg.get("requested_by") or {}).get("name") or "someone"
-        log.info("update to %s requested by %s", msg.get("latest"), who)
-        return _spawn_update(perform_update(
-            link, str(msg.get("release_sha") or ""), str(msg.get("latest") or "")))
+        request = {"release_sha": str(msg.get("release_sha") or ""),
+                   "latest": str(msg.get("latest") or "")}
+        if _current_work is not None:
+            _deferred_update = request
+            log.info("update to %s requested by %s — applying after the current task",
+                     request["latest"], who)
+            return None
+        log.info("update to %s requested by %s", request["latest"], who)
+        return _spawn_update(perform_update(link, request["release_sha"], request["latest"]))
     return None
 
 
@@ -5297,6 +5458,11 @@ async def worker_loop(link: CableLink) -> None:
             _current_work_started = None
             set_task_label("")
             _work_queue.task_done()
+
+        try:
+            await run_deferred_update(link)
+        except Exception:
+            log.exception("deferred update failed")
 
         # Outside the try so a task's own failure doesn't mask it,
         # and guarded so a bug in here can't take the worker down and

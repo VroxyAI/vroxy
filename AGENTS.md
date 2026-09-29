@@ -59,5 +59,5 @@ stream — verify against a live run before flipping
 | Safe restart | `restart_dispatch` skill |
 | Flip harness | edit `/etc/default/vroxy-dispatch` `DISPATCH_ENGINE=…`, then `restart_dispatch` |
 | Self-update after shipping | automatic via `restart_if_self_updated` once the turn ends |
-| Pull a release | "Update now" at `/w/…/dispatch`, or `DISPATCH_AUTO_UPDATE=1` for patch/minor (default `0`) — ff-only to the pinned sha, refused on a dirty or diverged checkout. README "Updating from a release" |
+| Pull a release | "Update now" at `/w/…/dispatch` (matched on `install_id`), or `DISPATCH_AUTO_UPDATE=1` for patch/minor (default `0`) — ff-only to the pinned sha with hooks/replace objects disabled, deps into a staging venv, refused on a dirty or diverged checkout. README "Updating from a release" |
 | Install / pull all units | `./install.sh --update` |

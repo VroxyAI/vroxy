@@ -386,33 +386,60 @@ The server answers heartbeats with a `version.current` frame naming the
 latest release, its commit sha and its severity (`patch` / `minor` /
 `major`). Dispatch updates the checkout it runs from in two cases:
 
-- **Someone pressed "Update now"** at `/w/…/dispatch` (an
-  `update.requested` frame addressed to this agent). Always attempted.
+- **Someone pressed "Update now"** at `/w/…/dispatch`: an
+  `update.requested` frame whose `agent.install_id` equals this
+  process's `VROXY_INSTALL_ID`. Anything else — another install, or a
+  frame with no `install_id` — is ignored, so two agents of the same
+  engine in one workspace never update each other. If a task is running
+  the request waits and is applied right after it, before the next one
+  starts.
 - **`DISPATCH_AUTO_UPDATE=1`** and the release is `patch` or `minor`,
   newer than the running version, and no task is in flight. A `major`
   release never applies itself. Each release sha is tried at most once
-  — attempts are remembered in `$VROXY_DISPATCH_STATE_DIR/update-attempts.json`,
-  so a refused or failed release is not retried on every heartbeat.
+  — attempts are remembered (atomically) in
+  `$VROXY_DISPATCH_STATE_DIR/update-attempts.json`, so a refused or
+  failed release is not retried on every heartbeat.
 
 An update is `git fetch origin` then `git merge --ff-only <release sha>`
-— exactly the pinned commit, never the branch tip, never `git pull`. It
-is REFUSED when the sha is malformed, unknown, not on
-`origin/<current branch>`, when HEAD is detached, when a tracked file
-has uncommitted changes, or when the branch has commits the release
-does not (not a fast-forward). Untracked files do not block it: git's
-own merge refuses to overwrite one, which reports `failed` and leaves
-it untouched. When `requirements.txt` or `pyproject.toml` changed, it
-runs `python -m pip install --quiet -r requirements.txt` with the
-interpreter dispatch runs under (the venv install.sh made). A failed
-install, or a release that does not byte-compile, is rolled back to the
-previous commit. Every git and pip call is bounded by the 90 s stall
-cap.
+— exactly the pinned commit, never the branch tip, never `git pull`.
+Every git call runs with `GIT_NO_REPLACE_OBJECTS=1`, grafts disabled,
+`core.hooksPath=/dev/null`, `core.fsmonitor=false`, no submodule
+recursion and no auto-gc, so nothing in `.git/` can execute during the
+update or stand in for the pinned commit. It is REFUSED when:
+
+- the sha is malformed, unknown, or not on `origin/<current branch>`;
+- HEAD is detached, or the branch has commits the release does not
+  (not a fast-forward);
+- a tracked file has uncommitted changes (untracked files do not
+  block it — git's own merge refuses to overwrite one, which reports
+  `failed` and leaves it untouched);
+- any `refs/replace/*` exist, or `.git/config` defines filter/merge
+  drivers;
+- another process is already updating this checkout (an `flock` on
+  `.git/vroxy-dispatch-update.lock` — several units can share one
+  checkout).
+
+After the merge HEAD must equal the pinned sha and the tree must be
+clean, and the new `feedback_agent.py` must byte-compile; otherwise the
+code is rolled back with `git reset --keep`.
+
+Dependencies are pinned with hashes in `requirements.txt`. When it or
+`pyproject.toml` changed, the release's `requirements.txt` is installed
+into a STAGING venv (`.venv.next`, `pip install --only-binary :all:`)
+before the code moves. Only when everything else succeeded is it
+swapped in: `.venv` → `.venv.prev` (one kept), `.venv.next` → `.venv`,
+which is the path the systemd unit's `ExecStart` runs. Any failure
+leaves the live venv untouched. A process not running from the
+checkout's `.venv` refuses a dependency change and says to run
+`install.sh --update`. Every git, venv and pip call is bounded by the
+90 s stall cap (a measured staging build is ~3 s).
 
 Dispatch reports the outcome with the `update_result` cable action
-(`updated` / `up_to_date` / `refused` / `failed`, a reason, from and to
-versions); the server posts the room line. An `updated` checkout then
-restarts through the same self-restart path a self-edit uses, after
-the task in flight if there is one, so queued work is spooled and
+(`updated` / `up_to_date` / `refused` / `failed`, a reason of at most
+300 characters with credentials and tokens scrubbed, from and to
+versions, and `agent.install_id` / `meta.install_id`); the server posts
+the room line. An `updated` checkout then restarts through the same
+self-restart path a self-edit uses, so queued work is spooled and
 replayed.
 
 ## Which CLI does the work

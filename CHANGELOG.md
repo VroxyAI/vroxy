@@ -3,22 +3,32 @@
 ## 0.48.0
 
 ### Added
-- Dispatch updates its own checkout from a release: `update.requested`
-  ("Update now" at `/w/…/dispatch`) always tries, and
+- Dispatch updates its own checkout from a release. `update.requested`
+  ("Update now" at `/w/…/dispatch`) acts only when `agent.install_id`
+  matches this install, and waits for the running task to finish.
   `DISPATCH_AUTO_UPDATE=1` (default off) applies patch/minor releases
   from the `version.current` frame while idle — never a major, and each
-  release sha at most once. `git fetch` + `git merge --ff-only <sha>`
-  to exactly the pinned commit; refused on a dirty tracked file, a
-  detached HEAD, a sha not on `origin/<branch>`, or a non-fast-forward.
-  Deps reinstall when `requirements.txt` / `pyproject.toml` changed; a
-  failed install or a non-compiling release rolls back. The outcome
-  goes to the server as `update_result`, then the existing self-restart
-  path runs.
+  release sha at most once. `git fetch` + `git merge --ff-only <sha>` to
+  exactly the pinned commit, with replace objects, grafts, hooks,
+  fsmonitor, submodule recursion and auto-gc disabled. Refused on a
+  dirty tracked file, a detached HEAD, a sha not on `origin/<branch>`, a
+  non-fast-forward, any `refs/replace/*`, local filter/merge drivers, or
+  another process holding the checkout's update lock. HEAD is re-checked
+  against the sha after the merge. Changed dependencies install into a
+  staging venv first and are swapped in only on success; a failure
+  leaves the live venv alone and rolls the code back. The outcome goes
+  to the server as `update_result` (with `agent.install_id` /
+  `meta.install_id`, reason scrubbed and capped at 300 characters),
+  then the existing self-restart path runs.
 - The `vroxy` CLI sends `X-Vroxy-Client: vroxy-cli/<version>` and, when
   the server's `X-Vroxy-Client-Latest` is newer, prints one line to
   stderr at most once a day (remembered in `update-notice.json`, 0600).
+  A malformed header is ignored.
 
 ### Changed
+- `requirements.txt` pins `websockets==13.1` with every published
+  sha256 (`pip` now requires hashes), and the `dispatch` extra pins the
+  same version.
 - The CLI version (`vroxy_cli/version.py`) and `pyproject.toml` now
   carry the same number as `AGENT_VERSION` (they were 0.35.0 / 0.45.2);
   a test keeps the three in step.

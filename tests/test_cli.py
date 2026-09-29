@@ -495,6 +495,18 @@ class VersionHeaderTest(unittest.TestCase):
             self.assertEqual("", err, latest)
         self.assertFalse(config.notice_path().exists())
 
+    def test_a_malformed_header_is_ignored_not_a_crash(self):
+        for latest in ("1.2.\u00b2", "\u0661.\u0662.\u0663", "9" * 5000 + ".0.0x", "1..2", " "):
+            out, err = self.run_cli(latest)
+            self.assertEqual("", err, repr(latest[:20]))
+            json.loads(out)
+
+    def test_a_failure_writing_the_notice_never_breaks_the_command(self):
+        with mock.patch.object(config, "save_notice", side_effect=RuntimeError("disk")):
+            out, err = self.run_cli("99.0.0")
+        json.loads(out)
+        self.assertNotIn("Traceback", err)
+
     def test_an_error_response_can_still_carry_the_notice(self):
         headers = {"X-Vroxy-Client-Latest": "99.0.0"}
         error = urllib.error.HTTPError("http://x", 403, "err", headers,
