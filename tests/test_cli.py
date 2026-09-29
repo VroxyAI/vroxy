@@ -198,5 +198,118 @@ class ManagementCommandsTest(unittest.TestCase):
         client.create_tool.assert_not_called()
 
 
+class ReadCommandsTest(unittest.TestCase):
+    def run_cli(self, argv, **returns):
+        with mock.patch("vroxy_cli.cli._client") as fake:
+            for name, value in returns.items():
+                getattr(fake.return_value, name).return_value = value
+            with mock.patch("builtins.print") as printed:
+                code = main(argv)
+        return code, fake.return_value, printed
+
+    def test_errors_list_passes_source_and_page(self):
+        code, client, _ = self.run_cli(
+            ["errors", "ws1", "list", "--source", "js", "--page", "2"], errors={"errors": []}
+        )
+
+        self.assertEqual(code, 0)
+        client.errors.assert_called_once_with("ws1", source="js", page=2)
+
+    def test_errors_show_asks_for_the_fingerprint(self):
+        code, client, printed = self.run_cli(
+            ["errors", "ws1", "show", "abc123"],
+            error={"error": {"error_class": "TypeError", "backtrace": ["a.js:1"]}, "occurrences": []},
+        )
+
+        self.assertEqual(code, 0)
+        client.error.assert_called_once_with("ws1", "abc123", page=None)
+        self.assertIn("TypeError", printed.call_args_list[0][0][0])
+
+    def test_usage_prints_unlimited_for_a_missing_limit(self):
+        payload = {
+            "plan": {"name": "Free", "price_label": "$0"},
+            "enforced": True,
+            "metrics": [{"metric": "docs", "label": "Documents", "used": 3, "limit": None}],
+            "features": [],
+        }
+        code, client, printed = self.run_cli(["usage", "ws1"], usage=payload)
+
+        self.assertEqual(code, 0)
+        client.usage.assert_called_once_with("ws1")
+        lines = [c[0][0] for c in printed.call_args_list]
+        self.assertIn("  Documents: 3 / unlimited", lines)
+
+    def test_visitors_list_maps_flags_to_the_api(self):
+        code, client, _ = self.run_cli(
+            ["visitors", "ws1", "list", "--identity", "identified", "--active"],
+            visitors={"visitors": []},
+        )
+
+        self.assertEqual(code, 0)
+        client.visitors.assert_called_once_with("ws1", identity="identified", active=True, page=None)
+
+    def test_visitors_identity_outside_the_choices_never_reaches_the_server(self):
+        with self.assertRaises(SystemExit):
+            main(["visitors", "ws1", "list", "--identity", "everyone"])
+
+    def test_visitors_show(self):
+        _, client, _ = self.run_cli(["visitors", "ws1", "show", "vst1"], visitor={"visitor": {}})
+
+        client.visitor.assert_called_once_with("ws1", "vst1")
+
+    def test_targets_prints_repo_policy_and_agent(self):
+        payload = {"targets": [{
+            "name": "vroxy_web", "online": True,
+            "repo": {"full_name": "acme/web"}, "agent": {"name": "Claude Code"},
+            "effective": {"policy": "always_pr", "base_ref": "master"},
+        }]}
+        code, client, printed = self.run_cli(["targets", "ws1"], targets=payload)
+
+        self.assertEqual(code, 0)
+        client.targets.assert_called_once_with("ws1", page=None)
+        line = printed.call_args_list[0][0][0]
+        for part in ("vroxy_web", "acme/web", "master", "always_pr", "Claude Code", "online"):
+            self.assertIn(part, line)
+
+    def test_json_flag_returns_the_raw_payload(self):
+        payload = {"targets": [], "meta": {"total_pages": 1}}
+        _, _, printed = self.run_cli(["--json", "targets", "ws1"], targets=payload)
+
+        self.assertEqual(json.loads(printed.call_args[0][0]), payload)
+
+
+class ReadClientTest(unittest.TestCase):
+    def capture(self, call):
+        seen = {}
+
+        def fake(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["body"] = json.loads(req.data) if req.data else None
+            return _response({})
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake):
+            call(Client(host="https://x.test", token="t"))
+        return seen
+
+    def test_login_asks_for_an_agent_token_not_a_phone_one(self):
+        seen = self.capture(lambda c: c.login("a@b.co", "pw", device="laptop"))
+
+        self.assertEqual(seen["url"], "https://x.test/api/mobile/v1/login")
+        self.assertEqual(seen["body"]["client"], "cli")
+        self.assertEqual(seen["body"]["device_model"], "laptop")
+
+    def test_read_endpoints_hit_the_workspace_paths(self):
+        cases = [
+            (lambda c: c.errors("ws1", source="js", page=2), "/workspaces/ws1/errors?source=js&page=2"),
+            (lambda c: c.error("ws1", "a/b"), "/workspaces/ws1/errors/a%2Fb"),
+            (lambda c: c.usage("ws1"), "/workspaces/ws1/usage"),
+            (lambda c: c.visitors("ws1", active=True), "/workspaces/ws1/visitors?active=yes"),
+            (lambda c: c.visitor("ws1", "vst1"), "/workspaces/ws1/visitors/vst1"),
+            (lambda c: c.targets("ws1"), "/workspaces/ws1/dispatch_targets"),
+        ]
+        for call, path in cases:
+            self.assertEqual(self.capture(call)["url"], f"https://x.test/api/mobile/v1{path}")
+
+
 if __name__ == "__main__":
     unittest.main()

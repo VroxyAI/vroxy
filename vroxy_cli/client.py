@@ -64,10 +64,11 @@ class Client:
 
         return _safe_json(raw)
 
-    def login(self, email, password):
-        return self._request(
-            "POST", "/login", {"email": email, "password": password}, authed=False
-        )
+    def login(self, email, password, device=None):
+        body = {"email": email, "password": password, "client": "cli"}
+        if device:
+            body["device_model"] = device
+        return self._request("POST", "/login", body, authed=False)
 
     def me(self):
         return self._request("GET", "/me")
@@ -176,6 +177,29 @@ class Client:
 
     def chat(self, workspace, chat):
         return self._request("GET", f"/workspaces/{workspace}/chats/{chat}")
+
+    def errors(self, workspace, source=None, page=None):
+        query = _query({"source": source, "page": page})
+        return self._request("GET", f"/workspaces/{workspace}/errors{query}")
+
+    def error(self, workspace, fingerprint, page=None):
+        query = _query({"page": page})
+        path = urllib.parse.quote(str(fingerprint), safe="")
+        return self._request("GET", f"/workspaces/{workspace}/errors/{path}{query}")
+
+    def usage(self, workspace):
+        return self._request("GET", f"/workspaces/{workspace}/usage")
+
+    def visitors(self, workspace, identity=None, active=False, page=None):
+        query = _query({"identity": identity, "active": "yes" if active else None, "page": page})
+        return self._request("GET", f"/workspaces/{workspace}/visitors{query}")
+
+    def visitor(self, workspace, visitor):
+        return self._request("GET", f"/workspaces/{workspace}/visitors/{visitor}")
+
+    def targets(self, workspace, page=None):
+        query = _query({"page": page})
+        return self._request("GET", f"/workspaces/{workspace}/dispatch_targets{query}")
 
 
 def _compact(fields):

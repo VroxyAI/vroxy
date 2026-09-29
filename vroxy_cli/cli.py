@@ -2,6 +2,7 @@ import argparse
 import getpass
 import json
 import os
+import socket
 import sys
 
 from . import config
@@ -32,7 +33,7 @@ def cmd_login(args):
     # and lands in shell history.
     password = os.environ.get("VROXY_PASSWORD") or getpass.getpass("Password: ")
 
-    result = Client(host=host).login(email, password)
+    result = Client(host=host).login(email, password, device=socket.gethostname() or None)
     token = result.get("token")
     if not token:
         raise VroxyError("Login succeeded but returned no token.")
@@ -293,6 +294,116 @@ def cmd_chats(args):
         return _emit(args, payload, lambda: print(json.dumps(payload, indent=2)))
 
 
+def _one_line(text, width):
+    text = (text or "").replace("\n", " ")
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def cmd_errors(args):
+    client = _client(args)
+
+    if args.action == "list":
+        payload = client.errors(args.workspace, source=args.source, page=args.page)
+        rows = payload.get("errors", [])
+
+        def plain():
+            if not rows:
+                print("No errors.")
+                return
+            for e in rows:
+                seen = (e.get("last_seen_at") or "")[:16].replace("T", " ")
+                print(f"{e.get('fingerprint'):<18} {e.get('occurrences', 0):>5}x  {seen}  "
+                      f"{e.get('error_class') or '?'}: {_one_line(e.get('message'), 70)}")
+            _page_footer(payload)
+
+        return _emit(args, payload, plain)
+
+    if args.action == "show":
+        payload = client.error(args.workspace, args.fingerprint, page=args.page)
+
+        def plain():
+            e = payload.get("error", {})
+            print(f"{e.get('error_class')}: {e.get('message') or ''}")
+            print(f"{e.get('occurrences', 0)} occurrence(s), last {e.get('last_seen_at')}, "
+                  f"source {e.get('source')}")
+            for frame in (e.get("backtrace") or [])[:15]:
+                print(f"  {frame}")
+            for o in payload.get("occurrences", []):
+                print(f"- {o.get('occurred_at')}  {o.get('url') or o.get('request_path') or ''}")
+
+        return _emit(args, payload, plain)
+
+
+def cmd_usage(args):
+    payload = _client(args).usage(args.workspace)
+
+    def plain():
+        plan = payload.get("plan", {})
+        print(f"{plan.get('name')} ({plan.get('price_label')})"
+              f"{'' if payload.get('enforced') else '  — limits not enforced yet'}")
+        for m in payload.get("metrics", []):
+            limit = "unlimited" if m.get("limit") is None else m.get("limit")
+            window = f" ({m['window']})" if m.get("window") else ""
+            print(f"  {m.get('label')}{window}: {m.get('used')} / {limit}")
+        included = [f["feature"] for f in payload.get("features", []) if f.get("included")]
+        if included:
+            print(f"  Includes: {', '.join(included)}")
+
+    _emit(args, payload, plain)
+
+
+def cmd_visitors(args):
+    client = _client(args)
+
+    if args.action == "list":
+        payload = client.visitors(
+            args.workspace, identity=args.identity, active=args.active, page=args.page
+        )
+        rows = payload.get("visitors", [])
+
+        def plain():
+            if not rows:
+                print("No visitors.")
+                return
+            for v in rows:
+                seen = (v.get("last_seen_at") or "")[:16].replace("T", " ")
+                gone = "  (deleted)" if v.get("deleted") else ""
+                print(f"{v.get('id'):<12} {seen:<16}  {v.get('display')}{gone}")
+            _page_footer(payload)
+
+        return _emit(args, payload, plain)
+
+    if args.action == "show":
+        payload = client.visitor(args.workspace, args.visitor)
+        return _emit(args, payload, lambda: print(json.dumps(payload, indent=2)))
+
+
+def cmd_targets(args):
+    payload = _client(args).targets(args.workspace, page=args.page)
+    rows = payload.get("targets", [])
+
+    def plain():
+        if not rows:
+            print("No dispatch targets.")
+            return
+        for t in rows:
+            effective = t.get("effective") or {}
+            repo = (t.get("repo") or {}).get("full_name") or "-"
+            agent = (t.get("agent") or {}).get("name") or "-"
+            state = "online" if t.get("online") else "offline"
+            print(f"{t.get('name'):<20} {repo:<28} {effective.get('base_ref') or '-':<12} "
+                  f"{effective.get('policy') or '-':<12} {agent}  [{state}]")
+
+    _emit(args, payload, plain)
+
+
+def _page_footer(payload):
+    meta = payload.get("meta") or {}
+    if (meta.get("total_pages") or 1) > 1:
+        print(f"page {meta.get('current_page')} of {meta.get('total_pages')} "
+              f"({meta.get('total_count')} total) — --page N for more")
+
+
 def _tool_params(raw):
     params = []
     for item in raw or []:
@@ -407,6 +518,36 @@ def build_parser():
     chats_list.add_argument("--page", type=int)
     chats_sub.add_parser("show").add_argument("chat")
     chats.set_defaults(func=cmd_chats, filter="open", q=None, page=None)
+
+    errors = sub.add_parser("errors", help="Client errors reported into a workspace")
+    errors.add_argument("workspace")
+    errors_sub = errors.add_subparsers(dest="action", required=True)
+    errors_list = errors_sub.add_parser("list")
+    errors_list.add_argument("--source", help="ruby, js, api, mobile, node, python, php")
+    errors_list.add_argument("--page", type=int)
+    errors_show = errors_sub.add_parser("show")
+    errors_show.add_argument("fingerprint", help="Fingerprint from `errors list`")
+    errors_show.add_argument("--page", type=int, help="Page of occurrences")
+    errors.set_defaults(func=cmd_errors, source=None, page=None)
+
+    usage = sub.add_parser("usage", help="Plan, usage this month, and what the plan includes")
+    usage.add_argument("workspace")
+    usage.set_defaults(func=cmd_usage)
+
+    visitors = sub.add_parser("visitors", help="People who have opened the widget")
+    visitors.add_argument("workspace")
+    visitors_sub = visitors.add_subparsers(dest="action", required=True)
+    visitors_list = visitors_sub.add_parser("list")
+    visitors_list.add_argument("--identity", choices=["identified", "anonymous"])
+    visitors_list.add_argument("--active", action="store_true", help="Seen in the last 24 hours")
+    visitors_list.add_argument("--page", type=int)
+    visitors_sub.add_parser("show").add_argument("visitor")
+    visitors.set_defaults(func=cmd_visitors, identity=None, active=False, page=None)
+
+    targets = sub.add_parser("targets", help="What each dispatch agent works on, and how it ships")
+    targets.add_argument("workspace")
+    targets.add_argument("--page", type=int)
+    targets.set_defaults(func=cmd_targets)
 
     return p
 

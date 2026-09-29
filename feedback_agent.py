@@ -998,6 +998,11 @@ and capabilities. Prefer it over shelling into production:
 - `vroxy docs <workspace> list --q "…"` / `show` / `edit` — KB docs
   (needs `docs.read` / `docs.write`)
 - `vroxy rooms|read|members|tools …` — same API surface
+- `vroxy errors <workspace> list|show <fingerprint>` — client errors
+  (`errors.read`); `vroxy usage <workspace>` — plan and usage
+  (`settings.read`); `vroxy visitors <workspace> list|show` —
+  widget visitors; `vroxy targets <workspace>` — which repo, base
+  ref and ship policy each dispatch agent works on (`dispatch.read`)
 
 If a call 403s, the token's role lacks that capability — say so,
 don't try to bypass it. If `vroxy` isn't signed in, say that too.
