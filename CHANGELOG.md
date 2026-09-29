@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.47.0
+
+### Added
+- `vroxy errors|usage|visitors|targets <workspace>` — read client
+  errors, plan usage, visitors and dispatch targets (vroxy_web ≥ 2.221.0).
+- `vroxy login` mints an `agent`-scope token (`client: "cli"`) instead
+  of a phone session, and retires the previously saved token once the
+  new login succeeds.
+
+### Changed
+- `vroxy logout` revokes the token on the server before deleting the
+  local file.
+- Removed `members invite|role|remove|revoke`: an agent surface must not
+  widen its own reach. `members list` stays. The server refuses those
+  calls for agent tokens anyway (`agent_token_refused`), and the room
+  prompt says that refusal is by design.
+
 ## 0.46.5
 
 ### Fixed
