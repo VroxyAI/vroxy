@@ -475,6 +475,26 @@ class HandleRoomMessageAskTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], frames_of(link, "room_ask"))
 
 
+class ResetCommandReplyTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._clear = fa.clear_sessions
+        fa.clear_sessions = lambda keys=None: ["rm123456"]
+
+    async def asyncTearDown(self):
+        fa.clear_sessions = self._clear
+
+    async def test_the_reset_reply_answers_the_command_message(self):
+        link = fa.CableLink()
+        payload = {**ROOM_PAYLOAD, "message": {**ROOM_PAYLOAD["message"], "body": "/clear"}}
+
+        await fa.handle_room_message(link, payload)
+
+        replies = frames_of(link, "room_reply")
+        self.assertEqual(1, len(replies))
+        self.assertIn("Fresh session", replies[0]["body"])
+        self.assertEqual("ms123456", replies[0]["reply_to"])
+
+
 class RoomReplyPostedFrameTest(unittest.IsolatedAsyncioTestCase):
     """The frame arrives on the socket reader while the worker is
     mid-turn, so the stream loop has to route it."""

@@ -141,7 +141,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.46.4"
+AGENT_VERSION      = "vroxy_dispatch 0.46.5"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -4817,7 +4817,8 @@ async def handle_room_message(ws, payload: dict) -> None:
         await room_reply(ws, room_id,
                          "🧹 Fresh session — I've forgotten this room's history."
                          if removed else
-                         "🧹 Already on a fresh session (nothing to clear).")
+                         "🧹 Already on a fresh session (nothing to clear).",
+                         reply_to=msg.get("hashid"))
         return
 
     login = login_command(body)

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.46.5
+
+### Fixed
+- The `/clear` / `/reset` / `/new` reply now names the message it
+  answers (`reply_to`), so the room settles that message's
+  "Working…" badge instead of leaving it spinning forever.
+
 ## 0.46.4
 
 ### Added
