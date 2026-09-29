@@ -160,14 +160,23 @@ class ManagementCommandsTest(unittest.TestCase):
 
         client.publish_doc.assert_called_once_with("ws1", "d1", published=False)
 
-    def test_a_role_outside_the_ladder_never_reaches_the_server(self):
-        with self.assertRaises(SystemExit):
-            main(["members", "ws1", "invite", "a@b.test", "superuser"])
+    def test_member_management_is_not_a_cli_command(self):
+        for argv in (
+            ["members", "ws1", "invite", "a@b.test", "admin"],
+            ["members", "ws1", "role", "7", "admin"],
+            ["members", "ws1", "remove", "7"],
+            ["members", "ws1", "revoke", "inv1"],
+        ):
+            with mock.patch("sys.stderr", StringIO()):
+                with self.assertRaises(SystemExit, msg=argv):
+                    main(argv)
+        for name in ("invite_member", "set_member_role", "remove_member", "revoke_invitation"):
+            self.assertFalse(hasattr(Client, name), name)
 
-    def test_invite_passes_the_role_through(self):
-        _, client = self.run_cli(["members", "ws1", "invite", "a@b.test", "admin"])
+    def test_members_list_still_works(self):
+        _, client = self.run_cli(["members", "ws1", "list"])
 
-        client.invite_member.assert_called_once_with("ws1", "a@b.test", "admin")
+        client.members.assert_called_once_with("ws1")
 
     def test_enable_and_disable_are_explicit_not_a_flip(self):
         _, client = self.run_cli(["tools", "ws1", "disable", "t1"])
@@ -276,6 +285,105 @@ class ReadCommandsTest(unittest.TestCase):
         _, _, printed = self.run_cli(["--json", "targets", "ws1"], targets=payload)
 
         self.assertEqual(json.loads(printed.call_args[0][0]), payload)
+
+
+class SessionCommandsTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = __import__("pathlib").Path(tempfile.mkdtemp())
+        for name, value in (("CONFIG_DIR", self.dir), ("CREDENTIALS", self.dir / "credentials.json")):
+            patcher = mock.patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {"VROXY_PASSWORD": "pw"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def route(self, responses):
+        calls = []
+
+        def fake(req, timeout=None):
+            path = req.full_url.split("/api/mobile/v1", 1)[1]
+            calls.append((path, req.headers.get("Authorization")))
+            outcome = responses[path]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return _response(outcome)
+
+        return calls, mock.patch("urllib.request.urlopen", side_effect=fake)
+
+    def test_logout_revokes_the_token_before_forgetting_it(self):
+        config.save("https://x.test", "old-token")
+        calls, patched = self.route({"/logout": {"ok": True}})
+        with patched, mock.patch("builtins.print"):
+            code = main(["logout"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [("/logout", "Bearer old-token")])
+        self.assertFalse(config.CREDENTIALS.exists())
+
+    def test_logout_still_forgets_the_token_when_the_server_is_unreachable_and_says_so(self):
+        config.save("https://x.test", "old-token")
+        _, patched = self.route({"/logout": urllib.error.URLError("down")})
+        err = StringIO()
+        with patched, mock.patch("sys.stdout", StringIO()), mock.patch("sys.stderr", err):
+            code = main(["logout"])
+
+        self.assertEqual(code, 0)
+        self.assertFalse(config.CREDENTIALS.exists())
+        self.assertIn("could not be revoked", err.getvalue())
+
+    def test_logout_treats_an_already_revoked_token_as_revoked(self):
+        config.save("https://x.test", "old-token")
+        _, patched = self.route({"/logout": _http_error(401, {})})
+        out, err = StringIO(), StringIO()
+        with patched, mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            main(["logout"])
+
+        self.assertIn("the token is revoked", out.getvalue())
+        self.assertEqual("", err.getvalue())
+
+    def test_logout_with_nothing_saved_calls_nothing(self):
+        calls, patched = self.route({})
+        with patched, mock.patch("builtins.print"):
+            self.assertEqual(main(["logout"]), 0)
+        self.assertEqual(calls, [])
+
+    def test_login_revokes_the_previously_saved_token(self):
+        config.save("https://x.test", "old-token")
+        calls, patched = self.route({
+            "/login": {"token": "new-token", "user": {"email": "a@b.co"}},
+            "/logout": {"ok": True},
+        })
+        with patched, mock.patch("builtins.print"):
+            code = main(["--host", "https://x.test", "login", "--email", "a@b.co"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [("/login", None), ("/logout", "Bearer old-token")])
+        self.assertEqual(config.token_for("https://x.test"), "new-token")
+
+    def test_a_failed_login_leaves_the_previous_token_alone(self):
+        config.save("https://x.test", "old-token")
+        calls, patched = self.route({"/login": _http_error(401, {"error": "Invalid email or password"})})
+        with patched, mock.patch("sys.stderr", StringIO()):
+            code = main(["--host", "https://x.test", "login", "--email", "a@b.co"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual([path for path, _ in calls], ["/login"])
+        self.assertEqual(config.token_for("https://x.test"), "old-token")
+
+    def test_login_still_succeeds_when_the_old_token_cannot_be_revoked(self):
+        config.save("https://x.test", "old-token")
+        _, patched = self.route({
+            "/login": {"token": "new-token", "user": {"email": "a@b.co"}},
+            "/logout": urllib.error.URLError("down"),
+        })
+        err = StringIO()
+        with patched, mock.patch("sys.stdout", StringIO()), mock.patch("sys.stderr", err):
+            code = main(["--host", "https://x.test", "login", "--email", "a@b.co"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(config.token_for("https://x.test"), "new-token")
+        self.assertIn("Couldn't revoke the previous token", err.getvalue())
 
 
 class ReadClientTest(unittest.TestCase):

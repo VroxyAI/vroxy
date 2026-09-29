@@ -39,16 +39,22 @@ managed (PEP 668, which is most current distros). All three end with
 ## The CLI
 
 ```bash
-vroxy login                            # host + API token, stored 0600
+vroxy login                            # host + API token, stored 0600; revokes the previous one
+vroxy logout                           # revokes the token server-side, then forgets it
 vroxy workspaces                       # what you can reach
 vroxy rooms <workspace>                # rooms in one
 vroxy read <workspace> <room>          # recent messages
 vroxy post <workspace> <room> "ship it"
 vroxy dispatch <workspace>             # the workspace's dispatch agents
 vroxy docs    <workspace> list|show|create|edit|publish|unpublish|delete
-vroxy members <workspace> list|invite|role|remove|revoke
+vroxy members <workspace> list
 vroxy tools   <workspace> list|show|create|enable|disable|delete
 ```
+
+The token is an Agent / CLI token, and the server refuses anything that
+would widen its own reach — inviting or promoting members, creating
+workspaces, accepting invitations, answering a room's questions, billing.
+Those stay with a person in the app.
 
 Every command after `login` takes the workspace first — a hashid or
 its slug.

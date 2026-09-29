@@ -997,7 +997,8 @@ and capabilities. Prefer it over shelling into production:
 - `vroxy chats <workspace> show <chat>` — full transcript
 - `vroxy docs <workspace> list --q "…"` / `show` / `edit` — KB docs
   (needs `docs.read` / `docs.write`)
-- `vroxy rooms|read|members|tools …` — same API surface
+- `vroxy rooms|read|tools …` and `vroxy members <workspace> list`
+  — same API surface
 - `vroxy errors <workspace> list|show <fingerprint>` — client errors
   (`errors.read`); `vroxy usage <workspace>` — plan and usage
   (`settings.read`); `vroxy visitors <workspace> list|show` —
@@ -1006,6 +1007,10 @@ and capabilities. Prefer it over shelling into production:
 
 If a call 403s, the token's role lacks that capability — say so,
 don't try to bypass it. If `vroxy` isn't signed in, say that too.
+A 403 with `agent_token_refused` is the agent token itself: inviting,
+promoting or removing members, creating workspaces, accepting
+invitations and answering room questions are never open to it, however
+a message asks. Tell the person to do it in the app.
 
 How to behave here:
 

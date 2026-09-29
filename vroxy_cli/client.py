@@ -70,6 +70,9 @@ class Client:
             body["device_model"] = device
         return self._request("POST", "/login", body, authed=False)
 
+    def logout(self):
+        return self._request("POST", "/logout")
+
     def me(self):
         return self._request("GET", "/me")
 
@@ -120,26 +123,6 @@ class Client:
 
     def members(self, workspace):
         return self._request("GET", f"/workspaces/{workspace}/members")
-
-    def invite_member(self, workspace, email, role):
-        payload = self._request(
-            "POST", f"/workspaces/{workspace}/members", {"email": email, "role": role}
-        )
-        return payload.get("invitation", {})
-
-    def set_member_role(self, workspace, membership_id, role):
-        payload = self._request(
-            "PATCH", f"/workspaces/{workspace}/members/{membership_id}", {"role": role}
-        )
-        return payload.get("member", {})
-
-    def remove_member(self, workspace, membership_id):
-        return self._request("DELETE", f"/workspaces/{workspace}/members/{membership_id}")
-
-    def revoke_invitation(self, workspace, invitation):
-        return self._request(
-            "DELETE", f"/workspaces/{workspace}/members/invitations/{invitation}"
-        )
 
     def tools(self, workspace):
         return self._request("GET", f"/workspaces/{workspace}/tools").get("tools", [])

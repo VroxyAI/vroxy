@@ -10,9 +10,6 @@ from .client import Client, VroxyError
 from .version import VERSION
 
 
-ROLES = ["operator", "member", "admin", "owner"]
-
-
 def _client(args):
     host = getattr(args, "host", None) or os.environ.get("VROXY_HOST") or config.load().get("host")
     token = os.environ.get("VROXY_TOKEN") or config.token_for(host)
@@ -33,6 +30,7 @@ def cmd_login(args):
     # and lands in shell history.
     password = os.environ.get("VROXY_PASSWORD") or getpass.getpass("Password: ")
 
+    previous = config.load()
     result = Client(host=host).login(email, password, device=socket.gethostname() or None)
     token = result.get("token")
     if not token:
@@ -40,9 +38,36 @@ def cmd_login(args):
     path = config.save(host, token, email=result.get("user", {}).get("email") or email)
     print(f"Signed in as {result.get('user', {}).get('email') or email} — token saved to {path}")
 
+    if previous.get("token") and previous["token"] != token:
+        revoked, reason = _revoke(previous.get("host") or host, previous["token"])
+        if not revoked:
+            print(f"Couldn't revoke the previous token ({reason}). "
+                  f"Revoke it under Settings → Agent / CLI.", file=sys.stderr)
+
 
 def cmd_logout(_args):
-    print("Signed out." if config.clear() else "Nothing to sign out of.")
+    saved = config.load()
+    if not saved.get("token"):
+        print("Nothing to sign out of.")
+        return
+
+    revoked, reason = _revoke(saved.get("host"), saved["token"])
+    config.clear()
+    if revoked:
+        print("Signed out — the token is revoked.")
+    else:
+        print(f"Signed out locally, but the token could not be revoked ({reason}). "
+              f"Revoke it under Settings → Agent / CLI.", file=sys.stderr)
+
+
+def _revoke(host, token):
+    try:
+        Client(host=host, token=token).logout()
+    except VroxyError as e:
+        if e.status == 401:
+            return True, None
+        return False, str(e)
+    return True, None
 
 
 def cmd_whoami(args):
@@ -182,24 +207,6 @@ def cmd_members(args):
                 print(f"{'pending':<8} {inv.get('role', ''):<9} {inv.get('email')}  ({inv.get('hashid')})")
 
         return _emit(args, payload, plain)
-
-    if action == "invite":
-        inv = client.invite_member(args.workspace, args.email, args.role)
-        return _emit(args, inv, lambda: print(f"Invited {inv.get('email')} as {inv.get('role')}."))
-
-    if action == "role":
-        member = client.set_member_role(args.workspace, args.member, args.role)
-        return _emit(args, member, lambda: print(f"{member.get('name')} is now {member.get('role')}."))
-
-    if action == "remove":
-        result = client.remove_member(args.workspace, args.member)
-        return _emit(args, result, lambda: print(
-            "You've left the workspace." if result.get("left") else "Removed."
-        ))
-
-    if action == "revoke":
-        result = client.revoke_invitation(args.workspace, args.invitation)
-        return _emit(args, result, lambda: print("Invitation revoked."))
 
 
 def cmd_tools(args):
@@ -425,7 +432,7 @@ def build_parser():
     login.add_argument("--email")
     login.set_defaults(func=cmd_login)
 
-    sub.add_parser("logout", help="Forget the saved token").set_defaults(func=cmd_logout)
+    sub.add_parser("logout", help="Revoke the saved token and forget it").set_defaults(func=cmd_logout)
     sub.add_parser("whoami", help="Who the saved token belongs to").set_defaults(func=cmd_whoami)
     sub.add_parser("workspaces", help="Workspaces you hold a seat in").set_defaults(func=cmd_workspaces)
 
@@ -472,14 +479,6 @@ def build_parser():
     members.add_argument("workspace")
     members_sub = members.add_subparsers(dest="action", required=True)
     members_sub.add_parser("list")
-    invite = members_sub.add_parser("invite")
-    invite.add_argument("email")
-    invite.add_argument("role", choices=ROLES)
-    role = members_sub.add_parser("role")
-    role.add_argument("member", help="Membership id from `members list`")
-    role.add_argument("role", choices=ROLES)
-    members_sub.add_parser("remove").add_argument("member")
-    members_sub.add_parser("revoke").add_argument("invitation", help="Invitation hashid")
     members.set_defaults(func=cmd_members)
 
     tools = sub.add_parser("tools", help="Custom bot tools")
