@@ -45,6 +45,36 @@ die()  { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
+python_setup_hint() {
+  local ver
+  ver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 3)"
+  if command -v apt-get >/dev/null 2>&1; then
+    printf 'sudo apt install python3-venv python3-pip python%s-venv' "$ver"
+  elif command -v dnf >/dev/null 2>&1; then
+    printf 'sudo dnf install python3-pip'
+  elif command -v apk >/dev/null 2>&1; then
+    printf 'sudo apk add py3-pip py3-virtualenv'
+  elif command -v brew >/dev/null 2>&1; then
+    printf 'brew install python'
+  else
+    printf "install your distro's python3 venv and pip packages"
+  fi
+}
+
+venv_usable() { [[ -x "$1/bin/python" ]] && "$1/bin/python" -m pip --version >/dev/null 2>&1; }
+
+make_venv() {
+  local dir="$1"
+  venv_usable "$dir" && return 0
+  [[ -e "$dir" ]] && say "Replacing an incomplete virtualenv at $dir…"
+  rm -rf "$dir"
+  say "Creating virtualenv…"
+  if ! python3 -m venv "$dir" >/dev/null 2>&1 || ! venv_usable "$dir"; then
+    rm -rf "$dir"
+    die "python3 can't create a virtualenv with pip on this machine. Fix it with: $(python_setup_hint) — then run ./install.sh again."
+  fi
+}
+
 REPO_URL="${VROXY_REPO_URL:-https://github.com/VroxyAI/vroxy.git}"
 CHECKOUT="${VROXY_HOME:-$HOME/.local/share/vroxy}"
 
@@ -75,10 +105,7 @@ bootstrap_if_piped() {
 # ── venv ──────────────────────────────────────────────────────────
 ensure_venv() {
   need python3
-  if [[ ! -x "$HERE/.venv/bin/python" ]]; then
-    say "Creating virtualenv…"
-    python3 -m venv "$HERE/.venv"
-  fi
+  make_venv "$HERE/.venv"
   say "Installing Python dependencies…"
   # `python -m pip`, never the `pip` script: its shebang hardcodes the
   # venv's ORIGINAL absolute path, so a venv that was copied from
@@ -345,19 +372,19 @@ install_cli() {
   need python3
   if command -v pipx >/dev/null 2>&1; then
     pipx install --force "$HERE" >/dev/null || die "pipx install failed"
-  elif python3 -m pip install --user --quiet --upgrade "$HERE" 2>/dev/null; then
+  elif python3 -m pip --version >/dev/null 2>&1 &&
+       python3 -m pip install --user --quiet --upgrade "$HERE" 2>/dev/null; then
     :
   else
     # PEP 668: a distro-managed python refuses --user installs.  Own a
     # venv rather than arguing with it, and put the entry point on the
     # PATH by hand.  No root, nothing outside $HOME.
-    say "System python is externally managed — installing the CLI into its own venv."
-    if [[ ! -x "$HERE/.venv-cli/bin/python" ]]; then
-      python3 -m venv "$HERE/.venv-cli" || {
-        rm -rf "$HERE/.venv-cli"
-        die "could not create a virtualenv — on Debian/Ubuntu: sudo apt install python3-venv"
-      }
+    if python3 -m pip --version >/dev/null 2>&1; then
+      say "System python is externally managed — installing the CLI into its own venv."
+    else
+      say "System python has no pip — installing the CLI into its own venv."
     fi
+    make_venv "$HERE/.venv-cli"
     "$HERE/.venv-cli/bin/python" -m pip install --quiet --upgrade "$HERE" ||
       die "venv install failed"
     mkdir -p "$HOME/.local/bin"
@@ -440,6 +467,8 @@ migrate_legacy() {
   say "Scheduled. The old unit stops and the new one starts in ~2s;"
   say "in-flight work is spooled and replayed. Check: ./install.sh --list"
 }
+
+[[ "${BASH_SOURCE[0]:-$0}" == "$0" ]] || return 0
 
 bootstrap_if_piped "$@"
 

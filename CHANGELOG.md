@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.48.1
+
+### Fixed
+- `install.sh` on a fresh Debian/Ubuntu box: when `python3 -m venv`
+  failed for want of `ensurepip`, it left a `.venv/bin/python` behind,
+  and the next run trusted it and died on "No module named pip". A venv
+  now counts only if `python -m pip` works in it; a half-made one is
+  removed and rebuilt, and a failure names the exact package to install
+  (`sudo apt install python3-venv python3-pip python3.X-venv`, or the
+  dnf / apk / brew equivalent).
+- `install.sh --cli` no longer claims "externally managed" when python3
+  simply has no pip; it says so and uses its own venv.
+- `install.sh` can be sourced by tests without running (`tests/test_install.py`).
+
 ## 0.48.0
 
 ### Added
