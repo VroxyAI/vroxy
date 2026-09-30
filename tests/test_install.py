@@ -174,6 +174,22 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual("My-Agent-2.0", result.stdout.strip())
 
+    def test_env_field_reads_a_key_from_env_contents(self):
+        result = run_sourced(
+            "v=$(printf 'CODE_ROOT=/a/b\\nPROJECT=web\\n')\n"
+            "env_field \"$v\" CODE_ROOT"
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("/a/b", result.stdout.strip())
+
+    def test_env_field_returns_empty_for_a_missing_key(self):
+        result = run_sourced(
+            "v=$(printf 'CODE_ROOT=/a/b\\n')\n"
+            "env_field \"$v\" PROJECT"
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stdout.strip())
+
 
 if __name__ == "__main__":
     unittest.main()

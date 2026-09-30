@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.51.8
+
+### Added
+- `install.sh --doctor` — a config health check over every installed
+  instance. It flags the misconfigurations that only surface later: a
+  `VROXY_INSTALL_ID` shared between two agents (two processes, one room),
+  a `VROXY_DISPATCH_UNIT` that points at another instance (self-update
+  restarting the wrong unit), a `CODE_ROOT`/`PROJECT` that doesn't
+  resolve, a missing token, duplicate agent names, and a unit that isn't
+  running — each with the exact fix. Exits non-zero when anything is
+  wrong. `--list` now also shows each instance's agent name and project.
+
 ## 0.51.7
 
 ### Added

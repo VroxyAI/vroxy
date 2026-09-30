@@ -8,6 +8,7 @@
 #   ./install.sh --unattended add a workspace from the environment
 #   ./install.sh --update     git pull + reinstall deps + restart all
 #   ./install.sh --list       what's installed, and whether it's up
+#   ./install.sh --doctor     check every env file for misconfig and print fixes
 #   ./install.sh --remove ID  stop, disable and forget one instance
 #   ./install.sh --migrate-legacy [ID]
 #                             move a pre-template unit onto the
@@ -82,6 +83,12 @@ trap restore_tty EXIT
 repo_resolves() { [[ -d "${1%/}/${2}" ]]; }
 is_git_repo()   { [[ -e "${1%/}/.git" ]]; }
 sanitize_instance_id() { printf '%s\n' "${1//[^a-zA-Z0-9._-]/-}"; }
+
+# Env files live under a root:root 0750 dir, so reading one is a `sudo`.
+# `env_field` pulls one KEY=value out of a file's CONTENTS (a string, not a
+# path), so the parse is testable without touching /etc.
+read_env() { sudo -n cat "${ENV_DIR}/${1}.env" 2>/dev/null || true; }
+env_field() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1; }
 
 python_setup_hint() {
   local ver
@@ -451,14 +458,125 @@ list_instances() {
   while read -r id; do
     [[ -n "$id" ]] || continue
     any=1
-    printf '%-20s %s\n' "$id" "$(systemctl is-active "vroxy-dispatch@${id}.service" 2>/dev/null || echo unknown)"
+    local contents name project
+    contents="$(read_env "$id")"
+    name="$(env_field "$contents" VROXY_AGENT_NAME)"
+    project="$(env_field "$contents" PROJECT)"
+    printf '%-20s %-9s agent=%-16s project=%s\n' \
+      "$id" "$(systemctl is-active "vroxy-dispatch@${id}.service" 2>/dev/null || echo unknown)" \
+      "${name:-?}" "${project:-?}"
   done < <(instances)
   if legacy_present; then
     any=1
-    printf '%-20s %s  (legacy unit — ./install.sh --migrate-legacy)\n' \
-      "$LEGACY_UNIT" "$(systemctl is-active "$LEGACY_UNIT" 2>/dev/null || echo unknown)"
+    printf '%-20s %-9s %s\n' \
+      "$LEGACY_UNIT" "$(systemctl is-active "$LEGACY_UNIT" 2>/dev/null || echo unknown)" \
+      "(legacy unit — ./install.sh --migrate-legacy)"
   fi
   [[ $any -eq 1 ]] || say "Nothing installed yet — run ./install.sh"
+}
+
+# A health check over every env file on the box: the misconfigurations an
+# agent can carry that only show up later — a shared install id (two agents,
+# one room), a CODE_ROOT/PROJECT that doesn't resolve, a unit name that
+# points at another instance — each with the exact fix. Exits non-zero when
+# anything is wrong so a script can gate on it.
+doctor() {
+  if ! sudo -n true 2>/dev/null; then
+    warn "cannot read ${ENV_DIR} without passwordless sudo — run with sudo, or grant it."
+    return 2
+  fi
+
+  local ids=() id
+  while read -r id; do
+    [[ -n "$id" ]] && ids+=("$id")
+  done < <(instances)
+
+  if [[ ${#ids[@]} -eq 0 ]]; then
+    say "Nothing installed yet — run ./install.sh"
+    return 0
+  fi
+
+  local problems=0
+  declare -A install_ids=()
+  declare -A agent_names=()
+
+  say "Checking ${#ids[@]} instance(s)…"
+  for id in "${ids[@]}"; do
+    local contents token install_id agent_name unit code_root project
+    contents="$(read_env "$id")"
+    token="$(env_field "$contents" VROXY_SERVICE_TOKEN)"
+    install_id="$(env_field "$contents" VROXY_INSTALL_ID)"
+    agent_name="$(env_field "$contents" VROXY_AGENT_NAME)"
+    unit="$(env_field "$contents" VROXY_DISPATCH_UNIT)"
+    code_root="$(env_field "$contents" CODE_ROOT)"
+    project="$(env_field "$contents" PROJECT)"
+
+    say ""
+    say "${id} — agent \"${agent_name:-?}\""
+
+    if [[ -z "$token" ]]; then
+      warn "  !! no VROXY_SERVICE_TOKEN"
+      warn "     fix: ./install.sh --dispatch (or --unattended with VROXY_TOKEN)"
+      problems=$((problems + 1))
+    fi
+
+    if [[ -z "$install_id" ]]; then
+      warn "  !! no VROXY_INSTALL_ID"
+      warn "     fix: set one — python3 -c 'import uuid; print(uuid.uuid4().hex)'"
+      problems=$((problems + 1))
+    elif [[ -n "${install_ids[$install_id]:-}" ]]; then
+      warn "  !! VROXY_INSTALL_ID ${install_id} is shared with ${install_ids[$install_id]} — two agents merge into one room"
+      warn "     fix: give this instance a fresh id (the command above), not another instance's"
+      problems=$((problems + 1))
+    else
+      install_ids[$install_id]="$id"
+    fi
+
+    if [[ -n "$agent_name" ]]; then
+      if [[ -n "${agent_names[$agent_name]:-}" ]]; then
+        warn "  !! agent name \"${agent_name}\" is also used by ${agent_names[$agent_name]} — names must be unique per workspace"
+        problems=$((problems + 1))
+      else
+        agent_names[$agent_name]="$id"
+      fi
+    fi
+
+    if [[ -n "$unit" && "$unit" != "vroxy-dispatch@${id}.service" ]]; then
+      warn "  !! VROXY_DISPATCH_UNIT=${unit} should be vroxy-dispatch@${id}.service — self-update would restart the wrong unit"
+      warn "     fix: sudo sed -i 's|^VROXY_DISPATCH_UNIT=.*|VROXY_DISPATCH_UNIT=vroxy-dispatch@${id}.service|' ${ENV_DIR}/${id}.env"
+      problems=$((problems + 1))
+    fi
+
+    if [[ -z "$code_root" || -z "$project" ]]; then
+      warn "  !! CODE_ROOT or PROJECT is missing"
+      warn "     fix: ./install.sh --dispatch (or set both in ${ENV_DIR}/${id}.env)"
+      problems=$((problems + 1))
+    elif repo_resolves "$code_root" "$project"; then
+      say "  ok  ${code_root}/${project}"
+    elif is_git_repo "$code_root"; then
+      say "  ok  single project ${code_root} (dispatch lifts it to $(dirname "$code_root") + $(basename "$code_root"))"
+    else
+      warn "  !! CODE_ROOT/PROJECT doesn't resolve: ${code_root}/${project} is not a directory"
+      warn "     fix: CODE_ROOT is the PARENT folder and PROJECT the repo name under it, or point CODE_ROOT straight at the repo"
+      problems=$((problems + 1))
+    fi
+
+    if systemctl is-active --quiet "vroxy-dispatch@${id}.service" 2>/dev/null; then
+      say "  ok  unit active"
+    else
+      warn "  !! unit vroxy-dispatch@${id}.service is not active"
+      warn "     fix: sudo systemctl enable --now vroxy-dispatch@${id}.service && journalctl -u vroxy-dispatch@${id} -n 50"
+      problems=$((problems + 1))
+    fi
+  done
+
+  say ""
+  if [[ $problems -eq 0 ]]; then
+    say "No problems found."
+  else
+    warn "$problems problem(s) found."
+  fi
+  return $(( problems > 0 ))
 }
 
 update_all() {
@@ -603,6 +721,7 @@ case "${1:-}" in
   --migrate-legacy) migrate_legacy "${2:-}" ;;
   --update) update_all ;;
   --list)   list_instances ;;
+  --doctor) doctor ;;
   --remove) remove_instance "${2:-}" ;;
   --help|-h)
     sed -n '2,20p' "$HERE/install.sh" | sed 's/^# \{0,1\}//'
