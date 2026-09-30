@@ -161,7 +161,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.5"
+AGENT_VERSION      = "vroxy_dispatch 0.51.6"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -5362,18 +5362,20 @@ def _is_ours(payload: dict) -> bool:
     """Whether work addressed to an agent belongs to THIS instance.
 
     Local agents all subscribe to the same tenant channel, so a
-    workspace running one Claude instance and one Codex instance
-    sees every room message twice.  The server names the agent it
-    routed to; anything addressed to another engine is somebody
-    else's turn.
-
-    A frame with no agent block predates this and is answered as
-    before — an older server must not go silent against a newer
-    dispatch.
+    workspace running several instances sees every room message once
+    per instance.  The server names the agent it routed to; two agents
+    on one box can share an engine, so the authoritative match is the
+    `install_id` when the frame carries one.  A frame that predates it
+    is matched on `kind` (engine), and a frame with no agent block is
+    answered as before — an older server must not go silent against a
+    newer dispatch.
     """
     agent = payload.get("agent")
     if not isinstance(agent, dict):
         return True
+    install_id = str(agent.get("install_id") or "").strip()
+    if install_id:
+        return bool(INSTALL_ID) and install_id == INSTALL_ID
     kind = (agent.get("kind") or "").strip()
     if not kind:
         return True

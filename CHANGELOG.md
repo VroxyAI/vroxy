@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.51.6
+
+### Fixed
+- Two dispatch agents on one box no longer both answer every room
+  message. Local agents all hear the same tenant channel, and `_is_ours`
+  matched on the agent's `kind` (engine) — so two same-engine agents
+  (e.g. two Claude instances) each saw the other's frame as their own.
+  It now matches on `install_id` first, falling back to `kind` for frames
+  that predate it, and to "answer it" when there is no agent block.
+
 ## 0.51.5
 
 ### Added

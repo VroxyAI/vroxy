@@ -2356,9 +2356,11 @@ class EngineAddressingTest(unittest.TestCase):
 
     def setUp(self):
         self._engine = fa.DISPATCH_ENGINE
+        self._install_id = fa.INSTALL_ID
 
     def tearDown(self):
         fa.DISPATCH_ENGINE = self._engine
+        fa.INSTALL_ID = self._install_id
 
     def test_claude_answers_a_claude_code_agent(self):
         fa.DISPATCH_ENGINE = "claude"
@@ -2381,6 +2383,23 @@ class EngineAddressingTest(unittest.TestCase):
         self.assertTrue(fa._is_ours({"room": {"hashid": "r1"}}))
         self.assertTrue(fa._is_ours({"agent": None}))
         self.assertTrue(fa._is_ours({"agent": {"name": "Dispatch"}}))
+
+    def test_install_id_outranks_kind_for_two_same_engine_agents(self):
+        fa.INSTALL_ID = "inst-a"
+        fa.DISPATCH_ENGINE = "claude"
+        self.assertTrue(fa._is_ours({"agent": {"kind": "claude_code", "install_id": "inst-a"}}))
+        self.assertFalse(fa._is_ours({"agent": {"kind": "claude_code", "install_id": "inst-b"}}))
+
+    def test_install_id_identifies_the_agent_across_an_engine_flip(self):
+        fa.INSTALL_ID = "inst-a"
+        fa.DISPATCH_ENGINE = "codex"
+        self.assertTrue(fa._is_ours({"agent": {"kind": "claude_code", "install_id": "inst-a"}}))
+
+    def test_a_kind_only_frame_still_matches_by_engine(self):
+        fa.INSTALL_ID = "inst-a"
+        fa.DISPATCH_ENGINE = "claude"
+        self.assertTrue(fa._is_ours({"agent": {"kind": "claude_code"}}))
+        self.assertFalse(fa._is_ours({"agent": {"kind": "codex"}}))
 
     def test_the_heartbeat_names_the_engine(self):
         sent = {}
