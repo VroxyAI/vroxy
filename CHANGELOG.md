@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.50.1
+
+### Changed
+- Every log line now carries the live harness — the dispatch log
+  prefix reads `[engine] [task]`, so a line from a tool call, a
+  heartbeat or a reply says which `DISPATCH_ENGINE` produced it.
+
 ## 0.50.0
 
 ### Added

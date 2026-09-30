@@ -146,7 +146,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.50.0"
+AGENT_VERSION      = "vroxy_dispatch 0.50.1"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -198,11 +198,12 @@ def task_label() -> str:
 class _TaskFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.task = task_label()
+        record.engine = DISPATCH_ENGINE
         return True
 
 
 def _setup_logging() -> logging.Logger:
-    fmt   = logging.Formatter("%(asctime)s %(levelname)s [%(task)s] %(message)s")
+    fmt   = logging.Formatter("%(asctime)s %(levelname)s [%(engine)s] [%(task)s] %(message)s")
     level = os.environ.get("LOG_LEVEL", "INFO").upper()
 
     root = logging.getLogger()

@@ -3498,6 +3498,11 @@ class TaskLabelTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fa._TaskFilter().filter(record))
         self.assertEqual("#Claude what is it working on", record.task)
 
+    def test_every_record_carries_the_engine(self):
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, "x", None, None)
+        fa._TaskFilter().filter(record)
+        self.assertEqual(fa.DISPATCH_ENGINE, record.engine)
+
     def test_an_idle_record_says_idle_rather_than_blank(self):
         fa.set_task_label("")
         record = logging.LogRecord("t", logging.INFO, __file__, 1, "x", None, None)
