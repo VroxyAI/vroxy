@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.49.1
+
+### Fixed
+- Flipping the engine kept reporting the previous harness's model: a
+  harness like opencode never puts its model in the stream, so the
+  heartbeat's model stayed at whatever the last claude/cursor run
+  served. `_adopt_engine` now clears the last-seen model on a flip, so
+  the admin page no longer says "claude" while running opencode.
+- `vroxy_cli/version.py` and `pyproject.toml` now track `AGENT_VERSION`
+  again — they were left on 0.48.3 when 0.49.0 shipped.
+
 ## 0.49.0
 
 ### Changed

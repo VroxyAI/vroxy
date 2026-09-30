@@ -890,10 +890,12 @@ class SetDispatchEngineTest(unittest.TestCase):
         self._prev = os.environ.get("VROXY_DISPATCH_ENV_FILE")
         os.environ["VROXY_DISPATCH_ENV_FILE"] = str(self.env)
         self._prev_engine = fa.DISPATCH_ENGINE
+        self._prev_model = fa._last_model
         self.addCleanup(self._restore_env)
 
     def _restore_env(self):
         fa.DISPATCH_ENGINE = self._prev_engine
+        fa._last_model = self._prev_model
         if self._prev is None:
             os.environ.pop("VROXY_DISPATCH_ENV_FILE", None)
         else:
@@ -933,6 +935,14 @@ class SetDispatchEngineTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual("codex", fa.DISPATCH_ENGINE,
                          "the next run must use the new engine without a restart")
+
+    def test_adoption_clears_the_stale_model(self):
+        fa.DISPATCH_ENGINE = "claude"
+        fa._last_model = "claude-sonnet-4-5"
+        ok, _ = fa.set_dispatch_engine("opencode")
+        self.assertTrue(ok)
+        self.assertIsNone(fa._last_model,
+                          "a flip must not keep reporting the previous engine's model")
 
 
 class EngineFlipTest(unittest.IsolatedAsyncioTestCase):

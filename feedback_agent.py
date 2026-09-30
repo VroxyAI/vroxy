@@ -146,7 +146,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.49.0"
+AGENT_VERSION      = "vroxy_dispatch 0.49.1"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1572,11 +1572,15 @@ def _adopt_engine(engine: str) -> None:
     The engine is read at call time everywhere (run dispatch, the
     heartbeat, `_is_ours`), so updating the module global is enough
     for the next run to use it.  The health picture is engine-specific
-    and must not carry into a different harness's turn."""
-    global DISPATCH_ENGINE, _engine_fault, _harness_cache
+    and must not carry into a different harness's turn — and neither
+    may the last-seen model, which a harness like opencode never
+    reports, so it would otherwise keep lying about the previous
+    engine's model."""
+    global DISPATCH_ENGINE, _engine_fault, _harness_cache, _last_model
     DISPATCH_ENGINE = engine
     _engine_fault = None
     _harness_cache = None
+    _last_model = None
 
 
 def set_dispatch_engine(engine: str) -> tuple[bool, str]:
