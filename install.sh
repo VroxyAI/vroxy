@@ -75,6 +75,12 @@ restore_tty() {
 }
 trap restore_tty EXIT
 
+# True when a code_root + project resolve to a real directory — the folder
+# the agent will work in. False when the operator pointed code_root INTO
+# the repo (code_root=/a/repo + project=repo → /a/repo/repo), which is the
+# "CODE_ROOT/… not found" crash the agent hits later in the room.
+repo_resolves() { [[ -d "${1%/}/${2}" ]]; }
+
 python_setup_hint() {
   local ver
   ver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 3)"
@@ -364,12 +370,21 @@ add_workspace() {
   read_prompt confirm "Install dispatch for this workspace? [Y/n]: "
   [[ -z "$confirm" || "$confirm" == "y" || "$confirm" == "Y" ]] || exit 1
 
-  read_prompt code_root "Code root (the folder holding the repos it works on) [$(dirname "$HERE")]: "
+  read_prompt code_root "Code root (the PARENT folder that holds your repos) [$(dirname "$HERE")]: "
   code_root="${code_root:-$(dirname "$HERE")}"
   [[ -d "$code_root" ]] || die "no such directory: $code_root"
 
-  read_prompt project "Default project (repo folder name under that root) [vroxy_web]: "
+  read_prompt project "Default project (the repo folder's name under that root) [vroxy_web]: "
   project="${project:-vroxy_web}"
+
+  if ! repo_resolves "$code_root" "$project"; then
+    warn "No repo at $code_root/$project"
+    warn "Code root is the PARENT folder that holds your repos, and the"
+    warn "project is a folder under it — e.g. code_root=$code_root,"
+    warn "project=$project would need $code_root/$project to exist."
+    read_prompt go "Continue anyway? [y/N]: "
+    [[ "$go" == "y" || "$go" == "Y" ]] || exit 1
+  fi
 
   read_prompt agent_name "Agent name as it appears in the workspace [Dispatch]: "
   agent_name="${agent_name:-Dispatch}"

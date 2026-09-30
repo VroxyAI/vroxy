@@ -145,6 +145,18 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual("GOT=[plain-host]", result.stdout.strip())
 
+    def test_repo_resolves_accepts_parent_and_rejects_repo_as_root(self):
+        parent = self.tmp / "brevitas"
+        (parent / "brev72true").mkdir(parents=True)
+
+        ok = run_sourced(f'repo_resolves "{parent}" brev72true && echo yes || echo no')
+        self.assertEqual(0, ok.returncode, ok.stderr)
+        self.assertEqual("yes", ok.stdout.strip())
+
+        bad = run_sourced(f'repo_resolves "{parent / "brev72true"}" brev72true && echo yes || echo no')
+        self.assertEqual(0, bad.returncode, bad.stderr)
+        self.assertEqual("no", bad.stdout.strip())
+
 
 if __name__ == "__main__":
     unittest.main()

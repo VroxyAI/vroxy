@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.51.4
+
+### Fixed
+- `install.sh` now catches a code root pointed INTO the repo. The prompts
+  read "the PARENT folder that holds your repos" + "the repo folder's name
+  under that root", and if `code_root/project` isn't a real directory the
+  installer warns and asks before wiring it up — instead of the agent
+  crashing later in the room with `FileNotFoundError: CODE_ROOT/brev72true
+  not found at '…/brev72true/brev72true'`.
+
 ## 0.51.3
 
 ### Fixed
