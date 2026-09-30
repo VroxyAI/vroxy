@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.51.0
+
+### Added
+- `room.reorder` — the server can now hand dispatch an ordered list of
+  queued message hashids and dispatch rebuilds its in-memory queue to
+  match. `apply_queued_reorder` only reorders queued ROOM tasks: the
+  in-flight one is already off the queue, and non-room work (feedback /
+  approve) keeps its exact position.
+
 ## 0.50.1
 
 ### Changed

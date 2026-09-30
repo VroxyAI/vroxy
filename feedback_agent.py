@@ -146,7 +146,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.50.1"
+AGENT_VERSION      = "vroxy_dispatch 0.51.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -4490,6 +4490,40 @@ def apply_queued_edit(room_hashid: str, message_hashid: str, body: str) -> bool:
     return changed
 
 
+def apply_queued_reorder(order: list[str]) -> bool:
+    """Rebuild the queue so queued ROOM tasks follow `order`.
+
+    The in-flight task is not on the queue (the worker holds it), so it
+    cannot be moved — and non-room tasks (feedback/approve) keep their
+    exact positions.  Only the room tasks' relative order changes."""
+    if _work_queue is None or not order:
+        return False
+
+    items: list[tuple[str, dict]] = []
+    while not _work_queue.empty():
+        try:
+            items.append(_work_queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    room_items = {
+        (payload.get("message") or {}).get("hashid") or "": (kind, payload)
+        for kind, payload in items if kind == "room"
+    }
+    ordered = [room_items.pop(hashid) for hashid in order if hashid in room_items]
+    reordered = ordered + list(room_items.values())
+
+    room_index = 0
+    for kind, payload in items:
+        if kind == "room":
+            _work_queue.put_nowait(reordered[room_index])
+            room_index += 1
+        else:
+            _work_queue.put_nowait((kind, payload))
+
+    return bool(ordered)
+
+
 def spool_pending_work() -> int:
     """Write the in-flight task and everything still queued to disk.
 
@@ -5647,6 +5681,13 @@ async def process_stream(link: CableLink, ws) -> None:
                 mid = (msg.get("message") or {}).get("hashid")
                 removed = drop_queued(mid or "")
                 log.info("room work dropped message=%s removed=%s", mid, removed)
+            elif msg.get("type") == "room.reorder":
+                order = msg.get("order")
+                if isinstance(order, list):
+                    reordered = apply_queued_reorder([str(h) for h in order])
+                    log.info("room queue reordered=%s count=%d", reordered, len(order))
+                else:
+                    log.warning("room.reorder without an order list — ignoring")
             elif msg.get("type") == "room.kill":
                 hashid = (msg.get("message") or {}).get("hashid")
                 killed = request_cancel(hashid)

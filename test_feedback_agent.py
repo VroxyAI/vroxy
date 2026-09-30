@@ -3578,6 +3578,55 @@ class QueuedEditTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("fb", items[0][1]["message"]["body"])
 
 
+class QueuedReorderTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        fa._work_queue = asyncio.Queue()
+
+    async def asyncTearDown(self):
+        fa._work_queue = None
+
+    def room_task(self, hashid):
+        return ("room", {"room": {"hashid": "room1"},
+                         "message": {"hashid": hashid, "body": hashid}})
+
+    async def drain(self):
+        out = []
+        while not fa._work_queue.empty():
+            out.append(fa._work_queue.get_nowait())
+        return out
+
+    def hashids(self, items):
+        return [(kind, (payload.get("message") or {}).get("hashid")) for kind, payload in items]
+
+    async def test_room_tasks_follow_the_new_order(self):
+        for h in ("m0", "m1", "m2", "m3"):
+            fa._work_queue.put_nowait(self.room_task(h))
+
+        self.assertTrue(fa.apply_queued_reorder(["m3", "m1", "m2", "m0"]))
+
+        self.assertEqual([("room", "m3"), ("room", "m1"), ("room", "m2"), ("room", "m0")],
+                         self.hashids(await self.drain()))
+
+    async def test_non_room_work_keeps_its_position(self):
+        fa._work_queue.put_nowait(self.room_task("m0"))
+        fa._work_queue.put_nowait(("feedback", {"message": {"hashid": "f1", "body": "fb"}}))
+        fa._work_queue.put_nowait(self.room_task("m1"))
+
+        self.assertTrue(fa.apply_queued_reorder(["m1", "m0"]))
+
+        self.assertEqual([("room", "m1"), ("feedback", "f1"), ("room", "m0")],
+                         self.hashids(await self.drain()))
+
+    async def test_an_empty_order_changes_nothing(self):
+        fa._work_queue.put_nowait(self.room_task("m0"))
+        fa._work_queue.put_nowait(self.room_task("m1"))
+
+        self.assertFalse(fa.apply_queued_reorder([]))
+
+        self.assertEqual([("room", "m0"), ("room", "m1")],
+                         self.hashids(await self.drain()))
+
+
 class DropQueuedTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         fa._work_queue = asyncio.Queue()
