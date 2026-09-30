@@ -81,6 +81,7 @@ trap restore_tty EXIT
 # "CODE_ROOT/… not found" crash the agent hits later in the room.
 repo_resolves() { [[ -d "${1%/}/${2}" ]]; }
 is_git_repo()   { [[ -e "${1%/}/.git" ]]; }
+sanitize_instance_id() { printf '%s\n' "${1//[^a-zA-Z0-9._-]/-}"; }
 
 python_setup_hint() {
   local ver
@@ -399,8 +400,20 @@ add_workspace() {
   id="${slug:-workspace}"
   local env_file="${ENV_DIR}/${id}.env"
   if [[ -e "$env_file" ]]; then
-    read_prompt over "${id} is already installed — overwrite its config? [y/N]: "
-    [[ "$over" == "y" || "$over" == "Y" ]] || exit 1
+    say "${id} is already installed on this machine."
+    read_prompt another "Add a second agent for this workspace instead? [y/N]: "
+    if [[ "$another" == "y" || "$another" == "Y" ]]; then
+      id="${slug}-$(sanitize_instance_id "$agent_name")"
+      env_file="${ENV_DIR}/${id}.env"
+      while [[ -e "$env_file" ]]; do
+        read_prompt id "Instance id for this one (e.g. ${slug}-frontend): "
+        [[ -n "$id" ]] || exit 1
+        env_file="${ENV_DIR}/${id}.env"
+      done
+    else
+      read_prompt over "Overwrite the existing ${slug} config? [y/N]: "
+      [[ "$over" == "y" || "$over" == "Y" ]] || exit 1
+    fi
   fi
 
   write_env_file "$id" "$name" "$host" "$token" "$agent_name" "$code_root" "$project"

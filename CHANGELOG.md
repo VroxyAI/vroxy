@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.51.7
+
+### Added
+- `install.sh --dispatch` now supports a second agent in the SAME
+  workspace. A second run used to hardcode the instance id to the
+  workspace slug and offer only "overwrite", so adding a second project
+  meant hand-copying an env file — which is how two agents ended up
+  sharing one `VROXY_INSTALL_ID` and one room. A collision now offers
+  "add a second agent" and prompts for a distinct instance id (default
+  `slug-agentname`), overwrite remaining the explicit other option.
+
 ## 0.51.6
 
 ### Fixed

@@ -169,6 +169,11 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(0, no.returncode, no.stderr)
         self.assertEqual("no", no.stdout.strip())
 
+    def test_sanitize_instance_id_maps_unsafe_chars_to_dash(self):
+        result = run_sourced('sanitize_instance_id "My Agent 2.0"')
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("My-Agent-2.0", result.stdout.strip())
+
 
 if __name__ == "__main__":
     unittest.main()
