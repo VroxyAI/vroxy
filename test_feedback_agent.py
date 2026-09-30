@@ -889,9 +889,11 @@ class SetDispatchEngineTest(unittest.TestCase):
         self.env.write_text("FOO=1\nDISPATCH_ENGINE=claude\nBAR=2\n")
         self._prev = os.environ.get("VROXY_DISPATCH_ENV_FILE")
         os.environ["VROXY_DISPATCH_ENV_FILE"] = str(self.env)
+        self._prev_engine = fa.DISPATCH_ENGINE
         self.addCleanup(self._restore_env)
 
     def _restore_env(self):
+        fa.DISPATCH_ENGINE = self._prev_engine
         if self._prev is None:
             os.environ.pop("VROXY_DISPATCH_ENV_FILE", None)
         else:
@@ -924,6 +926,59 @@ class SetDispatchEngineTest(unittest.TestCase):
         ok, _ = fa.set_dispatch_engine("cursor-agent")
         self.assertTrue(ok)
         self.assertIn("DISPATCH_ENGINE=cursor\n", self.env.read_text())
+
+    def test_adopts_the_engine_in_process(self):
+        fa.DISPATCH_ENGINE = "claude"
+        ok, _ = fa.set_dispatch_engine("codex")
+        self.assertTrue(ok)
+        self.assertEqual("codex", fa.DISPATCH_ENGINE,
+                         "the next run must use the new engine without a restart")
+
+
+class EngineFlipTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = Path(self.tmp.name) / "vroxy-dispatch"
+        self.env.write_text("DISPATCH_ENGINE=claude\n")
+        self._prev_env = os.environ.get("VROXY_DISPATCH_ENV_FILE")
+        os.environ["VROXY_DISPATCH_ENV_FILE"] = str(self.env)
+        self._saved = (fa.DISPATCH_ENGINE, fa.heartbeat, fa.clear_sessions,
+                       fa.schedule_restart, fa.RESTART_NOTICE_PATH)
+        fa.DISPATCH_ENGINE = "claude"
+        fa.RESTART_NOTICE_PATH = Path(self.tmp.name) / "restart-notice.json"
+        self.heartbeats = []
+        self.restarts = []
+
+        async def _fake_heartbeat(ws):
+            self.heartbeats.append(1)
+
+        fa.heartbeat = _fake_heartbeat
+        fa.clear_sessions = lambda keys=None: ["rm123456"]
+        fa.schedule_restart = lambda: (self.restarts.append(1), (True, "unit-test"))[1]
+
+    async def asyncTearDown(self):
+        (fa.DISPATCH_ENGINE, fa.heartbeat, fa.clear_sessions,
+         fa.schedule_restart, fa.RESTART_NOTICE_PATH) = self._saved
+        if self._prev_env is None:
+            os.environ.pop("VROXY_DISPATCH_ENV_FILE", None)
+        else:
+            os.environ["VROXY_DISPATCH_ENV_FILE"] = self._prev_env
+
+    async def test_a_flip_adopts_in_process_without_a_restart(self):
+        link = fa.CableLink()
+        await fa.handle_engine_command(link, "rm123456", "codex", None)
+
+        self.assertEqual("codex", fa.DISPATCH_ENGINE)
+        self.assertEqual([1], self.heartbeats,
+                         "the heartbeat must fire immediately so the server moves the agent row")
+        self.assertEqual([], self.restarts, "a flip must not schedule a restart")
+        self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
+        replies = frames_of(link, "room_reply")
+        self.assertEqual(1, len(replies))
+        self.assertIn("Flipped", replies[0]["body"])
+        self.assertIn("codex", replies[0]["body"])
+        self.assertIn("No restart", replies[0]["body"])
 
 
 class SplitRoomBodyTest(unittest.TestCase):

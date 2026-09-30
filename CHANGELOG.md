@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.49.0
+
+### Changed
+- Flipping the engine (`/engine <name>`) no longer restarts the
+  process: `set_dispatch_engine` adopts the new engine in-process
+  (`DISPATCH_ENGINE` is read at call time everywhere), and the flip
+  sends the heartbeat immediately so the server moves the agent row to
+  the new kind instead of waiting for the next beat. A self-update
+  still restarts, since new code has to load.
+
 ## 0.48.3
 
 ### Fixed

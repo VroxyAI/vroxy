@@ -146,7 +146,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.48.3"
+AGENT_VERSION      = "vroxy_dispatch 0.49.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1566,8 +1566,23 @@ def engine_env_path() -> Path:
         "VROXY_DISPATCH_ENV_FILE", "/etc/default/vroxy-dispatch"))
 
 
+def _adopt_engine(engine: str) -> None:
+    """Re-point DISPATCH_ENGINE in this process — no restart needed.
+
+    The engine is read at call time everywhere (run dispatch, the
+    heartbeat, `_is_ours`), so updating the module global is enough
+    for the next run to use it.  The health picture is engine-specific
+    and must not carry into a different harness's turn."""
+    global DISPATCH_ENGINE, _engine_fault, _harness_cache
+    DISPATCH_ENGINE = engine
+    _engine_fault = None
+    _harness_cache = None
+
+
 def set_dispatch_engine(engine: str) -> tuple[bool, str]:
-    """Rewrite DISPATCH_ENGINE in the unit's EnvironmentFile.
+    """Rewrite DISPATCH_ENGINE in the unit's EnvironmentFile and adopt
+    it in-process, so a flip takes effect on the next run rather than
+    waiting for a restart.
 
     Returns (ok, detail). Needs write access (or passwordless sudo)
     on that file — same bar schedule_restart already assumes."""
@@ -1591,6 +1606,7 @@ def set_dispatch_engine(engine: str) -> tuple[bool, str]:
 
     try:
         path.write_text(new_text)
+        _adopt_engine(engine)
         return True, str(path)
     except OSError:
         pass
@@ -1604,6 +1620,7 @@ def set_dispatch_engine(engine: str) -> tuple[bool, str]:
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         return False, detail or f"sudo tee {path} failed"
+    _adopt_engine(engine)
     return True, str(path)
 
 
@@ -3702,9 +3719,8 @@ async def handle_engine_command(ws, room_id: str, target: str | None,
 
     Bare (no target) posts a RoomAsk of the other available engines
     so web / phone / watch can tap one. A flip rewrites the unit
-    EnvironmentFile and schedules the same delayed restart
-    self-update uses, so the harness mid-reply is not killed by a
-    bare systemctl restart."""
+    EnvironmentFile AND adopts the engine in-process, so the next run
+    uses it without a restart."""
     current = DISPATCH_ENGINE
     available = known_engines()
     if not target:
@@ -3717,7 +3733,7 @@ async def handle_engine_command(ws, room_id: str, target: str | None,
             return
         posted = await post_room_reply(
             ws, room_id,
-            [f"Harness is `{current}`. Pick one to flip — restarts this unit in a few seconds."],
+            [f"Harness is `{current}`. Pick one to flip — no restart needed."],
             reply_to)
         await room_ask(ws, room_id, posted, {
             "prompt": "Flip to which harness?",
@@ -3750,30 +3766,19 @@ async def handle_engine_command(ws, room_id: str, target: str | None,
             reply_to)
         return
 
+    # set_dispatch_engine adopted the engine in-process, so the next
+    # run uses it without a restart.  The heartbeat goes out now — not
+    # up to a beat later — so the server moves the agent row to the new
+    # kind immediately; otherwise a claude→codex flip declines work
+    # still addressed to the old kind for the rest of the interval.
     clear_sessions()
+    await heartbeat(ws)
     await room_reply(
         ws, room_id,
-        f"🔄 Flipping harness `{current}` → `{wanted}` — restarting, "
-        f"back in a few seconds.",
+        f"🔄 Flipped harness `{current}` → `{wanted}` — the next "
+        f"message runs it. No restart needed.",
         reply_to)
-    write_restart_notice(room_id, reply_to, AGENT_VERSION,
-                         engine_from=current, engine_to=wanted)
-    ok, detail = await asyncio.to_thread(schedule_restart)
-    if ok:
-        log.info("engine flip %s → %s; restart scheduled (%s)",
-                 current, wanted, detail)
-        return
-
-    log.error("engine flip wrote env but restart failed: %s", detail)
-    with contextlib.suppress(OSError):
-        RESTART_NOTICE_PATH.unlink()
-    await room_reply(
-        ws, room_id,
-        f"⚠️ Wrote `DISPATCH_ENGINE={wanted}` but couldn't restart "
-        f"({detail}). Still answering as `{current}` until "
-        f"`sudo systemctl restart {SERVICE_UNIT}` — or use the "
-        f"restart_dispatch skill.",
-        reply_to)
+    log.info("engine flip %s → %s (in-process, no restart)", current, wanted)
 
 
 async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
