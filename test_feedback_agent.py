@@ -2323,13 +2323,16 @@ class HarnessProbeTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self._path = os.environ.get("PATH", "")
         self._engine = fa.DISPATCH_ENGINE
+        self._home = os.environ.get("HOME", "")
         os.environ["PATH"] = self.tmp
+        os.environ["HOME"] = self.tmp
         fa._harness_cache = None
         self._quotas = fa.quotas
         fa.quotas = lambda now=None: {}
 
     def tearDown(self):
         os.environ["PATH"] = self._path
+        os.environ["HOME"] = self._home
         fa.DISPATCH_ENGINE = self._engine
         fa.quotas = self._quotas
         fa._harness_cache = None
@@ -2380,6 +2383,15 @@ class HarnessProbeTest(unittest.TestCase):
         found = fa.probe_harnesses()
         self.assertEqual(found[0]["engine"], "gemini")
         self.assertIn("gemini", fa.HARNESS_SPECS)
+
+    def test_a_cli_in_its_own_home_install_dir_is_found_off_path(self):
+        own = Path(self.tmp) / ".opencode" / "bin"
+        own.mkdir(parents=True)
+        binary = own / "opencode"
+        binary.write_text('#!/bin/sh\necho "1.0.0"\n')
+        binary.chmod(0o755)
+        self.assertEqual(fa._resolve_harness_bin("opencode", "OPENCODE_BIN"), str(binary))
+        self.assertEqual([h["id"] for h in fa.probe_harnesses()], ["opencode"])
 
     def test_an_explicit_bin_override_wins_over_path(self):
         outside = Path(self.tmp) / "elsewhere"

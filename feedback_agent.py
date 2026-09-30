@@ -146,7 +146,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.48.2"
+AGENT_VERSION      = "vroxy_dispatch 0.48.3"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -460,11 +460,9 @@ def probe_harnesses() -> list[dict]:
     different problem from not installed, and flattening the two into
     "absent" hides the one worth fixing.
     """
-    from shutil import which
     found = []
     for h in KNOWN_HARNESSES:
-        override = os.environ.get(f"{h['id'].upper()}_BIN")
-        path = override if override and Path(override).exists() else which(h["bin"])
+        path = _resolve_harness_bin(h["bin"], f"{h['id'].upper()}_BIN")
         if not path:
             continue
         entry = {"id": h["id"], "label": h["label"]}
@@ -2238,6 +2236,22 @@ def worktree_changed_files(worktree: Path) -> list[dict]:
     return files
 
 
+def _resolve_harness_bin(name: str, env_var: str) -> str | None:
+    override = os.environ.get(env_var)
+    if override and Path(override).exists():
+        return override
+    from shutil import which
+    on_path = which(name)
+    if on_path:
+        return on_path
+    home = Path.home()
+    for guess in (home / ".local/bin" / name, home / f".{name}/bin" / name,
+                  home / "bin" / name, Path("/usr/local/bin") / name):
+        if guess.is_file() and os.access(guess, os.X_OK):
+            return str(guess)
+    return None
+
+
 def _resolve_claude_bin() -> str:
     """Same resolution order as bin/claude-chat: $CLAUDE_BIN → PATH
     → ~/.local/bin/claude → /usr/local/bin/claude.  Fail-loud so a
@@ -3169,11 +3183,12 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
     if not Path(work_dir).is_dir():
         raise FileNotFoundError(f"CODE_ROOT/{project} not found at {work_dir!r}")
 
-    from shutil import which
-    binpath = which(spec["bin"])
+    env_var = f"{spec['bin'].upper().replace('-', '_')}_BIN"
+    binpath = _resolve_harness_bin(spec["bin"], env_var)
     if not binpath:
         raise FileNotFoundError(
-            f"{spec['label']} not installed — `{spec['bin']}` is not on PATH")
+            f"{spec['label']} not installed — `{spec['bin']}` is not on PATH, "
+            f"in ~/.{spec['bin']}/bin or ~/.local/bin; set {env_var}")
 
     sid_file = _streamed_sid_file(f"{engine}_{session_key or project}")
     sid_file.parent.mkdir(parents=True, exist_ok=True)

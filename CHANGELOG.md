@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.48.3
+
+### Fixed
+- `/engine opencode` crashed with "`opencode` is not on PATH" on a box
+  where it was installed: OpenCode's installer puts the binary in
+  `~/.opencode/bin` and adds that to `~/.bashrc`, which the systemd
+  unit never reads. Every harness binary now resolves through one
+  helper — `<NAME>_BIN` → PATH → `~/.local/bin`, `~/.<name>/bin`,
+  `~/bin`, `/usr/local/bin` — for both running a turn and the
+  heartbeat's harness inventory.
+
 ## 0.48.2
 
 ### Fixed
