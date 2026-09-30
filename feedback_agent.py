@@ -146,7 +146,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.49.1"
+AGENT_VERSION      = "vroxy_dispatch 0.50.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -3125,6 +3125,17 @@ def _opencode_shaped(event: dict):
         thought = part.get("text") or event.get("text")
         if thought:
             out.append({"type": "thinking", "text": thought})
+    elif etype == "step_finish" or ptype == "step-finish":
+        # opencode reports per-step token usage and cost on the closing
+        # frame; the runner sums these into one result event.
+        tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+        out.append({
+            "type": "result",
+            "usage": {"input": tokens.get("input"),
+                      "output": tokens.get("output"),
+                      "total": tokens.get("total")},
+            "cost_usd": part.get("cost"),
+        })
     return out, sid, model
 
 
@@ -3255,6 +3266,9 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
     new_sid: str | None = None
     tool_calls = text_chars = thinking_chars = 0
     stalled_windows = 0
+    run_usage: dict = {}
+    run_cost: float | None = None
+    run_started = time.monotonic()
 
     try:
         for raw in _stream_lines(proc):
@@ -3321,8 +3335,16 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
                 elif etype == "result":
                     if out.get("final_text"):
                         final_text_chunks = [out["final_text"]]
-                    if out.get("usage"):
-                        log.info("  · usage %s", out["usage"])
+                    usage = out.get("usage")
+                    if isinstance(usage, dict):
+                        for key, value in usage.items():
+                            if isinstance(value, (int, float)):
+                                run_usage[key] = run_usage.get(key, 0) + value
+                    cost = out.get("cost_usd")
+                    if isinstance(cost, (int, float)):
+                        run_cost = (run_cost or 0.0) + cost
+                    if usage:
+                        log.info("  · usage %s", usage)
                 try:
                     on_event(out)
                 except Exception:
@@ -3345,6 +3367,20 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
             if stderr_text:
                 log.warning("%s stderr: %s", engine, _one_line(stderr_text, 400))
             proc.stderr.close()
+
+    # One cumulative result event at the end, whatever the harness
+    # reported across its stream — this is what the room's run summary
+    # and the server's DispatchRun row read.
+    try:
+        on_event({
+            "type": "result",
+            "usage": run_usage or None,
+            "cost_usd": run_cost,
+            "duration_ms": int((time.monotonic() - run_started) * 1000),
+            "final_text": None,
+        })
+    except Exception:
+        log.exception("on_event final result raised")
 
     answer_chunks = final_text_chunks or narration
     failed = proc.returncode not in (0, None)
@@ -4884,6 +4920,32 @@ def _stall_line(event: dict) -> str:
     return f"still working — nothing back for {seconds}s"
 
 
+def _format_run_summary(result: dict, model: str | None) -> str | None:
+    """One compact line for the end of a run: engine, model (when the
+    harness reported one), tokens, cost and duration.  None when there
+    is nothing worth saying."""
+    parts: list[str] = []
+    usage = result.get("usage") or {}
+    total = usage.get("total")
+    if isinstance(total, (int, float)) and total > 0:
+        parts.append(f"{int(total):,} tokens")
+    cost = result.get("cost_usd")
+    if isinstance(cost, (int, float)) and cost > 0:
+        parts.append(f"${cost:.4f}".rstrip("0").rstrip("."))
+    duration = result.get("duration_ms")
+    if isinstance(duration, (int, float)) and duration >= 0:
+        parts.append(f"{duration / 1000:.0f}s")
+    if not parts:
+        return None
+    label = f"`{DISPATCH_ENGINE}`"
+    if model:
+        label += f" `{model}`"
+    line = f"⚙️ {label} — " + " · ".join(parts)
+    if result.get("is_error"):
+        line += " · ⚠️ failed"
+    return line
+
+
 async def _emit_room_run(ws, room_id: str, reply_to: str | None,
                          steps: list[dict], result: dict) -> None:
     """One `room_run` action at the end of a run — Rails writes a
@@ -5417,6 +5479,13 @@ async def handle_room_message(ws, payload: dict) -> None:
     # person has it, and a failure here must not look like a failure
     # to reply.
     await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
+
+    summary = _format_run_summary(result, _last_model)
+    if summary:
+        try:
+            await room_reply(ws, room_id, summary, msg.get("hashid"))
+        except Exception:
+            log.exception("could not post the run summary")
 
 
 # The work queue and its worker live for the PROCESS, not for one

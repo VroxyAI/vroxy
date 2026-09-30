@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.50.0
+
+### Added
+- A run now ends with a compact summary line in the room: engine, model
+  (when the harness reports one), tokens, cost and duration, flagged
+  when it failed. opencode/gemini/amp/cursor now also report their
+  tokens and cost — opencode's `step_finish` frame carries them, and
+  `run_harness_streamed` sums per-step usage into one result event the
+  DispatchRun row already read.
+
 ## 0.49.1
 
 ### Fixed
