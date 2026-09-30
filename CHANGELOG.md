@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.51.3
+
+### Fixed
+- `install.sh` prompts no longer choke on paste: a terminal with
+  bracketed paste on wraps pasted text in `ESC[200~ … ESC[201~`, which
+  bash's `read` builtin doesn't unwrap — so a pasted host or token landed
+  in the variable as raw escape sequences and the token check died right
+  after. Prompts now read through `read_prompt`, which disables bracketed
+  paste for the read and strips the markers as a backstop, and a trap
+  restores the terminal if a silent (`read -s`) prompt is interrupted.
+
 ## 0.51.2
 
 ### Fixed

@@ -45,6 +45,36 @@ die()  { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
+# A terminal with bracketed paste on wraps a paste in ESC[200~ … ESC[201~;
+# bash's `read` builtin doesn't unwrap that, so the value lands in the
+# variable as raw escape sequences and every prompt after the first looks
+# broken. Disable it for the read (and strip the markers as a backstop).
+read_prompt() {
+  local var="$1" prompt="$2" silent="${3:-}" rc=0
+  [[ -t 0 ]] && printf '\e[?2004l' >&2
+  if [[ "$silent" == silent ]]; then
+    if ! read -rsp "$prompt" "$var"; then rc=$?; fi
+    printf '\n' >&2
+  else
+    if ! read -rp "$prompt" "$var"; then rc=$?; fi
+  fi
+  [[ -t 0 ]] && printf '\e[?2004h' >&2
+  local val="${!var}"
+  val="${val//$'\e'\[200~/}"
+  val="${val//$'\e'\[201~/}"
+  printf -v "$var" '%s' "$val"
+  return "$rc"
+}
+
+# `read -s` leaves echo off if the script is interrupted mid-read; put the
+# terminal back to a sane state however the script exits.
+restore_tty() {
+  [[ -t 0 ]] || return 0
+  command -v stty >/dev/null 2>&1 && stty echo 2>/dev/null
+  printf '\e[?2004h' >&2
+}
+trap restore_tty EXIT
+
 python_setup_hint() {
   local ver
   ver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 3)"
@@ -309,11 +339,11 @@ add_workspace() {
   install_unit
 
   local host token slug name id code_root project agent_name body
-  read -rp "vroxy host [https://vroxy.ai]: " host
+  read_prompt host "vroxy host [https://vroxy.ai]: "
   host="${host:-https://vroxy.ai}"
 
   # -s: a token must not land in the terminal scrollback or history.
-  read -rsp "Workspace API token (platform:dispatch or full): " token; echo
+  read_prompt token "Workspace API token (platform:dispatch or full): " silent
   [[ -n "$token" ]] || die "a token is required"
 
   say "Checking the token…"
@@ -325,29 +355,29 @@ add_workspace() {
 
   if [[ "$(printf '%s' "$body" | json_field dispatch_ok)" != "True" ]]; then
     warn "That token lacks platform:dispatch (or full) scope — the cable will refuse it."
-    read -rp "Continue anyway? [y/N]: " go
+    read_prompt go "Continue anyway? [y/N]: "
     [[ "$go" == "y" || "$go" == "Y" ]] || exit 1
   fi
 
   say ""
   say "Workspace: ${name} (${slug})"
-  read -rp "Install dispatch for this workspace? [Y/n]: " confirm
+  read_prompt confirm "Install dispatch for this workspace? [Y/n]: "
   [[ -z "$confirm" || "$confirm" == "y" || "$confirm" == "Y" ]] || exit 1
 
-  read -rp "Code root (the folder holding the repos it works on) [$(dirname "$HERE")]: " code_root
+  read_prompt code_root "Code root (the folder holding the repos it works on) [$(dirname "$HERE")]: "
   code_root="${code_root:-$(dirname "$HERE")}"
   [[ -d "$code_root" ]] || die "no such directory: $code_root"
 
-  read -rp "Default project (repo folder name under that root) [vroxy_web]: " project
+  read_prompt project "Default project (repo folder name under that root) [vroxy_web]: "
   project="${project:-vroxy_web}"
 
-  read -rp "Agent name as it appears in the workspace [Dispatch]: " agent_name
+  read_prompt agent_name "Agent name as it appears in the workspace [Dispatch]: "
   agent_name="${agent_name:-Dispatch}"
 
   id="${slug:-workspace}"
   local env_file="${ENV_DIR}/${id}.env"
   if [[ -e "$env_file" ]]; then
-    read -rp "${id} is already installed — overwrite its config? [y/N]: " over
+    read_prompt over "${id} is already installed — overwrite its config? [y/N]: "
     [[ "$over" == "y" || "$over" == "Y" ]] || exit 1
   fi
 
@@ -466,9 +496,8 @@ default_install() {
     say "Not a terminal — skipping the dispatch agent.  Run ./install.sh --dispatch to add one."
     return
   fi
-  printf '\nAlso run a dispatch agent on this machine? It connects to one\nworkspace and installs a systemd unit. [y/N] '
   local answer
-  read -r answer || answer=""
+  read_prompt answer $'\nAlso run a dispatch agent on this machine? It connects to one\nworkspace and installs a systemd unit. [y/N] ' || answer=""
   case "$answer" in
     [yY]*) add_workspace ;;
     *)     say "Skipped.  Run ./install.sh --dispatch later if you change your mind." ;;
@@ -480,7 +509,7 @@ migrate_legacy() {
   need python3
 
   local id="${1:-}"
-  [[ -n "$id" ]] || { printf 'Instance id for this workspace (e.g. vroxy): '; read -r id; }
+  [[ -n "$id" ]] || { read_prompt id "Instance id for this workspace (e.g. vroxy): "; }
   [[ -n "$id" ]] || die "an instance id is required."
   sudo -n test -e "${ENV_DIR}/${id}.env" 2>/dev/null &&
     die "${ENV_DIR}/${id}.env already exists — pick another id or remove that instance first."
@@ -511,8 +540,7 @@ migrate_legacy() {
     say "Open /w/<workspace>/dispatch and copy the agent's name EXACTLY."
     say "Get it wrong and the server makes a second agent instead of"
     say "adopting this one — its room and history stay on the old row."
-    printf 'Agent name: '
-    read -r agent_name
+    read_prompt agent_name "Agent name: "
   fi
   [[ -n "$agent_name" ]] || die "an agent name is required — see /w/<workspace>/dispatch"
 

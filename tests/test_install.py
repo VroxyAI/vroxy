@@ -121,6 +121,30 @@ class InstallScriptTest(unittest.TestCase):
         self.assertTrue(DOCTOR_SH.is_file())
         self.assertTrue(os.access(DOCTOR_SH, os.X_OK), f"{DOCTOR_SH} must be executable")
 
+    def test_read_prompt_strips_bracketed_paste(self):
+        result = run_sourced(
+            "read_prompt h \"host: \" <<< $'\\033[200~https://vroxy.ai\\033[201~'\n"
+            "printf 'GOT=[%s]\\n' \"$h\""
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("GOT=[https://vroxy.ai]", result.stdout.strip())
+
+    def test_read_prompt_strips_bracketed_paste_from_a_silent_token(self):
+        result = run_sourced(
+            "read_prompt t \"token: \" silent <<< $'\\033[200~abc123token\\033[201~'\n"
+            "printf 'GOT=[%s]\\n' \"$t\""
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("GOT=[abc123token]", result.stdout.strip())
+
+    def test_read_prompt_leaves_plain_input_alone(self):
+        result = run_sourced(
+            "read_prompt h \"host: \" <<< 'plain-host'\n"
+            "printf 'GOT=[%s]\\n' \"$h\""
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("GOT=[plain-host]", result.stdout.strip())
+
 
 if __name__ == "__main__":
     unittest.main()
