@@ -80,6 +80,7 @@ trap restore_tty EXIT
 # the repo (code_root=/a/repo + project=repo → /a/repo/repo), which is the
 # "CODE_ROOT/… not found" crash the agent hits later in the room.
 repo_resolves() { [[ -d "${1%/}/${2}" ]]; }
+is_git_repo()   { [[ -e "${1%/}/.git" ]]; }
 
 python_setup_hint() {
   local ver
@@ -378,12 +379,18 @@ add_workspace() {
   project="${project:-vroxy_web}"
 
   if ! repo_resolves "$code_root" "$project"; then
-    warn "No repo at $code_root/$project"
-    warn "Code root is the PARENT folder that holds your repos, and the"
-    warn "project is a folder under it — e.g. code_root=$code_root,"
-    warn "project=$project would need $code_root/$project to exist."
-    read_prompt go "Continue anyway? [y/N]: "
-    [[ "$go" == "y" || "$go" == "Y" ]] || exit 1
+    if is_git_repo "$code_root"; then
+      project="$(basename "$code_root")"
+      code_root="$(dirname "$code_root")"
+      say "Single project — CODE_ROOT=$code_root, PROJECT=$project"
+    else
+      warn "No repo at $code_root/$project"
+      warn "Code root is the PARENT folder that holds your repos, and the"
+      warn "project is a folder under it — e.g. code_root=$code_root,"
+      warn "project=$project would need $code_root/$project to exist."
+      read_prompt go "Continue anyway? [y/N]: "
+      [[ "$go" == "y" || "$go" == "Y" ]] || exit 1
+    fi
   fi
 
   read_prompt agent_name "Agent name as it appears in the workspace [Dispatch]: "

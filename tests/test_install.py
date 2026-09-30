@@ -157,6 +157,18 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(0, bad.returncode, bad.stderr)
         self.assertEqual("no", bad.stdout.strip())
 
+    def test_is_git_repo_true_for_a_checkout_and_false_for_a_plain_dir(self):
+        parent = self.tmp / "brevitas"
+        (parent / "brev72true" / ".git").mkdir(parents=True)
+
+        yes = run_sourced(f'is_git_repo "{parent / "brev72true"}" && echo yes || echo no')
+        self.assertEqual(0, yes.returncode, yes.stderr)
+        self.assertEqual("yes", yes.stdout.strip())
+
+        no = run_sourced(f'is_git_repo "{parent}" && echo yes || echo no')
+        self.assertEqual(0, no.returncode, no.stderr)
+        self.assertEqual("no", no.stdout.strip())
+
 
 if __name__ == "__main__":
     unittest.main()

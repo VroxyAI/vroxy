@@ -1021,6 +1021,28 @@ class RoomSessionKeyTest(unittest.TestCase):
         self.assertIn(fa.PROJECT, fa._room_session_key("aaa"))
 
 
+class ResolveProjectTest(unittest.TestCase):
+    def test_parent_plus_project_resolves_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "vroxy_web").mkdir()
+            self.assertEqual((root, "vroxy_web"),
+                             fa.resolve_project(root, "vroxy_web"))
+
+    def test_a_single_repo_is_lifted_to_parent_plus_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "brev72true"
+            (repo / ".git").mkdir(parents=True)
+            self.assertEqual((repo.parent, "brev72true"),
+                             fa.resolve_project(repo, "brev72true"))
+
+    def test_an_unresolved_dir_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual((root, "vroxy_web"),
+                             fa.resolve_project(root, "vroxy_web"))
+
+
 class ClearSessionsTest(unittest.TestCase):
     """SID_DIR is redirected at a tmpdir — a test that reaches the
     real ~/.cache/claude-chat would wipe a live session."""

@@ -87,6 +87,21 @@ SERVICE_TOKEN   = os.environ.get("VROXY_SERVICE_TOKEN", "")
 CODE_ROOT       = Path(os.environ.get("CODE_ROOT",
                                        str(Path(__file__).resolve().parent.parent)))
 PROJECT         = os.environ.get("PROJECT", "vroxy_web")
+
+
+def resolve_project(code_root: Path, project: str) -> tuple[Path, str]:
+    """The folder dispatch works in is CODE_ROOT / PROJECT. Two shapes are
+    valid: a folder holding several repos (code_root=/a, project=repo) and
+    a single repo (code_root=/a/repo). When CODE_ROOT is itself a checkout,
+    lift it so the single-project case no longer resolves to repo/repo."""
+    if (code_root / project).is_dir():
+        return code_root, project
+    if (code_root / ".git").exists():
+        return code_root.parent, code_root.name
+    return code_root, project
+
+
+CODE_ROOT, PROJECT = resolve_project(CODE_ROOT, PROJECT)
 CLAUDE_CHAT_BIN = os.environ.get(
     "CLAUDE_CHAT_BIN",
     str(Path(__file__).resolve().parent / "bin" / "claude-chat"),
@@ -146,7 +161,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.2"
+AGENT_VERSION      = "vroxy_dispatch 0.51.5"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.

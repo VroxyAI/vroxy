@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.51.5
+
+### Added
+- A single-project install now works like a multi-project one. If
+  `CODE_ROOT` points straight at the repo (its `.git` is right there),
+  dispatch lifts it: `CODE_ROOT` becomes the parent and `PROJECT` the
+  repo's name, so `CODE_ROOT/PROJECT` no longer resolves to `repo/repo`.
+  `install.sh` does the same detection at the prompt instead of warning,
+  and `resolve_project` covers both shapes in one place.
+
 ## 0.51.4
 
 ### Fixed
