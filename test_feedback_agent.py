@@ -4083,6 +4083,16 @@ class HarnessParserTest(unittest.TestCase):
     def test_opencode_argv_auto_approves_tools(self):
         argv = fa.HARNESS_SPECS["opencode"]["argv"]("/bin/opencode", "PROMPT", None)
         self.assertIn("--auto", argv)
+        self.assertIn("--print-logs", argv)
+
+    def test_opencode_stderr_names_the_model(self):
+        stderr = ('timestamp=… level=INFO run=r1 message="llm runtime selected" '
+                  'llm.runtime=ai-sdk llm.provider=deepseek llm.model=deepseek-v4-pro')
+        self.assertEqual("deepseek-v4-pro", fa._stderr_model("opencode", stderr))
+
+    def test_other_harnesses_have_no_stderr_model(self):
+        self.assertIsNone(fa._stderr_model("claude", 'message="llm runtime selected" llm.model=x'))
+        self.assertIsNone(fa._stderr_model("opencode", "nothing interesting here"))
 
     def test_only_harnesses_that_have_really_run_claim_to_be_verified(self):
         verified = {e for e, s in fa.HARNESS_SPECS.items() if s["verified"]}

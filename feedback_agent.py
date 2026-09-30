@@ -146,7 +146,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.1"
+AGENT_VERSION      = "vroxy_dispatch 0.51.2"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -2345,10 +2345,37 @@ def _stream_lines(proc):
         yield item
 
 
+def _collect_stderr(proc):
+    """Read stderr on a daemon thread so a verbose harness (`--print-logs`)
+    can't fill the pipe and deadlock the child while stdout is read."""
+    chunks: list[str] = []
+
+    def pump():
+        try:
+            for raw in proc.stderr:
+                chunks.append(raw)
+        except Exception:
+            log.exception("stderr pump raised")
+
+    reader = threading.Thread(target=pump, name="harness-stderr", daemon=True)
+    reader.start()
+    return reader, chunks
+
+
+_OPENCODE_MODEL_RE = re.compile(r'message="llm runtime selected".*?llm\.model=([^\s]+)')
+
+
+def _stderr_model(engine: str, stderr_text: str) -> str | None:
+    """The model a harness names on stderr, for streams that omit it.
+    opencode's JSON stream never carries it, but its `--print-logs`
+    stderr does on the `llm runtime selected` line."""
+    if engine != "opencode":
+        return None
+    match = _OPENCODE_MODEL_RE.search(stderr_text or "")
+    return match.group(1) if match else None
+
+
 def _kill_process_tree(proc) -> None:
-    """SIGTERM the whole group, then SIGKILL what ignored it.  Claude
-    spawns its tools as children; killing only the parent leaves a
-    wedged `bin/test` holding the database."""
     for sig, grace in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
         if proc.poll() is not None:
             return
@@ -3160,8 +3187,11 @@ HARNESS_SPECS = {
         "verified": True,
         # --auto approves tool permission prompts so a room turn
         # cannot hang waiting on a TTY the agent does not have.
+        # --print-logs is how the model name reaches us: the JSON
+        # stream omits it, and stderr's "llm runtime selected" line
+        # is the only place opencode says it.
         "argv": lambda b, prompt, sid: (
-            [b, "run", "--format", "json", "--auto"]
+            [b, "run", "--format", "json", "--auto", "--print-logs"]
             + (["-s", sid] if sid else []) + [prompt]),
     },
     "amp": {
@@ -3254,6 +3284,7 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
     )
     global _current_proc, _last_model
     _current_proc = proc
+    stderr_reader, stderr_chunks = _collect_stderr(proc)
 
     # The ANSWER is the prose after the last tool call — the same rule
     # ProgressTrail reads a stream by. Prose BEFORE one is narration
@@ -3364,10 +3395,24 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
         if proc.stderr:
             if proc.poll() is None:
                 _kill_process_tree(proc)
-            stderr_text = proc.stderr.read() or ""
+            stderr_reader.join(timeout=STALL_SECONDS)
+            stderr_text = "".join(stderr_chunks) or ""
             if stderr_text:
                 log.warning("%s stderr: %s", engine, _one_line(stderr_text, 400))
             proc.stderr.close()
+
+    # The JSON stream never names opencode's model — its stderr does,
+    # on the "llm runtime selected" line. Adopt it here so the run's
+    # summary and the heartbeat report the real model, not the last
+    # claude/cursor one.
+    if not _last_model:
+        model = _stderr_model(engine, stderr_text)
+        if model:
+            _last_model = model[:80]
+            try:
+                on_event({"type": "model", "model": _last_model})
+            except Exception:
+                log.exception("on_event model raised")
 
     # One cumulative result event at the end, whatever the harness
     # reported across its stream — this is what the room's run summary

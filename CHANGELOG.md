@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.51.2
+
+### Fixed
+- opencode runs now report their model: the JSON stream omits it, so
+  the runner passes `--print-logs`, drains stderr on a thread (a verbose
+  harness can't deadlock the pipe), and reads the model off the
+  `llm runtime selected` line. The run summary and heartbeat now say
+  `deepseek-v4-pro` instead of going blank.
+
 ## 0.51.1
 
 ### Changed
