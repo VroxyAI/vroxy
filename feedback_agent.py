@@ -146,7 +146,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.0"
+AGENT_VERSION      = "vroxy_dispatch 0.51.1"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -4955,32 +4955,6 @@ def _stall_line(event: dict) -> str:
     return f"still working — nothing back for {seconds}s"
 
 
-def _format_run_summary(result: dict, model: str | None) -> str | None:
-    """One compact line for the end of a run: engine, model (when the
-    harness reported one), tokens, cost and duration.  None when there
-    is nothing worth saying."""
-    parts: list[str] = []
-    usage = result.get("usage") or {}
-    total = usage.get("total")
-    if isinstance(total, (int, float)) and total > 0:
-        parts.append(f"{int(total):,} tokens")
-    cost = result.get("cost_usd")
-    if isinstance(cost, (int, float)) and cost > 0:
-        parts.append(f"${cost:.4f}".rstrip("0").rstrip("."))
-    duration = result.get("duration_ms")
-    if isinstance(duration, (int, float)) and duration >= 0:
-        parts.append(f"{duration / 1000:.0f}s")
-    if not parts:
-        return None
-    label = f"`{DISPATCH_ENGINE}`"
-    if model:
-        label += f" `{model}`"
-    line = f"⚙️ {label} — " + " · ".join(parts)
-    if result.get("is_error"):
-        line += " · ⚠️ failed"
-    return line
-
-
 async def _emit_room_run(ws, room_id: str, reply_to: str | None,
                          steps: list[dict], result: dict) -> None:
     """One `room_run` action at the end of a run — Rails writes a
@@ -5512,15 +5486,11 @@ async def handle_room_message(ws, payload: dict) -> None:
 
     # After the answer: the run is only worth recording once the
     # person has it, and a failure here must not look like a failure
-    # to reply.
+    # to reply.  The tokens / cost / model ride the `room_run` action,
+    # which the server turns into the run summary in the work log — a
+    # separate summary line in the room would be a second notification
+    # for the same answer.
     await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
-
-    summary = _format_run_summary(result, _last_model)
-    if summary:
-        try:
-            await room_reply(ws, room_id, summary, msg.get("hashid"))
-        except Exception:
-            log.exception("could not post the run summary")
 
 
 # The work queue and its worker live for the PROCESS, not for one

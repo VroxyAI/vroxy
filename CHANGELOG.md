@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.51.1
+
+### Changed
+- A finished run no longer posts a separate summary line into the room
+  — the tokens/cost/model already ride the `room_run` action into the
+  run's work log, and the extra line read as a second notification for
+  the same answer.
+
 ## 0.51.0
 
 ### Added

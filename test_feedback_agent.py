@@ -3414,38 +3414,6 @@ class ReleaseVersionsTest(unittest.TestCase):
         self.assertIn(f'version = "{number}"', pyproject)
 
 
-class RunSummaryTest(unittest.TestCase):
-    def setUp(self):
-        self._engine = fa.DISPATCH_ENGINE
-        fa.DISPATCH_ENGINE = "opencode"
-        self.addCleanup(setattr, fa, "DISPATCH_ENGINE", self._engine)
-
-    def test_nothing_to_say_is_none(self):
-        self.assertIsNone(fa._format_run_summary({}, None))
-
-    def test_reports_engine_tokens_cost_and_duration(self):
-        line = fa._format_run_summary({
-            "usage": {"total": 9092},
-            "cost_usd": 0.0025,
-            "duration_ms": 12500,
-        }, "deepseek-v4-pro")
-        self.assertIn("`opencode`", line)
-        self.assertIn("`deepseek-v4-pro`", line)
-        self.assertIn("9,092 tokens", line)
-        self.assertIn("$0.0025", line)
-        self.assertIn("12s", line)
-
-    def test_a_failed_run_is_marked(self):
-        line = fa._format_run_summary(
-            {"usage": {"total": 10}, "is_error": True}, None)
-        self.assertIn("failed", line)
-
-    def test_omits_the_model_when_unknown(self):
-        line = fa._format_run_summary({"usage": {"total": 10}}, None)
-        self.assertIn("`opencode`", line)
-        self.assertNotIn("`deepseek", line)
-
-
 if __name__ == "__main__":
     unittest.main()
 
