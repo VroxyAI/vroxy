@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.51.10
+
+### Added
+- A workspace can now pick the model an agent runs. The `agent` block of
+  every routed frame carries a `model` (`provider/model` form); opencode
+  runs it via `--model`, so an operator can switch providers or models
+  from the web without touching the box. Blank means the harness default.
+
 ## 0.51.9
 
 ### Added

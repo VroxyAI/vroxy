@@ -116,6 +116,10 @@ DISPATCH_ENGINE = os.environ.get("DISPATCH_ENGINE", "claude").strip().lower()
 # rather than from config: config says what was asked for, the stream
 # says what answered.
 _last_model: str | None = None
+# The model the operator asked this agent to use, set from the web and
+# carried on every routed frame's `agent` block (`provider/model` form).
+# None means "use the harness's own default".
+_agent_model: str | None = None
 # Whether to inventory the coding CLIs on this box and report them.
 # ON by default — it is what makes the fleet view useful — but it is
 # somebody's machine, so `DISPATCH_TELEMETRY=0` turns it off and the
@@ -161,7 +165,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.9"
+AGENT_VERSION      = "vroxy_dispatch 0.51.10"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1241,6 +1245,15 @@ def attachment_cli_flags(engine: str, attachments: list[dict] | None) -> list[st
         for d in _attachment_dirs(attachments):
             flags += ["--include-directories", d]
     return flags
+
+
+def model_cli_flags(engine: str, model: str | None) -> list[str]:
+    """`--model` for the harnesses that take it. opencode reads the model
+    in `provider/model` form; the other CLIs pick their model from their
+    own config and are not driven here (yet)."""
+    if engine == "opencode" and (model or "").strip():
+        return ["--model", model.strip()]
+    return []
 
 
 def build_room_prompt(payload: dict, attachments: list[dict] | None = None) -> str:
@@ -3283,7 +3296,7 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
     resumed = bool(allow_resume and stored_sid)
 
     argv = spec["argv"](binpath, prompt, stored_sid if resumed else None)
-    extra = attachment_cli_flags(engine, attachments)
+    extra = attachment_cli_flags(engine, attachments) + model_cli_flags(engine, _agent_model)
     if extra:
         # Prompt is last for cursor; for the others options can sit
         # right after the binary. Either way keep the prompt itself
@@ -5385,6 +5398,19 @@ def _is_ours(payload: dict) -> bool:
     return kind == ENGINE_AGENT_KINDS.get(DISPATCH_ENGINE, "claude_code")
 
 
+def note_agent_config(payload: dict) -> None:
+    """Remember the model the server routed this work with. Every routed
+    frame carries the agent's `model` (the web-configured `provider/model`
+    string); a blank/absent one means "use the harness default"."""
+    global _agent_model
+    agent = payload.get("agent")
+    model = agent.get("model") if isinstance(agent, dict) else None
+    if model:
+        _agent_model = str(model).strip()[:80] or None
+    else:
+        _agent_model = None
+
+
 async def _fast_lane_room(link, payload: dict) -> None:
     """Parallel answer while the main lane is mid-build.
 
@@ -5418,6 +5444,7 @@ async def handle_room_message(ws, payload: dict) -> None:
                  agent.get("name"), agent.get("kind"), DISPATCH_ENGINE)
         return
 
+    note_agent_config(payload)
     body = (msg.get("body") or "").strip()
     set_task_label(f"#{room.get('name') or room_id} {body}")
     log.info("Handling room message room=%s (#%s) from=%s body=%s",

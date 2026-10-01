@@ -2431,6 +2431,27 @@ class EngineAddressingTest(unittest.TestCase):
         self.assertEqual(sent["meta"]["engine"], "codex")
 
 
+class AgentModelConfigTest(unittest.TestCase):
+    def test_opencode_gets_the_model_flag(self):
+        self.assertEqual(
+            ["--model", "anthropic/claude-sonnet-4-5"],
+            fa.model_cli_flags("opencode", "anthropic/claude-sonnet-4-5"))
+
+    def test_no_model_or_other_harness_yields_no_flag(self):
+        self.assertEqual([], fa.model_cli_flags("opencode", None))
+        self.assertEqual([], fa.model_cli_flags("opencode", "   "))
+        self.assertEqual([], fa.model_cli_flags("claude", "some-model"))
+
+    def test_a_frame_names_the_model_and_a_blank_one_clears_it(self):
+        saved = fa._agent_model
+        try:
+            fa.note_agent_config({"agent": {"model": "openai/gpt-5"}})
+            self.assertEqual("openai/gpt-5", fa._agent_model)
+            fa.note_agent_config({"agent": {"name": "no model here"}})
+            self.assertIsNone(fa._agent_model)
+        finally:
+            fa._agent_model = saved
+
 
 class HarnessProbeTest(unittest.TestCase):
     """What coding CLIs this box has, reported so an operator does not
