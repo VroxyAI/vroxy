@@ -421,6 +421,19 @@ for part in sys.argv[1].split("."):
     cur = (cur or {}).get(part)
 print("" if cur is None else cur)' "$1"; }
 
+# The workspace's existing agents from a `whoami` body, one per line as
+# `name\tready|offline` (empty when none). Lets an operator see what is
+# already registered before naming another, and avoid a silent rename.
+whoami_agents() { python3 -c 'import json,sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for a in (data or {}).get("agents") or []:
+    if isinstance(a, dict) and a.get("name"):
+        status = "ready" if a.get("online") else "offline"
+        print(a["name"] + "\t" + status)'; }
+
 write_env_file() {
   local id="$1" name="$2" host="$3" token="$4" agent_name="$5" code_root="$6" project="$7"
   local env_file="${ENV_DIR}/${id}.env"
@@ -498,7 +511,7 @@ add_workspace() {
   ensure_venv
   install_unit
 
-  local host token slug name id code_root project agent_name body
+  local host token slug name id code_root project agent_name body agents_list agent status
   read_prompt host "vroxy host [https://vroxy.ai]: "
   host="${host:-https://vroxy.ai}"
 
@@ -520,6 +533,14 @@ add_workspace() {
 
   say ""
   say "Workspace: ${name} (${slug})"
+  agents_list="$(printf '%s' "$body" | whoami_agents)"
+  if [[ -n "$agents_list" ]]; then
+    say "Already registered in this workspace:"
+    while IFS=$'\t' read -r agent status; do
+      [[ -n "$agent" ]] || continue
+      [[ "$status" == "ready" ]] && say "    • ${agent} (connected)" || say "    • ${agent} (not connected)"
+    done <<< "$agents_list"
+  fi
   read_prompt confirm "Install dispatch for this workspace? [Y/n]: "
   [[ -z "$confirm" || "$confirm" == "y" || "$confirm" == "Y" ]] || exit 1
 
@@ -543,6 +564,9 @@ add_workspace() {
 
   read_prompt agent_name "Agent name as it appears in the workspace [Dispatch]: "
   agent_name="${agent_name:-Dispatch}"
+  if printf '%s' "$agents_list" | cut -f1 | grep -Fqx "$agent_name"; then
+    warn "\"${agent_name}\" is already registered in this workspace — the server will rename this one to keep it distinct."
+  fi
 
   id="${slug:-workspace}"
   local env_file="${ENV_DIR}/${id}.env"

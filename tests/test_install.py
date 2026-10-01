@@ -245,6 +245,20 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual("", result.stdout.strip())
 
+    def test_whoami_agents_lists_names_and_online_status(self):
+        body = ('{"agents": ['
+                '{"name": "Claude Code", "kind": "claude_code", "online": true},'
+                '{"name": "GitHub", "kind": "copilot", "online": false}]}')
+        result = run_sourced(f'v={body!r}\nwhoami_agents <<< "$v"')
+        self.assertEqual(0, result.returncode, result.stderr)
+        lines = result.stdout.strip().splitlines()
+        self.assertEqual(["Claude Code\tready", "GitHub\toffline"], lines)
+
+    def test_whoami_agents_is_empty_for_no_agents(self):
+        result = run_sourced('whoami_agents <<< \'{"agents": []}\'')
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stdout.strip())
+
     def test_harness_bin_installed_finds_one_on_path(self):
         result = run_sourced("harness_bin_installed python3 && echo yes || echo no")
         self.assertEqual(0, result.returncode, result.stderr)

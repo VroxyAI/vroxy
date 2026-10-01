@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.51.13
+
+### Changed
+- `install.sh` shows the workspace's existing agents (name + connected
+  status, read from `/api/v1/whoami`) before asking for an agent name,
+  and warns when the chosen name is already registered — instead of
+  letting the server silently rename a duplicate to "Dispatch 2".
+
 ## 0.51.12
 
 ### Changed
