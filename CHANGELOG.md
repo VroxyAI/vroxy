@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.51.15
+
+### Changed
+- The installer now tells you where the agent logs after it starts —
+  the file (`~/.local/share/vroxy/log/dispatch-<id>.log`) and the
+  systemd follow command — so a `curl | bash` install isn't left
+  wondering where its output went.
+
 ## 0.51.14
 
 ### Fixed

@@ -595,6 +595,7 @@ add_workspace() {
   systemctl is-active --quiet "vroxy-dispatch@${id}.service" \
     && say "Running. It registers itself as \"${agent_name}\" in ${name} on its first heartbeat." \
     || warn "Not running — journalctl -u vroxy-dispatch@${id} -n 50"
+  say "Logs: ${HERE}/log/dispatch-${id}.log (tail -f) or journalctl -u vroxy-dispatch@${id} -f"
   ensure_node
   suggest_harnesses "$id"
 }
