@@ -190,6 +190,28 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual("", result.stdout.strip())
 
+    def test_harness_bin_installed_finds_one_on_path(self):
+        result = run_sourced("harness_bin_installed python3 && echo yes || echo no")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("yes", result.stdout.strip())
+
+    def test_harness_bin_installed_finds_one_in_home_local_bin(self):
+        bindir = self.tmp / ".local" / "bin"
+        bindir.mkdir(parents=True)
+        (bindir / "someharness").write_text("#!/bin/sh\n")
+        (bindir / "someharness").chmod(0o755)
+        result = run_sourced(
+            "harness_bin_installed someharness && echo yes || echo no",
+            env_extra={"HOME": str(self.tmp)})
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("yes", result.stdout.strip())
+
+    def test_harness_bin_installed_misses_an_absent_one(self):
+        result = run_sourced(
+            "harness_bin_installed definitely-not-a-real-harness-xyz && echo yes || echo no")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("no", result.stdout.strip())
+
 
 if __name__ == "__main__":
     unittest.main()

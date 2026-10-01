@@ -90,6 +90,49 @@ sanitize_instance_id() { printf '%s\n' "${1//[^a-zA-Z0-9._-]/-}"; }
 read_env() { sudo -n cat "${ENV_DIR}/${1}.env" 2>/dev/null || true; }
 env_field() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1; }
 
+# The coding CLIs vroxy_dispatch can drive, with a one-line install. Keep
+# in step with feedback_agent.py's KNOWN_HARNESSES (the engine-bearing
+# entries); the bin names here mirror `_resolve_harness_bin`'s guesses.
+HARNESS_SUGGESTIONS=(
+  "claude|Claude Code|npm install -g @anthropic-ai/claude-code"
+  "codex|OpenAI Codex|npm install -g @openai/codex"
+  "opencode|OpenCode|curl -fsSL https://opencode.ai/install | bash"
+  "gemini|Gemini CLI|npm install -g @google/gemini-cli"
+  "copilot|GitHub Copilot CLI|npm install -g @github/copilot"
+  "cursor-agent|Cursor Agent|npm install -g cursor-agent"
+)
+
+harness_bin_installed() {
+  local bin="$1"
+  command -v "$bin" >/dev/null 2>&1 && return 0
+  local guess
+  for guess in "$HOME/.local/bin/$bin" "$HOME/.$bin/bin/$bin" \
+               "$HOME/bin/$bin" "/usr/local/bin/$bin"; do
+    [[ -x "$guess" ]] && return 0
+  done
+  return 1
+}
+
+# After an install, say which harnesses are missing so a box with none of
+# them doesn't sit there silently refusing to answer.
+suggest_harnesses() {
+  local found=0 line bin label cmd
+  for line in "${HARNESS_SUGGESTIONS[@]}"; do
+    IFS='|' read -r bin label cmd <<<"$line"
+    harness_bin_installed "$bin" && found=$((found + 1))
+  done
+  [[ $found -gt 0 ]] && return 0
+  say ""
+  say "No coding CLI found on this machine. vroxy_dispatch drives one of these"
+  say "to do the work — install at least one (the default engine is claude):"
+  for line in "${HARNESS_SUGGESTIONS[@]}"; do
+    IFS='|' read -r bin label cmd <<<"$line"
+    say "    ${label} — ${cmd}"
+  done
+  say "Then set DISPATCH_ENGINE in ${ENV_DIR}/<id>.env to the one you installed,"
+  say "and restart: sudo systemctl restart vroxy-dispatch@<id>.service"
+}
+
 python_setup_hint() {
   local ver
   ver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 3)"
@@ -431,6 +474,7 @@ add_workspace() {
   systemctl is-active --quiet "vroxy-dispatch@${id}.service" \
     && say "Running. It registers itself as \"${agent_name}\" in ${name} on its first heartbeat." \
     || warn "Not running — journalctl -u vroxy-dispatch@${id} -n 50"
+  suggest_harnesses
 }
 
 instances() {

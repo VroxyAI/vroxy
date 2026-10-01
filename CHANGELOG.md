@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.51.11
+
+### Added
+- `install.sh` now says so when a box has no coding CLI to drive. After
+  installing a dispatch agent it checks for the harnesses vroxy_dispatch
+  supports (Claude Code, Codex, OpenCode, Gemini, Copilot, Cursor) and, if
+  none are present, prints each with its one-line install command and how
+  to point `DISPATCH_ENGINE` at the one you chose — instead of an agent
+  that silently refuses to answer.
+
 ## 0.51.10
 
 ### Added
