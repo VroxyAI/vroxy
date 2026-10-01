@@ -51,11 +51,13 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; 
 # variable as raw escape sequences and every prompt after the first looks
 # broken. Disable it for the read (and strip the markers as a backstop).
 read_prompt() {
-  local var="$1" prompt="$2" silent="${3:-}" rc=0
+  local var="$1" prompt="$2" mode="${3:-}" rc=0
   [[ -t 0 ]] && printf '\e[?2004l' >&2
-  if [[ "$silent" == silent ]]; then
+  if [[ "$mode" == silent ]]; then
     if ! read -rsp "$prompt" "$var"; then rc=$?; fi
     printf '\n' >&2
+  elif [[ "$mode" == masked ]]; then
+    read_masked "$var" "$prompt"; rc=$?
   else
     if ! read -rp "$prompt" "$var"; then rc=$?; fi
   fi
@@ -65,6 +67,26 @@ read_prompt() {
   val="${val//$'\e'\[201~/}"
   printf -v "$var" '%s' "$val"
   return "$rc"
+}
+
+# A token must not land in scrollback or history, but `read -s` shows
+# nothing — a pasted key looks like it never took, so people paste it
+# twice and the doubled token gets refused. Echo `*` per keystroke so
+# the paste is visibly received without revealing the value.
+read_masked() {
+  local var="$1" prompt="$2"
+  local pw="" char
+  printf '%s' "$prompt" >&2
+  while IFS= read -r -s -n1 char; do
+    [[ -z "$char" ]] && { printf '\n' >&2; break; }
+    if [[ "$char" == $'\177' || "$char" == $'\b' ]]; then
+      [[ -n "$pw" ]] && { pw="${pw%?}"; printf '\b \b' >&2; }
+    else
+      pw+="$char"
+      printf '*' >&2
+    fi
+  done
+  printf -v "$var" '%s' "$pw"
 }
 
 # `read -s` leaves echo off if the script is interrupted mid-read; put the
@@ -83,6 +105,48 @@ trap restore_tty EXIT
 repo_resolves() { [[ -d "${1%/}/${2}" ]]; }
 is_git_repo()   { [[ -e "${1%/}/.git" ]]; }
 sanitize_instance_id() { printf '%s\n' "${1//[^a-zA-Z0-9._-]/-}"; }
+
+# The subdirectories of a code root — the folders an agent might work in.
+dir_candidates() {
+  local root="$1" d
+  for d in "$root"/*/; do
+    [[ -d "$d" ]] || continue
+    basename "$d"
+  done | sort
+}
+
+# Pick the default project by looking at what is actually under the code
+# root instead of guessing a name. A monorepo (several folders) gets a
+# numbered list; one folder becomes the default; none falls back to a
+# free-form name. Writes the choice into the caller's variable by name.
+choose_project() {
+  local out="$1" root="$2"
+  local dirs=() name i
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && dirs+=("$name")
+  done < <(dir_candidates "$root")
+
+  if [[ ${#dirs[@]} -eq 0 ]]; then
+    read_prompt name "Project folder (no folders found under $root): "
+    printf -v "$out" '%s' "$name"
+    return
+  fi
+  if [[ ${#dirs[@]} -eq 1 ]]; then
+    read_prompt name "Default project [${dirs[0]}]: "
+    printf -v "$out" '%s' "${name:-${dirs[0]}}"
+    return
+  fi
+
+  say "Found ${#dirs[@]} folders under $root:"
+  for i in "${!dirs[@]}"; do say "    $((i + 1)). ${dirs[$i]}"; done
+  read_prompt name "Default project — number or folder name [1]: "
+  name="${name:-1}"
+  if [[ "$name" =~ ^[0-9]+$ ]] && (( name >= 1 && name <= ${#dirs[@]} )); then
+    printf -v "$out" '%s' "${dirs[$((name - 1))]}"
+  else
+    printf -v "$out" '%s' "$name"
+  fi
+}
 
 # Env files live under a root:root 0750 dir, so reading one is a `sudo`.
 # `env_field` pulls one KEY=value out of a file's CONTENTS (a string, not a
@@ -116,12 +180,13 @@ harness_bin_installed() {
 # After an install, say which harnesses are missing so a box with none of
 # them doesn't sit there silently refusing to answer.
 suggest_harnesses() {
-  local found=0 line bin label cmd
+  local found=0 line bin label cmd npm_missing=0
   for line in "${HARNESS_SUGGESTIONS[@]}"; do
     IFS='|' read -r bin label cmd <<<"$line"
     harness_bin_installed "$bin" && found=$((found + 1))
   done
   [[ $found -gt 0 ]] && return 0
+  npm_present || npm_missing=1
   say ""
   say "No coding CLI found on this machine. vroxy_dispatch drives one of these"
   say "to do the work — install at least one (the default engine is claude):"
@@ -129,6 +194,9 @@ suggest_harnesses() {
     IFS='|' read -r bin label cmd <<<"$line"
     say "    ${label} — ${cmd}"
   done
+  if [[ $npm_missing -eq 1 ]]; then
+    say "(npm is not installed — run: $(node_setup_hint), or use opencode above, which needs no npm)"
+  fi
   say "Then set DISPATCH_ENGINE in ${ENV_DIR}/<id>.env to the one you installed,"
   say "and restart: sudo systemctl restart vroxy-dispatch@<id>.service"
 }
@@ -177,6 +245,40 @@ apt_install_python_pkgs() {
   if [[ -n "$ver" ]]; then
     run_pkg apt-get install -y -qq "python${ver}-venv" 2>/dev/null || true
   fi
+}
+
+npm_present() { command -v npm >/dev/null 2>&1; }
+
+node_setup_hint() {
+  if command -v apt-get >/dev/null 2>&1; then
+    printf 'sudo apt install -y nodejs npm'
+  elif command -v dnf >/dev/null 2>&1; then
+    printf 'sudo dnf install -y nodejs npm'
+  else
+    printf 'install Node.js + npm for your distro (or use opencode, which needs no npm)'
+  fi
+}
+
+# Most coding CLIs are npm packages. A box without npm would be told
+# `npm install -g …` and then fail with "command not found", so offer to
+# install node + npm first (default Yes) — the same as the Python
+# toolchain this installer already provisions. opencode is the npm-free
+# escape hatch and the message says so.
+ensure_node() {
+  npm_present && return 0
+  if [[ "${VROXY_INSTALL_NO_APT:-}" != "1" ]] &&
+     command -v apt-get >/dev/null 2>&1 && can_install_packages; then
+    read_prompt go "npm is not installed — install nodejs + npm now? [Y/n]: "
+    [[ -z "$go" || "$go" == "y" || "$go" == "Y" ]] || return 1
+    say "Installing nodejs + npm…"
+    run_pkg apt-get update -qq || true
+    run_pkg apt-get install -y -qq nodejs npm ||
+      { warn "couldn't install nodejs/npm — $(node_setup_hint)"; return 1; }
+    npm_present && return 0
+  fi
+  warn "npm is not installed — most coding CLIs need it (opencode doesn't)."
+  warn "Install it with: $(node_setup_hint)"
+  return 1
 }
 
 # Distros that ship python3 without ensurepip leave a half-made
@@ -400,8 +502,7 @@ add_workspace() {
   read_prompt host "vroxy host [https://vroxy.ai]: "
   host="${host:-https://vroxy.ai}"
 
-  # -s: a token must not land in the terminal scrollback or history.
-  read_prompt token "Workspace API token (platform:dispatch or full): " silent
+  read_prompt token "Workspace API token (platform:dispatch or full): " masked
   [[ -n "$token" ]] || die "a token is required"
 
   say "Checking the token…"
@@ -426,19 +527,15 @@ add_workspace() {
   code_root="${code_root:-$(dirname "$HERE")}"
   [[ -d "$code_root" ]] || die "no such directory: $code_root"
 
-  read_prompt project "Default project (the repo folder's name under that root) [vroxy_web]: "
-  project="${project:-vroxy_web}"
-
-  if ! repo_resolves "$code_root" "$project"; then
-    if is_git_repo "$code_root"; then
-      project="$(basename "$code_root")"
-      code_root="$(dirname "$code_root")"
-      say "Single project — CODE_ROOT=$code_root, PROJECT=$project"
-    else
-      warn "No repo at $code_root/$project"
-      warn "Code root is the PARENT folder that holds your repos, and the"
-      warn "project is a folder under it — e.g. code_root=$code_root,"
-      warn "project=$project would need $code_root/$project to exist."
+  if is_git_repo "$code_root"; then
+    project="$(basename "$code_root")"
+    code_root="$(dirname "$code_root")"
+    say "Single project — CODE_ROOT=$code_root, PROJECT=$project"
+  else
+    choose_project project "$code_root"
+    if [[ -z "$project" ]]; then
+      warn "No project folder — CODE_ROOT is the parent folder and PROJECT"
+      warn "is the repo under it, e.g. $code_root/<project>."
       read_prompt go "Continue anyway? [y/N]: "
       [[ "$go" == "y" || "$go" == "Y" ]] || exit 1
     fi
@@ -474,6 +571,7 @@ add_workspace() {
   systemctl is-active --quiet "vroxy-dispatch@${id}.service" \
     && say "Running. It registers itself as \"${agent_name}\" in ${name} on its first heartbeat." \
     || warn "Not running — journalctl -u vroxy-dispatch@${id} -n 50"
+  ensure_node
   suggest_harnesses
 }
 

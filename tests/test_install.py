@@ -145,6 +145,61 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual("GOT=[plain-host]", result.stdout.strip())
 
+    def test_read_prompt_masked_echoes_stars_and_keeps_the_value(self):
+        result = run_sourced(
+            "read_prompt t \"token: \" masked <<< 'abc123token'\n"
+            "printf 'GOT=[%s]\\n' \"$t\""
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("GOT=[abc123token]", result.stdout.strip())
+        self.assertIn("***********", result.stderr)
+
+    def test_read_prompt_masked_strips_bracketed_paste(self):
+        result = run_sourced(
+            "read_prompt t \"token: \" masked <<< $'\\033[200~abc123token\\033[201~'\n"
+            "printf 'GOT=[%s]\\n' \"$t\""
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("GOT=[abc123token]", result.stdout.strip())
+
+    def test_choose_project_defaults_to_the_only_folder(self):
+        (self.tmp / "repo-a").mkdir()
+        result = run_sourced(
+            f'choose_project p "{self.tmp}" <<< ""\n'
+            'printf "GOT=[%s]\\n" "$p"'
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("GOT=[repo-a]", result.stdout.strip())
+
+    def test_choose_project_lists_a_monorepo_and_picks_by_number(self):
+        (self.tmp / "aa").mkdir()
+        (self.tmp / "bb").mkdir()
+        result = run_sourced(
+            f'choose_project p "{self.tmp}" <<< "2"\n'
+            'printf "GOT=[%s]\\n" "$p"'
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Found 2 folders", result.stdout)
+        self.assertTrue(result.stdout.strip().endswith("GOT=[bb]"), result.stdout)
+
+    def test_choose_project_accepts_a_folder_name(self):
+        (self.tmp / "aa").mkdir()
+        (self.tmp / "bb").mkdir()
+        result = run_sourced(
+            f'choose_project p "{self.tmp}" <<< "aa"\n'
+            'printf "GOT=[%s]\\n" "$p"'
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue(result.stdout.strip().endswith("GOT=[aa]"), result.stdout)
+
+    def test_choose_project_asks_when_no_folders_exist(self):
+        result = run_sourced(
+            f'choose_project p "{self.tmp}" <<< "myproj"\n'
+            'printf "GOT=[%s]\\n" "$p"'
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("GOT=[myproj]", result.stdout.strip())
+
     def test_repo_resolves_accepts_parent_and_rejects_repo_as_root(self):
         parent = self.tmp / "brevitas"
         (parent / "brev72true").mkdir(parents=True)

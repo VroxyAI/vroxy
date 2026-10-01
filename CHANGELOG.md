@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.51.12
+
+### Changed
+- The API-token prompt is now masked (`*` per keystroke) instead of
+  silent — a pasted token is visibly received, so it doesn't get pasted
+  twice and refused as a doubled key.
+- The default-project prompt looks at what's actually under the code
+  root: one folder becomes the default, several get a numbered list
+  (monorepo), and none falls back to a free-form name — instead of
+  guessing `vroxy_web`.
+- A box without npm is warned before the CLI suggestions and offered
+  `nodejs + npm` (default Yes), since most coding CLIs are npm packages
+  and `npm install -g …` otherwise dies with "command not found".
+
 ## 0.51.11
 
 ### Added
