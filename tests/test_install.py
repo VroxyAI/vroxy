@@ -259,6 +259,16 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual("", result.stdout.strip())
 
+    def test_suggest_harnesses_uses_the_real_instance_id(self):
+        result = run_sourced(
+            "harness_bin_installed() { return 1; }\n"
+            "suggest_harnesses phleet"
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("/etc/vroxy-dispatch/phleet.env", result.stdout)
+        self.assertIn("vroxy-dispatch@phleet.service", result.stdout)
+        self.assertNotIn("<id>", result.stdout)
+
     def test_harness_bin_installed_finds_one_on_path(self):
         result = run_sourced("harness_bin_installed python3 && echo yes || echo no")
         self.assertEqual(0, result.returncode, result.stderr)

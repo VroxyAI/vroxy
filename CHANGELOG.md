@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.51.14
+
+### Fixed
+- The "no coding CLI" hint prints the actual instance id in the env
+  path and restart command (`/etc/vroxy-dispatch/phleet.env`,
+  `vroxy-dispatch@phleet.service`) instead of a literal `<id>`.
+
 ## 0.51.13
 
 ### Changed

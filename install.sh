@@ -180,7 +180,7 @@ harness_bin_installed() {
 # After an install, say which harnesses are missing so a box with none of
 # them doesn't sit there silently refusing to answer.
 suggest_harnesses() {
-  local found=0 line bin label cmd npm_missing=0
+  local id="$1" found=0 line bin label cmd npm_missing=0
   for line in "${HARNESS_SUGGESTIONS[@]}"; do
     IFS='|' read -r bin label cmd <<<"$line"
     harness_bin_installed "$bin" && found=$((found + 1))
@@ -197,8 +197,8 @@ suggest_harnesses() {
   if [[ $npm_missing -eq 1 ]]; then
     say "(npm is not installed — run: $(node_setup_hint), or use opencode above, which needs no npm)"
   fi
-  say "Then set DISPATCH_ENGINE in ${ENV_DIR}/<id>.env to the one you installed,"
-  say "and restart: sudo systemctl restart vroxy-dispatch@<id>.service"
+  say "Then set DISPATCH_ENGINE in ${ENV_DIR}/${id}.env to the one you installed,"
+  say "and restart: sudo systemctl restart vroxy-dispatch@${id}.service"
 }
 
 python_setup_hint() {
@@ -596,7 +596,7 @@ add_workspace() {
     && say "Running. It registers itself as \"${agent_name}\" in ${name} on its first heartbeat." \
     || warn "Not running — journalctl -u vroxy-dispatch@${id} -n 50"
   ensure_node
-  suggest_harnesses
+  suggest_harnesses "$id"
 }
 
 instances() {
