@@ -348,6 +348,17 @@ class PostRoomReplyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["one", "two", "three"],
                          [f["body"] for f in frames_of(link, "room_reply")])
 
+    async def test_the_reply_names_this_install(self):
+        saved = fa.INSTALL_ID
+        fa.INSTALL_ID = "inst-reply-9"
+        try:
+            link = fa.CableLink()
+            await fa.room_reply(link, "rm123456", "hi")
+            frame = frames_of(link, "room_reply")[0]
+            self.assertEqual("inst-reply-9", frame["install_id"])
+        finally:
+            fa.INSTALL_ID = saved
+
     async def test_the_ask_lands_on_the_final_chunk(self):
         link = fa.CableLink()
         feeder = asyncio.create_task(

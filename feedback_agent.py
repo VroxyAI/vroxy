@@ -161,7 +161,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.8"
+AGENT_VERSION      = "vroxy_dispatch 0.51.9"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -769,7 +769,8 @@ async def heartbeat(ws) -> None:
     into Rails.cache under a tenant-scoped key with a 60 s TTL —
     the admin index card polls that key to show 🟢/🔴 + version."""
     meta = {"status": _current_status, "project": PROJECT,
-            "engine": DISPATCH_ENGINE}
+            "engine": DISPATCH_ENGINE,
+            "code_root": str(CODE_ROOT / PROJECT)}
     if TELEMETRY_ENABLED:
         # Probing blocks on subprocesses / HTTP, so it never runs on
         # the event loop — a slow `--version` or quota call would
@@ -834,13 +835,15 @@ async def reply(ws, chat_id: str, body: str, kind: str = "assistant",
 
 async def room_reply(ws, room_id: str, body: str, reply_to: str | None = None) -> None:
     """`AdminFeedbackChannel#room_reply` — the server posts it into
-    the Room as the dispatch bot user through RoomMessageService, so
-    it fans out to the room's cable, notifications, and webhooks
-    exactly like a human message."""
+    the Room through RoomMessageService, so it fans out to the room's
+    cable, notifications, and webhooks exactly like a human message.
+    `install_id` names which agent is speaking, so the server can post
+    as the agent's own identity instead of the shared dispatch bot."""
     payload: dict[str, Any] = {
         "action":  "room_reply",
         "room_id": room_id,
         "body":    body,
+        "install_id": INSTALL_ID,
     }
     if reply_to:
         payload["reply_to"] = reply_to

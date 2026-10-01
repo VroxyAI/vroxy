@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.51.9
+
+### Added
+- The heartbeat now reports `code_root` (the checkout this instance
+  works in), so the workspace can show where each agent's code lives.
+- `room_reply` now carries `install_id`, so the server posts the reply
+  as the agent's own name rather than the shared dispatch bot.
+
 ## 0.51.8
 
 ### Added
