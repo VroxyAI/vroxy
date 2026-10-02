@@ -165,7 +165,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.15"
+AGENT_VERSION      = "vroxy_dispatch 0.51.16"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -4992,6 +4992,56 @@ def progress_action(sent: int, truncated: bool) -> str:
     return "drop" if truncated else "notice"
 ROOM_RUN_STEPS_MAX = 500
 ROOM_PROGRESS_TEXT_MAX = 400
+GIT_REF_MAX = 10
+
+
+def _github_web_base(work_dir: str) -> str:
+    """`https://github.com/owner/repo` for the checkout's origin, or ""."""
+    rc, out, _ = _run(["git", "config", "--get", "remote.origin.url"], Path(work_dir))
+    url = (out or "").strip()
+    m = re.match(r"(?:git@github\.com:|https://github\.com/)([^/]+/[^/]+?)(?:\.git)?/?$", url)
+    return f"https://github.com/{m.group(1)}" if m else ""
+
+
+def _collect_git_refs(work_dir: str, since_iso: str) -> list[dict]:
+    """Commits, PRs and issues created in `work_dir` since the run began.
+
+    Commits come from `git log --since`; PRs/issues from `gh` (which
+    must be installed and authed — otherwise we quietly return only
+    the commits).  Bounded and best-effort: a missing repo, an unset
+    gh, or a transient failure must never cost the run its answer."""
+    refs: list[dict] = []
+    base = _github_web_base(work_dir)
+
+    rc, out, _ = _run(["git", "log", "--format=%H|%s", f"--since={since_iso}", "HEAD"],
+                      Path(work_dir))
+    if rc == 0 and out and base:
+        for line in out.splitlines():
+            if "|" not in line:
+                continue
+            sha, subject = line.split("|", 1)
+            sha = sha.strip()[:40]
+            subject = subject.strip()[:80]
+            if len(sha) >= 7:
+                refs.append({"kind": "commit", "url": f"{base}/commit/{sha}", "title": subject})
+
+    if shutil.which("gh"):
+        for sub, kind in (("pr", "pull_request"), ("issue", "issue")):
+            rc, out, _ = _run(["gh", sub, "list", "--state", "all",
+                               "--json", "url,createdAt,title", "--limit", "50"],
+                              Path(work_dir))
+            if rc != 0:
+                continue
+            try:
+                items = json.loads(out)
+            except Exception:
+                continue
+            for it in items:
+                if (it.get("createdAt") or "") >= since_iso:
+                    refs.append({"kind": kind, "url": it.get("url", ""),
+                                 "title": (it.get("title") or "")[:80]})
+
+    return refs[:GIT_REF_MAX]
 
 
 def _progress_line(name: str, input_dict: dict | None) -> str:
@@ -5042,6 +5092,13 @@ async def _emit_room_run(ws, room_id: str, reply_to: str | None,
     goes out, and bookkeeping must never be what breaks a reply."""
     try:
         usage = result.get("usage") or {}
+        git_refs: list[dict] = []
+        try:
+            since = time.time() - (result.get("duration_ms") or 0) / 1000.0
+            since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+            git_refs = await asyncio.to_thread(_collect_git_refs, str(CODE_ROOT / PROJECT), since_iso)
+        except Exception:
+            log.exception("git ref collection failed")
         await cable_send(ws, "message", {
             "action":        "room_run",
             "room_id":       room_id,
@@ -5059,6 +5116,7 @@ async def _emit_room_run(ws, room_id: str, reply_to: str | None,
             "duration_ms":   result.get("duration_ms"),
             "num_turns":     result.get("num_turns"),
             "steps":         steps[:ROOM_RUN_STEPS_MAX],
+            "git_refs":      git_refs,
         })
     except Exception:
         log.exception("emit_room_run failed")

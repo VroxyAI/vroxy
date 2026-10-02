@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.51.16
+
+### Added
+- A finished room run now reports the GitHub work it created — commits
+  (`git log --since`), PRs and issues (`gh pr/issue list`, when `gh` is
+  installed and authed) — so the workspace can link them under the run
+  summary. Best-effort: a missing repo or an unauthenticated `gh` just
+  means no links, never a lost answer.
+
 ## 0.51.15
 
 ### Changed
