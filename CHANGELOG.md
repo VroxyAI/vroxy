@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.51.17
+
+### Added
+- Sessions now log their own growth: every turn writes the turn count and
+  age to the dispatch log, with a warning as a session nears the turn
+  limit (and another right before it retires), so a session that is about
+  to be cleared mid-conversation is visible beforehand. Retirement logs
+  its final turn count and age, and `--sessions` lists each stored
+  session with its turns and age.
+
 ## 0.51.16
 
 ### Added

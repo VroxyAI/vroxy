@@ -165,7 +165,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.16"
+AGENT_VERSION      = "vroxy_dispatch 0.51.17"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1483,6 +1483,11 @@ def _session_spent(sid_file: Path) -> str | None:
     return None
 
 
+def _session_age_hours(meta: dict) -> float | None:
+    started = float(meta.get("started_at") or 0)
+    return (time.time() - started) / 3600.0 if started > 0 else None
+
+
 def _note_session_turn(sid_file: Path, fresh: bool) -> None:
     meta = {} if fresh else _read_session_meta(sid_file)
     meta["started_at"] = meta.get("started_at") or time.time()
@@ -1491,10 +1496,35 @@ def _note_session_turn(sid_file: Path, fresh: bool) -> None:
         _session_meta_file(sid_file).write_text(json.dumps(meta))
     except Exception:
         log.exception("saving session meta failed")
+        return
+
+    # Every session grows in the log so a growing (or stuck) session is
+    # visible without reading the sidecars.  A session that is near the
+    # turn limit warns — retiring mid-conversation was the surprise.
+    turns  = meta["turns"]
+    hours  = _session_age_hours(meta)
+    age    = f"{hours:.1f}h old" if hours is not None else "age unknown"
+    if SESSION_MAX_TURNS > 0:
+        frac = turns / SESSION_MAX_TURNS
+        if turns == 1:
+            log.info("session %s started", sid_file.name)
+        elif frac >= 0.9:
+            log.warning("session %s at %d/%d turns (%s) — retires next turn",
+                        sid_file.name, turns, SESSION_MAX_TURNS, age)
+        elif frac >= 0.75:
+            log.warning("session %s at %d/%d turns (%s)", sid_file.name, turns, SESSION_MAX_TURNS, age)
+        else:
+            log.info("session %s grew to %d turns (%s)", sid_file.name, turns, age)
+    else:
+        log.info("session %s grew to %d turns (%s)", sid_file.name, turns, age)
 
 
 def _retire_session(sid_file: Path, reason: str) -> None:
-    log.info("retiring session %s — %s", sid_file.name, reason)
+    meta  = _read_session_meta(sid_file)
+    turns = int(meta.get("turns") or 0)
+    hours = _session_age_hours(meta)
+    age   = f"{hours:.1f}h old" if hours is not None else "age unknown"
+    log.info("retiring session %s (%d turns, %s) — %s", sid_file.name, turns, age, reason)
     for path in (sid_file, _session_meta_file(sid_file)):
         try:
             path.unlink(missing_ok=True)
@@ -5914,11 +5944,16 @@ def cli() -> None:
 
     if "--sessions" in sys.argv:
         files = sorted(SID_DIR.glob("*")) if SID_DIR.is_dir() else []
+        files = [f for f in files if not f.name.endswith(".meta")]
         if not files:
             print(f"no stored sessions in {SID_DIR}")
             return
         for path in files:
-            print(f"{path.name}\t{path.read_text().strip()}")
+            meta  = _read_session_meta(path)
+            turns = int(meta.get("turns") or 0)
+            hours = _session_age_hours(meta)
+            age   = f"{hours:.1f}h" if hours is not None else "—"
+            print(f"{path.name}\tturns={turns}\tage={age}\t{path.read_text().strip()}")
         return
 
     if "--help" in sys.argv or "-h" in sys.argv:
