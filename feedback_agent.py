@@ -165,7 +165,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.17"
+AGENT_VERSION      = "vroxy_dispatch 0.51.18"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -5851,7 +5851,16 @@ async def process_stream(link: CableLink, ws) -> None:
             elif msg.get("type") in ("version.current", "update.requested"):
                 handle_update_frame(link, msg)
             elif msg.get("type") == "room_reply.posted":
+                # Tenant-stream acks carry install_id so multi-agent
+                # boxes on one tenant only claim their own. A missing
+                # install_id is the old transmit-only shape — accept it.
+                iid = str(msg.get("install_id") or "").strip()
+                if iid and INSTALL_ID and iid != INSTALL_ID:
+                    log.debug("Ignoring room_reply.posted for other install %s", iid)
+                    continue
                 note_posted_message(msg.get("room_id"), msg.get("message_id"))
+                log.info("room_reply.posted ack room=%s message=%s",
+                         msg.get("room_id"), msg.get("message_id"))
             else:
                 log.debug("Ignoring message type=%s", msg.get("type"))
     finally:

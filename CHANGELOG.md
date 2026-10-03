@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.51.18
+
+### Fixed
+- Ask buttons on Holodeck (and any agent that never sees connection-scoped
+  `transmit`) work again: `room_reply.posted` is also broadcast on the
+  tenant AdminFeedbackChannel stream, and agents ignore another install's
+  ack via `install_id`. Previously every Holodeck ask parsed fine, wrote
+  the prose fallback, then dropped the buttons after the 10s ack wait —
+  which looked like a Cursor-only regression because that was the harness
+  in use when Holodeck started asking.
+
+
 ## 0.51.17
 
 ### Added
