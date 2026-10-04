@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.51.23
+
+### Added
+- **Fallback priority.** When no harness has been pinned with
+  `/harness`, dispatch now walks a priority order and runs the first
+  engine actually installed on the box, instead of always defaulting
+  to `claude`. The default order is `opencode` → `cursor` → `codex` →
+  `gemini` → `claude` (claude stays the last resort). `/priority` in a
+  dispatch room shows the list (with what's installed and which is
+  active) and `/priority <a> <b> …` reorders it — persisted under
+  `~/.cache/vroxy-dispatch/`, no root, no restart. A pinned `/harness`
+  choice always wins over the priority list. `pi` is deliberately not
+  in the list: it has no runner yet (`engine: None`), so it can't be
+  selected.
+
 ## 0.51.22
 
 ### Changed

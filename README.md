@@ -462,11 +462,21 @@ dispatch room (or `/engine`). It persists under
 `~/.cache/vroxy-dispatch/engine-<unit>` — owned by the dispatch user,
 no root, no restart. There is no `DISPATCH_ENGINE` env var: it used to
 live in the root-owned EnvironmentFile, which made flipping a harness
-a `sudo` job. Defaults to `claude`. Also runs `codex`, `cursor`
-(`cursor-agent`), `gemini`, `copilot_cli`, `opencode`, and `amp`. One
-process runs one engine — to have several, install a second systemd
-instance. An unrecognised value raises at the first run rather than
-falling back.
+a `sudo` job.
+
+When no harness has been chosen, dispatch picks the first engine in a
+**priority order** that is actually installed on the box — default
+`opencode` → `cursor` → `codex` → `gemini` → `claude` (claude is the
+last resort). `/priority` in a dispatch room shows that list with what
+is installed, and `/priority opencode cursor codex gemini claude`
+reorders it (persists under `~/.cache/vroxy-dispatch/`, no root). It
+only matters when `/harness` hasn't pinned a choice; a pinned harness
+always wins.
+
+Also runs `codex`, `cursor` (`cursor-agent`), `gemini`,
+`copilot_cli`, `opencode`, and `amp`. One process runs one engine —
+to have several, install a second systemd instance. An unrecognised
+value raises at the first run rather than falling back.
 
 `cursor` and `copilot_cli` were verified first; `opencode` now is
 too (real `--format json` capture on this box). Gemini's parser

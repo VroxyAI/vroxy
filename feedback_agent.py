@@ -164,7 +164,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.22"
+AGENT_VERSION      = "vroxy_dispatch 0.51.23"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -361,6 +361,21 @@ KNOWN_HARNESSES = (
     {"id": "amp",    "label": "Amp",           "bin": "amp",          "engine": "amp"},
     {"id": "goose",  "label": "Goose",         "bin": "goose",        "engine": None},
 )
+
+# The order dispatch tries when no harness has been chosen via
+# `/harness`: first engine that is both drivable and installed on the
+# box wins.  Editable per instance via `/priority` in a dispatch room,
+# persisted under STATE_DIR.  `pi` is not here — it has no runner yet
+# (`engine: None`), so it cannot be selected.
+DEFAULT_ENGINE_PRIORITY = ["opencode", "cursor", "codex", "gemini", "claude"]
+
+# engine slug → (bin name, env-var override), from the harness inventory,
+# so "installed?" can be answered with a cheap PATH lookup — the same
+# resolution `probe_harnesses` uses, without the subprocess it spawns.
+_ENGINE_BIN_LOOKUP = {
+    h["engine"]: (h["bin"], f"{h['id'].upper()}_BIN")
+    for h in KNOWN_HARNESSES if h.get("engine")
+}
 
 # A `--version` that hangs must not hold the heartbeat open, and the
 # whole sweep has to stay far under STALL_SECONDS — nine probes at
@@ -1613,6 +1628,18 @@ def engine_command(body: str) -> tuple[str, str | None] | None:
     return None
 
 
+def priority_command(body: str) -> tuple[str, list[str]] | None:
+    """Leading `/priority`, optionally with the new order after it.
+
+    `/priority` alone shows the list; `/priority opencode cursor …`
+    sets it.  Returns `("/priority", args)` where `args` is the list
+    of requested engine slugs (possibly empty)."""
+    parts = (body or "").strip().split()
+    if not parts or parts[0].lower() != "/priority":
+        return None
+    return "/priority", parts[1:]
+
+
 def normalize_engine(name: str) -> str:
     raw = (name or "").strip().lower()
     return ENGINE_ALIASES.get(raw, raw)
@@ -1655,13 +1682,68 @@ def update_attempts_path() -> Path:
     return STATE_DIR / f"update-attempts-{instance_slug()}.json"
 
 
+def engine_priority_path() -> Path:
+    return STATE_DIR / f"engine-priority-{instance_slug()}"
+
+
+def load_engine_priority() -> list[str]:
+    """The ordered engine preference for this instance.
+
+    The `/priority` file under STATE_DIR if it exists, else
+    DEFAULT_ENGINE_PRIORITY.  Entries that aren't drivable are dropped
+    with a warning, so a stale name never silently shortens the list."""
+    path = engine_priority_path()
+    try:
+        lines = [ln.strip().lower()
+                 for ln in path.read_text(encoding="utf-8").splitlines()]
+    except OSError:
+        return list(DEFAULT_ENGINE_PRIORITY)
+    out: list[str] = []
+    for ln in lines:
+        if not ln or ln.startswith("#"):
+            continue
+        eng = normalize_engine(ln)
+        if eng in known_engines():
+            if eng not in out:
+                out.append(eng)
+        else:
+            log.warning("ignoring unknown engine %r in %s", ln, path)
+    return out or list(DEFAULT_ENGINE_PRIORITY)
+
+
+def set_engine_priority(engines: list[str]) -> tuple[bool, str]:
+    """Persist a new priority order under STATE_DIR.  Returns (ok, detail).
+
+    No root, no restart — the dispatch user owns STATE_DIR.  The list
+    only affects resolution when there is no explicit `/harness` choice."""
+    norm: list[str] = []
+    for name in engines:
+        eng = normalize_engine(name)
+        if eng not in known_engines():
+            return False, f"unknown engine {name!r} (want one of: {', '.join(known_engines())})"
+        if eng not in norm:
+            norm.append(eng)
+    if not norm:
+        return False, "priority list is empty"
+    path = engine_priority_path()
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        tmp.write_text("\n".join(norm) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        return False, f"could not write {path}: {e}"
+    return True, str(path)
+
+
 def resolve_dispatch_engine() -> str:
-    """State file → `claude`.
+    """Explicit `/harness` choice → first installed in priority → `claude`.
 
     The state file is under the running user's `STATE_DIR`, so a
-    harness flip never needs root.  There is deliberately no
-    `DISPATCH_ENGINE` env fallback: it made the harness a unit-env
-    knob that only root could turn."""
+    harness flip never needs root.  When nothing was chosen, walk the
+    priority list and take the first engine installed on this box.
+    There is deliberately no `DISPATCH_ENGINE` env fallback: it made
+    the harness a unit-env knob that only root could turn."""
     path = engine_state_path()
     try:
         raw = path.read_text(encoding="utf-8").strip().splitlines()[0].strip().lower()
@@ -1672,6 +1754,10 @@ def resolve_dispatch_engine() -> str:
         if eng in known_engines():
             return eng
         log.warning("ignoring unknown engine %r in %s", raw, path)
+    for eng in load_engine_priority():
+        if _engine_bin(eng):
+            log.info("no harness chosen — %s is first available in priority order", eng)
+            return eng
     return "claude"
 
 
@@ -2363,6 +2449,17 @@ def _resolve_harness_bin(name: str, env_var: str) -> str | None:
         if guess.is_file() and os.access(guess, os.X_OK):
             return str(guess)
     return None
+
+
+def _engine_bin(engine: str) -> str | None:
+    """The binary that would drive `engine`, or None when it isn't
+    installed.  Cheap: PATH and file checks only, no subprocess to the
+    CLI itself."""
+    info = _ENGINE_BIN_LOOKUP.get(engine)
+    if not info:
+        return None
+    name, env_var = info
+    return _resolve_harness_bin(name, env_var)
 
 
 def _resolve_claude_bin() -> str:
@@ -3988,6 +4085,50 @@ async def handle_engine_command(ws, room_id: str, target: str | None,
         f"message runs it. No restart needed.",
         reply_to)
     log.info("engine flip %s → %s (in-process, no restart)", current, wanted)
+
+
+async def handle_priority_command(ws, room_id: str, args: list[str],
+                                  reply_to: str | None) -> None:
+    """`/priority` — show or set the fallback engine order.
+
+    Bare shows the current list with which one is installed and which
+    is active.  With a list of slugs it persists the new order under
+    STATE_DIR (no root) and, when no `/harness` choice is pinned,
+    re-resolves in-process so the change applies immediately."""
+    if not args:
+        chosen = DISPATCH_ENGINE
+        lines = ["Fallback priority (first installed wins):"]
+        for i, eng in enumerate(load_engine_priority(), 1):
+            state = "installed" if _engine_bin(eng) else "not installed"
+            marker = "  ← active" if eng == chosen else ""
+            lines.append(f"{i}. `{eng}` ({state}){marker}")
+        await room_reply(ws, room_id, "\n".join(lines), reply_to)
+        return
+
+    ok, detail = await asyncio.to_thread(set_engine_priority, args)
+    if not ok:
+        await room_reply(
+            ws, room_id,
+            f"⚠️ Couldn't set priority: {detail}", reply_to)
+        return
+
+    order = ", ".join(f"`{e}`" for e in load_engine_priority())
+    if not engine_state_path().exists():
+        new = resolve_dispatch_engine()
+        if new != DISPATCH_ENGINE:
+            _adopt_engine(new)
+            clear_sessions()
+            await heartbeat(ws)
+            await room_reply(
+                ws, room_id,
+                f"🔄 Priority order: {order}. No harness was pinned, so "
+                f"`{new}` is now active.", reply_to)
+            return
+    await room_reply(
+        ws, room_id,
+        f"🔄 Priority order: {order}. A `/harness` choice is pinned, so "
+        f"this applies on the next fresh install or when you clear it.",
+        reply_to)
 
 
 async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
@@ -5620,6 +5761,11 @@ async def handle_room_message(ws, payload: dict) -> None:
     eng = engine_command(body)
     if eng:
         await handle_engine_command(ws, room_id, eng[1], msg.get("hashid"))
+        return
+
+    prio = priority_command(body)
+    if prio:
+        await handle_priority_command(ws, room_id, prio[1], msg.get("hashid"))
         return
 
     # Fetched before the prompt is built so the paths can go in it,

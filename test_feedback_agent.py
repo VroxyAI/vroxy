@@ -1027,10 +1027,24 @@ class SetDispatchEngineTest(unittest.TestCase):
         self.assertEqual("opencode", fa.resolve_dispatch_engine(),
                          "the state file wins; DISPATCH_ENGINE env is ignored")
 
-    def test_resolve_defaults_to_claude_with_no_state(self):
-        os.environ["DISPATCH_ENGINE"] = "cursor"
-        self.assertEqual("claude", fa.resolve_dispatch_engine(),
-                         "no state file means claude — the env var is not consulted")
+    def test_resolve_picks_first_installed_in_priority(self):
+        def fake_bin(engine):
+            return "/usr/bin/" + engine if engine in ("codex", "gemini") else None
+
+        with mock.patch.object(fa, "_engine_bin", side_effect=fake_bin):
+            self.assertEqual("codex", fa.resolve_dispatch_engine(),
+                             "no state file means the first installed engine in priority order")
+
+    def test_resolve_falls_back_to_claude_when_nothing_installed(self):
+        with mock.patch.object(fa, "_engine_bin", return_value=None):
+            self.assertEqual("claude", fa.resolve_dispatch_engine(),
+                             "nothing installed means claude, the historical default")
+
+    def test_resolve_reads_the_priority_file(self):
+        (self.state / "engine-priority-test").write_text("gemini\nclaude\n")
+        with mock.patch.object(fa, "_engine_bin", return_value="/bin/x"):
+            self.assertEqual("gemini", fa.resolve_dispatch_engine(),
+                             "the /priority file, not DEFAULT_ENGINE_PRIORITY, decides the order")
 
     def test_no_sudo_on_flip(self):
         calls = []
@@ -1044,6 +1058,29 @@ class SetDispatchEngineTest(unittest.TestCase):
             ok, detail = fa.set_dispatch_engine("gemini")
         self.assertTrue(ok, detail)
         self.assertEqual([], calls, "a harness flip must not shell out at all")
+
+    def test_set_priority_persists_in_order(self):
+        ok, detail = fa.set_engine_priority(["opencode", "cursor", "codex"])
+        self.assertTrue(ok, detail)
+        self.assertEqual(
+            ["opencode", "cursor", "codex"], fa.load_engine_priority())
+        self.assertEqual(
+            "opencode\ncursor\ncodex\n",
+            (self.state / "engine-priority-test").read_text())
+
+    def test_set_priority_refuses_unknown_engine(self):
+        ok, detail = fa.set_engine_priority(["opencode", "nope"])
+        self.assertFalse(ok)
+        self.assertIn("unknown", detail)
+        self.assertFalse((self.state / "engine-priority-test").exists())
+
+    def test_set_priority_refuses_empty(self):
+        ok, detail = fa.set_engine_priority([])
+        self.assertFalse(ok)
+        self.assertIn("empty", detail)
+
+    def test_load_priority_defaults_when_no_file(self):
+        self.assertEqual(fa.DEFAULT_ENGINE_PRIORITY, fa.load_engine_priority())
 
 
 class EngineFlipTest(unittest.IsolatedAsyncioTestCase):
