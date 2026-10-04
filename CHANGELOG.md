@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.51.25
+
+### Added
+- Harness availability is now probed for EVERY installed harness, not
+  just the active one. Each harness with a cheap auth check —
+  `claude auth status`, `codex login status`, `cursor status`,
+  `opencode auth list`, `copilot` via `gh auth status` — reports
+  `healthy` / `problem` ("not logged in", "out of quota", …) on the
+  heartbeat, so the web/mobile can show which harnesses are actually
+  usable. The deep check (`claude doctor`) still runs only for the
+  harness in use, because it is too slow to run against all seven every
+  fifteen minutes. `/harness` with no argument now prints that status
+  table alongside the flip picker.
+
 ## 0.51.24
 
 ### Changed

@@ -2715,6 +2715,33 @@ class HarnessProbeTest(unittest.TestCase):
                          "two harnesses probing the same binary would "
                          "report one install twice")
 
+    def test_a_logged_in_harness_reports_healthy(self):
+        self._install("codex", "codex-cli 0.153.4")
+        found = {h["id"]: h for h in fa.probe_harnesses()}
+        self.assertIs(found["codex"]["healthy"], True)
+        self.assertNotIn("problem", found["codex"])
+
+    def test_a_not_logged_in_harness_reports_the_problem(self):
+        self._install("codex", "Not logged in", exit_code=1)
+        found = {h["id"]: h for h in fa.probe_harnesses()}
+        self.assertIs(found["codex"]["healthy"], False)
+        self.assertIn("not logged in", found["codex"]["problem"])
+
+    def test_claude_json_logged_in_false_reads_as_not_logged_in(self):
+        path = Path(self.tmp) / "claude"
+        path.write_text("#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\": false}'\n")
+        path.chmod(0o755)
+        found = {h["id"]: h for h in fa.probe_harnesses()}
+        self.assertIs(found["claude"]["healthy"], False)
+        self.assertIn("not logged in", found["claude"]["problem"])
+
+    def test_harness_without_an_auth_probe_has_no_health_key(self):
+        self._install("gemini", "gemini 1.2.3")
+        found = {h["id"]: h for h in fa.probe_harnesses()}
+        self.assertNotIn("healthy", found["gemini"],
+                         "no cheap auth command means auth is unknown, not "
+                         "a lie about it being fine")
+
     def test_telemetry_off_sends_no_inventory_at_all(self):
         self._install("codex")
         sent = {}
@@ -4105,18 +4132,22 @@ class HarnessHealthTest(unittest.TestCase):
         self.assertFalse(healthy)
         self.assertIsNotNone(problem)
 
-    def test_only_the_engine_in_use_is_health_probed(self):
-        """A broken gemini on a box running claude is a fact, not a
-        problem, and probing all ten is subprocesses spent proving
-        something nobody asked."""
+    def test_every_harness_with_an_auth_probe_reports_healthy(self):
+        """The cheap "logged in?" check runs for every installed harness,
+        not just the active one — the sidebar needs to see a broken login
+        on a harness it isn't using yet."""
         fa.DISPATCH_ENGINE = "claude"
         self._script("claude", 'echo "2.1.0"')
         self._script("codex", 'echo "0.1.0"')
+        self._script("gemini", 'echo "1.2.3"')
 
         found = {h["id"]: h for h in fa.probe_harnesses()}
 
         self.assertIn("healthy", found["claude"])
-        self.assertNotIn("healthy", found["codex"])
+        self.assertIn("healthy", found["codex"],
+                      "codex has a cheap auth probe, so it reports too")
+        self.assertNotIn("healthy", found["gemini"],
+                         "no auth command means auth is unknown, not a lie")
 
     def test_an_unhealthy_active_harness_carries_its_reason(self):
         fa.DISPATCH_ENGINE = "codex"

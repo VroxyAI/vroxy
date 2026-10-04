@@ -164,7 +164,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.24"
+AGENT_VERSION      = "vroxy_dispatch 0.51.25"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -348,16 +348,18 @@ async def subscribe(ws) -> None:
 # its auth still reported green. None of these cost a model call.
 KNOWN_HARNESSES = (
     {"id": "claude", "label": "Claude Code",   "bin": "claude",       "engine": "claude",
-     "health": ["doctor"]},
+     "health": ["doctor"], "auth": ["auth", "status"]},
     {"id": "codex",  "label": "OpenAI Codex",  "bin": "codex",        "engine": "codex",
-     "health": ["login", "status"]},
+     "health": ["login", "status"], "auth": ["login", "status"]},
     {"id": "gemini", "label": "Gemini CLI",    "bin": "gemini",       "engine": "gemini"},
-    {"id": "copilot", "label": "GitHub Copilot CLI", "bin": "copilot", "engine": "copilot_cli"},
+    {"id": "copilot", "label": "GitHub Copilot CLI", "bin": "copilot", "engine": "copilot_cli",
+     "auth": ["auth", "status"], "auth_bin": "gh"},
     {"id": "aider",  "label": "Aider",         "bin": "aider",        "engine": None},
-    {"id": "opencode", "label": "OpenCode",    "bin": "opencode",     "engine": "opencode"},
+    {"id": "opencode", "label": "OpenCode",    "bin": "opencode",     "engine": "opencode",
+     "auth": ["auth", "list"]},
     {"id": "pi",     "label": "Pi",            "bin": "pi",           "engine": None},
     {"id": "cursor", "label": "Cursor Agent",  "bin": "cursor-agent", "engine": "cursor",
-     "health": ["status"]},
+     "health": ["status"], "auth": ["status"]},
     {"id": "amp",    "label": "Amp",           "bin": "amp",          "engine": "amp"},
     {"id": "goose",  "label": "Goose",         "bin": "goose",        "engine": None},
 )
@@ -409,6 +411,7 @@ def _harness_version(path: str) -> str | None:
 # an operator gets "not logged in" instead of a raw exit code.
 _AUTH_HINTS = (
     ("not logged in",     "not logged in"),
+    ("not logged into",   "not logged in"),
     ("please log in",     "not logged in"),
     ("login required",    "not logged in"),
     ("unauthenticated",   "not logged in"),
@@ -421,6 +424,12 @@ _AUTH_HINTS = (
     ("out of credit",     "out of credit"),
     ("add credits",       "out of credit"),
     ("billing",           "a billing problem"),
+    # `claude auth status` answers in JSON, not prose.
+    ('"loggedin": false', "not logged in"),
+    ('"loggedin":false',  "not logged in"),
+    # `opencode auth list` prints a footer count, not an error.
+    ("0 credentials",     "not logged in"),
+    ("no credentials",    "not logged in"),
 )
 
 
@@ -486,13 +495,21 @@ def _harness_health(path: str, args: list[str]) -> tuple[bool, str | None]:
 
 
 def probe_harnesses() -> list[dict]:
-    """Which coding CLIs are installed on this box.
+    """Which coding CLIs are installed on this box, and whether each
+    one can actually do a turn.
 
     Reported so an operator can see what a checkout could be driven
     with without shelling into it.  An entry that resolves but won't
     report a version is still listed — installed-but-broken is a
     different problem from not installed, and flattening the two into
     "absent" hides the one worth fixing.
+
+    Every harness with an `auth` command gets a cheap "logged in?"
+    check (`healthy`/`problem`).  Only the harness we would actually
+    USE gets the deeper `health` check (quota, subscription, login) —
+    a broken gemini on a box running claude is a fact, not a problem,
+    and `claude doctor` is too slow to run against all seven every
+    fifteen minutes.
     """
     found = []
     for h in KNOWN_HARNESSES:
@@ -506,17 +523,30 @@ def probe_harnesses() -> list[dict]:
         if h["engine"]:
             entry["engine"] = h["engine"]
         entry["active"] = h["engine"] == DISPATCH_ENGINE
-        # Only the harness we would actually USE gets health-probed.
-        # A broken gemini on a box running claude is a fact, not a
-        # problem, and probing all ten every 15 minutes is ten
-        # subprocesses spent proving something nobody asked.
-        if entry["active"] and h.get("health"):
+
+        # Cheap "logged in?" check for every harness that has one.
+        if h.get("auth"):
+            auth_path = path
+            if h.get("auth_bin"):
+                auth_path = _resolve_harness_bin(h["auth_bin"], f"{h['id'].upper()}_AUTH_BIN")
+            if auth_path:
+                healthy, problem = _harness_health(auth_path, h["auth"])
+                if _engine_fault and entry["active"]:
+                    healthy, problem = False, _engine_fault
+                entry["healthy"] = healthy
+                if problem:
+                    entry["problem"] = problem
+
+        # Deeper check (quota/subscription) for the active harness only,
+        # when it is a different command from the cheap auth probe.
+        if entry["active"] and h.get("health") and h.get("health") != h.get("auth"):
             healthy, problem = _harness_health(path, h["health"])
             if _engine_fault:
                 healthy, problem = False, _engine_fault
-            entry["healthy"] = healthy
-            if problem:
-                entry["problem"] = problem
+            if not healthy:
+                entry["healthy"] = False
+                if problem:
+                    entry["problem"] = problem
         found.append(entry)
     return found
 
@@ -535,6 +565,21 @@ def harnesses(now: float | None = None) -> list[dict]:
     log.info("harnesses on this box: %s",
              ", ".join(f"{h['id']}={h.get('version', '?')}" for h in found) or "none")
     return found
+
+
+def harness_status_lines() -> list[str]:
+    """One line per installed harness — version, active marker, and the
+    auth/health verdict — for `/harness`'s bare status view."""
+    lines: list[str] = []
+    for h in harnesses():
+        mark = "→" if h.get("active") else "·"
+        version = h.get("version") or "?"
+        if "healthy" in h:
+            state = "ready" if h["healthy"] else (h.get("problem") or "not ready")
+        else:
+            state = "unknown"
+        lines.append(f"{mark} `{h['id']}` {version} — {state}")
+    return lines or ["(no coding CLIs installed)"]
 
 
 def _read_json_file(path: Path) -> dict | None:
@@ -4049,7 +4094,8 @@ async def handle_engine_command(ws, room_id: str, target: str | None,
             return
         posted = await post_room_reply(
             ws, room_id,
-            [f"Harness is `{current}`. Pick one to flip — no restart needed."],
+            [f"Harness is `{current}`. Pick one to flip — no restart needed.",
+             *(await asyncio.to_thread(harness_status_lines))],
             reply_to)
         await room_ask(ws, room_id, posted, {
             "prompt": "Flip to which harness?",
