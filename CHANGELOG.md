@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.51.19
+
+### Fixed
+- `/harness` on a second install (Holodeck, etc.) now writes
+  `DISPATCH_ENGINE` to that unit's own env file. `engine_env_path`
+  derives `/etc/vroxy-dispatch/<id>.env` from `VROXY_DISPATCH_UNIT`
+  when `VROXY_DISPATCH_ENV_FILE` is unset, and `install.sh` stamps
+  the path explicitly. It used to always rewrite
+  `/etc/default/vroxy-dispatch`, so a Holodeck flip mutated the
+  dogfood unit and did not survive Holodeck's own restart.
+- `set_dispatch_engine` still adopts in-process when the env file
+  already matches. A Holodeck restart (no `DISPATCH_ENGINE` in its
+  file → default `claude`) followed by `/harness cursor` used to
+  claim success and keep running Claude, because the *wrong* file
+  already said cursor and the no-op path skipped `_adopt_engine`.
+
 ## 0.51.18
 
 ### Fixed

@@ -926,6 +926,18 @@ class SetDispatchEngineTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("already", detail)
 
+    def test_already_set_still_adopts_in_process(self):
+        fa.DISPATCH_ENGINE = "claude"
+        self.env.write_text("DISPATCH_ENGINE=cursor\n")
+        ok, detail = fa.set_dispatch_engine("cursor")
+        self.assertTrue(ok, detail)
+        self.assertIn("already", detail)
+        self.assertEqual("cursor", fa.DISPATCH_ENGINE,
+                         "a no-op file rewrite must still adopt — Holodeck "
+                         "restarted on claude while the wrong env file "
+                         "already said cursor, and the flip claimed success "
+                         "then kept running claude")
+
     def test_unknown_engine_refused(self):
         ok, detail = fa.set_dispatch_engine("nope")
         self.assertFalse(ok)
@@ -955,6 +967,21 @@ class SetDispatchEngineTest(unittest.TestCase):
         self.assertIsNone(fa._last_model,
                           "a flip must not keep reporting the previous engine's model")
 
+    def test_engine_env_path_follows_the_unit(self):
+        prev_unit = os.environ.get("VROXY_DISPATCH_UNIT")
+        os.environ.pop("VROXY_DISPATCH_ENV_FILE", None)
+        os.environ["VROXY_DISPATCH_UNIT"] = "vroxy-dispatch@holodeck.service"
+        try:
+            self.assertEqual(
+                Path("/etc/vroxy-dispatch/holodeck.env"),
+                fa.engine_env_path(),
+                "a @instance must write its own env, not the default unit's")
+        finally:
+            if prev_unit is None:
+                os.environ.pop("VROXY_DISPATCH_UNIT", None)
+            else:
+                os.environ["VROXY_DISPATCH_UNIT"] = prev_unit
+            os.environ["VROXY_DISPATCH_ENV_FILE"] = str(self.env)
 
 class EngineFlipTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

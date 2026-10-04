@@ -461,6 +461,7 @@ VROXY_SERVICE_TOKEN=${token}
 VROXY_INSTALL_ID=${install_id}
 VROXY_AGENT_NAME=${agent_name}
 VROXY_DISPATCH_UNIT=vroxy-dispatch@${id}.service
+VROXY_DISPATCH_ENV_FILE=${ENV_DIR}/${id}.env
 CODE_ROOT=${code_root}
 PROJECT=${project}
 LOG_FILE=${HERE}/log/dispatch-${id}.log

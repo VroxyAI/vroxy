@@ -165,7 +165,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.18"
+AGENT_VERSION      = "vroxy_dispatch 0.51.19"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1624,8 +1624,21 @@ def known_engines() -> list[str]:
 
 
 def engine_env_path() -> Path:
-    return Path(os.environ.get(
-        "VROXY_DISPATCH_ENV_FILE", "/etc/default/vroxy-dispatch"))
+    """Where `/harness` writes DISPATCH_ENGINE for THIS unit.
+
+    Order: explicit `VROXY_DISPATCH_ENV_FILE` → the `@instance` env
+    derived from `VROXY_DISPATCH_UNIT` → the legacy single-unit file.
+    Deriving from the unit matters: a second install like Holodeck
+    must not rewrite `/etc/default/vroxy-dispatch` belonging to the
+    first agent on the box."""
+    override = os.environ.get("VROXY_DISPATCH_ENV_FILE")
+    if override:
+        return Path(override)
+    unit = os.environ.get("VROXY_DISPATCH_UNIT", "").strip()
+    match = re.fullmatch(r"vroxy-dispatch@(.+)\.service", unit)
+    if match:
+        return Path(f"/etc/vroxy-dispatch/{match.group(1)}.env")
+    return Path("/etc/default/vroxy-dispatch")
 
 
 def _adopt_engine(engine: str) -> None:
@@ -1668,6 +1681,12 @@ def set_dispatch_engine(engine: str) -> tuple[bool, str]:
         new_text = text.rstrip() + "\n" + line + "\n"
 
     if new_text == text:
+        # File already matches — still adopt. A @instance that was
+        # writing the WRONG env file (or that restarted without
+        # DISPATCH_ENGINE in its own file) can be mid-claude while the
+        # file already says cursor; returning here without adopting
+        # claimed a flip and then kept running the old harness.
+        _adopt_engine(engine)
         return True, f"already {engine}"
 
     try:
