@@ -13,6 +13,14 @@
 #   ./install.sh --migrate-legacy [ID]
 #                             move a pre-template unit onto the
 #                             template.  Needs the agent's EXACT name.
+#   ./install.sh --migrate-system
+#                             move every /etc/vroxy-dispatch install onto
+#                             a rootless USER unit (needs passwordless sudo).
+#
+# ROOTLESS BY DEFAULT. As a normal user, installs a systemd USER unit
+# (`systemctl --user`, env under $XDG_CONFIG_HOME) — install, start,
+# stop and every config change run as you, no sudo.  `VROXY_DISPATCH_SYSTEM=1`
+# (or running as root, e.g. cloud-init) keeps the machine-wide system unit.
 #
 # --unattended reads VROXY_TOKEN (required), VROXY_HOST, CODE_ROOT,
 # PROJECT, VROXY_AGENT_NAME, VROXY_INSTANCE_ID and optional DISPATCH_ENGINE
@@ -36,10 +44,31 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo /nonexistent)"
 UNIT_NAME="vroxy-dispatch@.service"
-UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
-ENV_DIR="/etc/vroxy-dispatch"
 RUN_USER="${SUDO_USER:-$(id -un)}"
 RUN_GROUP="$(id -gn "$RUN_USER")"
+
+# Rootless by default: a USER unit + env under $XDG_CONFIG_HOME, so
+# install, start, stop and every config change run as the user — no
+# sudo anywhere.  `VROXY_DISPATCH_SYSTEM=1` (or running as root, e.g.
+# cloud-init) keeps the machine-wide system unit for server fleets and
+# boxes that haven't migrated yet.
+if [[ "$(id -u)" -eq 0 || "${VROXY_DISPATCH_SYSTEM:-0}" == "1" ]]; then
+  SYSTEM_INSTALL=1
+else
+  SYSTEM_INSTALL=0
+fi
+if [[ "$SYSTEM_INSTALL" == "1" ]]; then
+  UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
+  ENV_DIR="/etc/vroxy-dispatch"
+  UNIT_MODE="system"
+else
+  UNIT_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/${UNIT_NAME}"
+  ENV_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vroxy-dispatch"
+  UNIT_MODE="user"
+fi
+
+# systemctl aimed at the right manager (`systemctl --user` vs system).
+ctl()     { if [[ "$SYSTEM_INSTALL" == "1" ]]; then sudo systemctl "$@"; else systemctl --user "$@"; fi; }
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
@@ -149,10 +178,17 @@ choose_project() {
   fi
 }
 
-# Env files live under a root:root 0750 dir, so reading one is a `sudo`.
-# `env_field` pulls one KEY=value out of a file's CONTENTS (a string, not a
-# path), so the parse is testable without touching /etc.
-read_env() { sudo -n cat "${ENV_DIR}/${1}.env" 2>/dev/null || true; }
+# Env files live under the user's config dir (0700) for a user install,
+# or a root:root 0750 dir for a system install — reading the latter is a
+# `sudo`.  `env_field` pulls one KEY=value out of a file's CONTENTS (a
+# string, not a path), so the parse is testable without touching /etc.
+read_env() {
+  if [[ "$SYSTEM_INSTALL" == "1" ]]; then
+    sudo -n cat "${ENV_DIR}/${1}.env" 2>/dev/null || true
+  else
+    cat "${ENV_DIR}/${1}.env" 2>/dev/null || true
+  fi
+}
 env_field() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1; }
 
 # The coding CLIs vroxy_dispatch can drive, with a one-line install. Keep
@@ -200,7 +236,11 @@ suggest_harnesses() {
   fi
   say "Then flip the harness in a dispatch room (/harness cursor), or seed"
   say "~/.cache/vroxy-dispatch/engine-${id} with the engine name and restart:"
-  say "  sudo systemctl restart vroxy-dispatch@${id}.service"
+  if [[ "$SYSTEM_INSTALL" == "1" ]]; then
+    say "  sudo systemctl restart vroxy-dispatch@${id}.service"
+  else
+    say "  systemctl --user restart vroxy-dispatch@${id}.service"
+  fi
 }
 
 python_setup_hint() {
@@ -372,10 +412,13 @@ ensure_venv() {
 # ── the template unit ─────────────────────────────────────────────
 # `%i` is the instance id, so one file serves every workspace.
 install_unit() {
-  say "Installing ${UNIT_NAME}…"
-  sudo mkdir -p "$ENV_DIR"
-  sudo chmod 750 "$ENV_DIR"
-  sudo tee "$UNIT_PATH" >/dev/null <<UNIT
+  say "Installing ${UNIT_NAME} (${UNIT_MODE})…"
+  mkdir -p "$(dirname "$UNIT_PATH")" "$ENV_DIR"
+  chmod 700 "$ENV_DIR"
+  if [[ "$SYSTEM_INSTALL" == "1" ]]; then
+    chmod 750 "$ENV_DIR"
+  fi
+  tee "$UNIT_PATH" >/dev/null <<UNIT
 [Unit]
 Description=vroxy dispatch — %i
 Documentation=https://github.com/wartron/vroxy_dispatch
@@ -384,8 +427,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=${RUN_USER}
-Group=${RUN_GROUP}
+$([[ "$SYSTEM_INSTALL" == "1" ]] && printf 'User=%s\nGroup=%s\n' "$RUN_USER" "$RUN_GROUP")
 WorkingDirectory=${HERE}
 EnvironmentFile=${ENV_DIR}/%i.env
 ExecStart=${HERE}/.venv/bin/python ${HERE}/feedback_agent.py
@@ -397,9 +439,25 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+$([[ "$SYSTEM_INSTALL" == "1" ]] && printf 'WantedBy=multi-user.target\n' || printf 'WantedBy=default.target\n')
 UNIT
-  sudo systemctl daemon-reload
+  ctl daemon-reload
+  if [[ "$SYSTEM_INSTALL" != "1" ]]; then
+    ensure_linger
+  fi
+}
+
+# A user unit only survives logout if the account is lingering.  `loginctl
+# enable-linger` needs root once per box (not per change), and is the one
+# step a rootless install cannot do for itself — so check and tell the
+# operator rather than silently installing an agent that dies at logout.
+ensure_linger() {
+  command -v loginctl >/dev/null 2>&1 || return 0
+  local linger
+  linger="$(loginctl show-user "$RUN_USER" -p Linger --value 2>/dev/null || true)"
+  [[ "$linger" == "yes" ]] && return 0
+  warn "User lingering is OFF for ${RUN_USER}: the agent stops when you log out."
+  warn "Run once, as root:  loginctl enable-linger ${RUN_USER}"
 }
 
 # ── verifying a token before we wire anything to it ───────────────
@@ -445,8 +503,8 @@ write_env_file() {
   # its room, and its history — which is why an existing one is read
   # back rather than minted again. cloud-init re-runs on every boot.
   local install_id=""
-  if sudo -n test -e "$env_file" 2>/dev/null; then
-    install_id="$(sudo -n sed -n 's/^VROXY_INSTALL_ID=//p' "$env_file" | head -1)"
+  if [[ -f "$env_file" ]] || { [[ "$SYSTEM_INSTALL" == "1" ]] && sudo -n test -e "$env_file" 2>/dev/null; }; then
+    install_id="$(read_env "$id" | sed -n 's/^VROXY_INSTALL_ID=//p' | head -1)"
   fi
   [[ -n "$install_id" ]] || install_id="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 
@@ -454,10 +512,13 @@ write_env_file() {
   cable="${cable/https:/wss:}"
   cable="${cable/http:/ws:}"
 
-  sudo mkdir -p "$ENV_DIR"
-  sudo tee "$env_file" >/dev/null <<ENVFILE
+  local perm_mode="0640"
+  [[ "$SYSTEM_INSTALL" == "1" ]] || perm_mode="0600"
+
+  mkdir -p "$ENV_DIR"
+  tee "$env_file" >/dev/null <<ENVFILE
 # vroxy_dispatch — ${name}
-# Written by install.sh. Contains a workspace token: keep 0640.
+# Written by install.sh. Contains a workspace token: keep ${perm_mode}.
 VROXY_CABLE_URL=${cable}
 VROXY_SERVICE_TOKEN=${token}
 VROXY_INSTALL_ID=${install_id}
@@ -471,10 +532,14 @@ PYTHONUNBUFFERED=1
 PATH=${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
 # DISPATCH_AUTO_UPDATE=0
 ENVFILE
-  sudo chown root:"$RUN_GROUP" "$env_file"
-  sudo chmod 640 "$env_file"
-  # Harness preference is user-writable state, not the root-owned
-  # EnvironmentFile — /harness flips it without sudo.
+  if [[ "$SYSTEM_INSTALL" == "1" ]]; then
+    chown root:"$RUN_GROUP" "$env_file"
+    chmod 640 "$env_file"
+  else
+    chmod 600 "$env_file"
+  fi
+  # Harness preference is user-writable state, not the env file —
+  # /harness flips it without sudo.
   if [[ -n "${DISPATCH_ENGINE:-}" ]]; then
     local state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/vroxy-dispatch"
     mkdir -p "$state_dir"
@@ -507,11 +572,11 @@ unattended_workspace() {
   mkdir -p "$code_root"
   write_env_file "$id" "$name" "$host" "$token" "$agent_name" "$code_root" "$project"
 
-  sudo systemctl enable --now "vroxy-dispatch@${id}.service"
+  ctl enable --now "vroxy-dispatch@${id}.service"
   sleep 2
-  systemctl is-active --quiet "vroxy-dispatch@${id}.service" \
+  ctl is-active --quiet "vroxy-dispatch@${id}.service" \
     && say "vroxy-dispatch@${id} running for ${name} as \"${agent_name}\"." \
-    || die "vroxy-dispatch@${id} did not start — journalctl -u vroxy-dispatch@${id} -n 50"
+    || die "vroxy-dispatch@${id} did not start — $(journal_hint "$id")"
 }
 
 add_workspace() {
@@ -597,23 +662,37 @@ add_workspace() {
   write_env_file "$id" "$name" "$host" "$token" "$agent_name" "$code_root" "$project"
 
   say "Starting vroxy-dispatch@${id}…"
-  sudo systemctl enable --now "vroxy-dispatch@${id}.service"
+  ctl enable --now "vroxy-dispatch@${id}.service"
   sleep 2
-  systemctl is-active --quiet "vroxy-dispatch@${id}.service" \
+  ctl is-active --quiet "vroxy-dispatch@${id}.service" \
     && say "Running. It registers itself as \"${agent_name}\" in ${name} on its first heartbeat." \
-    || warn "Not running — journalctl -u vroxy-dispatch@${id} -n 50"
-  say "Logs: ${HERE}/log/dispatch-${id}.log (tail -f) or journalctl -u vroxy-dispatch@${id} -f"
+    || warn "Not running — $(journal_hint "$id")"
+  say "Logs: ${HERE}/log/dispatch-${id}.log (tail -f) or $(journal_hint "$id" follow)"
   ensure_node
   suggest_harnesses "$id"
 }
 
+# How to read this instance's journal for the active unit scope.
+journal_hint() {
+  local id="$1" follow="${2:-}"
+  if [[ "$SYSTEM_INSTALL" == "1" ]]; then
+    printf 'journalctl -u vroxy-dispatch@%s%s' "$id" "${follow:+" -f"}"
+  else
+    printf 'journalctl --user -u vroxy-dispatch@%s%s' "$id" "${follow:+" -f"}"
+  fi
+}
+
 instances() {
-  # `sudo`: ENV_DIR is 0750 root:root because the env files hold
-  # workspace tokens, so an unprivileged `find` reads nothing and
-  # --list cheerfully reported "nothing installed" over a running
-  # instance. Listing names is not privileged; reading the files is.
-  sudo -n test -d "$ENV_DIR" 2>/dev/null || return 0
-  sudo -n find "$ENV_DIR" -maxdepth 1 -name '*.env' -printf '%f\n' 2>/dev/null | sed 's/\.env$//' | sort
+  # A system install's ENV_DIR is root-owned, so reading it is a `sudo`;
+  # a user install's is the invoking user's own config dir.  Listing
+  # names is not privileged; reading the files is.
+  if [[ "$SYSTEM_INSTALL" == "1" ]]; then
+    sudo -n test -d "$ENV_DIR" 2>/dev/null || return 0
+    sudo -n find "$ENV_DIR" -maxdepth 1 -name '*.env' -printf '%f\n' 2>/dev/null | sed 's/\.env$//' | sort
+  else
+    [[ -d "$ENV_DIR" ]] || return 0
+    find "$ENV_DIR" -maxdepth 1 -name '*.env' -printf '%f\n' 2>/dev/null | sed 's/\.env$//' | sort
+  fi
 }
 
 LEGACY_UNIT="vroxy-dispatch-feedback-agent.service"
@@ -637,7 +716,7 @@ list_instances() {
     name="$(env_field "$contents" VROXY_AGENT_NAME)"
     project="$(env_field "$contents" PROJECT)"
     printf '%-20s %-9s agent=%-16s project=%s\n' \
-      "$id" "$(systemctl is-active "vroxy-dispatch@${id}.service" 2>/dev/null || echo unknown)" \
+      "$id" "$(ctl is-active "vroxy-dispatch@${id}.service" 2>/dev/null || echo unknown)" \
       "${name:-?}" "${project:-?}"
   done < <(instances)
   if legacy_present; then
@@ -655,7 +734,7 @@ list_instances() {
 # points at another instance — each with the exact fix. Exits non-zero when
 # anything is wrong so a script can gate on it.
 doctor() {
-  if ! sudo -n true 2>/dev/null; then
+  if [[ "$SYSTEM_INSTALL" == "1" ]] && ! sudo -n true 2>/dev/null; then
     warn "cannot read ${ENV_DIR} without passwordless sudo — run with sudo, or grant it."
     return 2
   fi
@@ -717,7 +796,11 @@ doctor() {
 
     if [[ -n "$unit" && "$unit" != "vroxy-dispatch@${id}.service" ]]; then
       warn "  !! VROXY_DISPATCH_UNIT=${unit} should be vroxy-dispatch@${id}.service — self-update would restart the wrong unit"
-      warn "     fix: sudo sed -i 's|^VROXY_DISPATCH_UNIT=.*|VROXY_DISPATCH_UNIT=vroxy-dispatch@${id}.service|' ${ENV_DIR}/${id}.env"
+      if [[ "$SYSTEM_INSTALL" == "1" ]]; then
+        warn "     fix: sudo sed -i 's|^VROXY_DISPATCH_UNIT=.*|VROXY_DISPATCH_UNIT=vroxy-dispatch@${id}.service|' ${ENV_DIR}/${id}.env"
+      else
+        warn "     fix: sed -i 's|^VROXY_DISPATCH_UNIT=.*|VROXY_DISPATCH_UNIT=vroxy-dispatch@${id}.service|' ${ENV_DIR}/${id}.env"
+      fi
       problems=$((problems + 1))
     fi
 
@@ -735,11 +818,15 @@ doctor() {
       problems=$((problems + 1))
     fi
 
-    if systemctl is-active --quiet "vroxy-dispatch@${id}.service" 2>/dev/null; then
+    if ctl is-active --quiet "vroxy-dispatch@${id}.service" 2>/dev/null; then
       say "  ok  unit active"
     else
       warn "  !! unit vroxy-dispatch@${id}.service is not active"
-      warn "     fix: sudo systemctl enable --now vroxy-dispatch@${id}.service && journalctl -u vroxy-dispatch@${id} -n 50"
+      if [[ "$SYSTEM_INSTALL" == "1" ]]; then
+        warn "     fix: sudo systemctl enable --now vroxy-dispatch@${id}.service && journalctl -u vroxy-dispatch@${id} -n 50"
+      else
+        warn "     fix: systemctl --user enable --now vroxy-dispatch@${id}.service && journalctl --user -u vroxy-dispatch@${id} -n 50"
+      fi
       problems=$((problems + 1))
     fi
   done
@@ -753,6 +840,21 @@ doctor() {
   return $(( problems > 0 ))
 }
 
+# Out-of-band restart: one issued from inside the unit's own cgroup takes
+# this script down with it when systemd stops the unit.  A transient timer
+# (systemd-run) owns it instead, so it survives the script dying.  `sudo
+# systemctl` for a system install, `systemctl --user` for a user one.
+restart_out_of_band() {
+  local label="$1"; shift
+  if [[ "$SYSTEM_INSTALL" == "1" ]]; then
+    sudo systemd-run --on-active=2s --unit="vroxy-dispatch-${label}-$RANDOM" --collect \
+      systemctl restart "$@"
+  else
+    systemd-run --user --on-active=2s --unit="vroxy-dispatch-${label}-$RANDOM" --collect \
+      systemctl --user restart "$@"
+  fi
+}
+
 update_all() {
   say "Updating the checkout…"
   git -C "$HERE" pull --ff-only
@@ -761,15 +863,11 @@ update_all() {
   while read -r id; do
     [[ -n "$id" ]] || continue
     say "Restarting vroxy-dispatch@${id}…"
-    # Out of band: a restart issued from inside the unit's own cgroup
-    # takes this script down with it when systemd stops the unit.
-    sudo systemd-run --on-active=2s --unit="vroxy-dispatch-update-${id}-$RANDOM" --collect \
-      systemctl restart "vroxy-dispatch@${id}.service"
+    restart_out_of_band "update-${id}" "vroxy-dispatch@${id}.service"
   done < <(instances)
   if legacy_present; then
     say "Restarting ${LEGACY_UNIT}…"
-    sudo systemd-run --on-active=2s --unit="vroxy-dispatch-update-legacy-$RANDOM" --collect \
-      systemctl restart "$LEGACY_UNIT"
+    restart_out_of_band "update-legacy" "$LEGACY_UNIT"
   fi
   say "Restarts scheduled. Each instance spools its in-flight work and replays it on boot."
 }
@@ -777,8 +875,8 @@ update_all() {
 remove_instance() {
   local id="$1"
   [[ -n "$id" ]] || die "usage: ./install.sh --remove <id>"
-  sudo systemctl disable --now "vroxy-dispatch@${id}.service" 2>/dev/null || true
-  sudo rm -f "${ENV_DIR}/${id}.env"
+  ctl disable --now "vroxy-dispatch@${id}.service" 2>/dev/null || true
+  rm -f "${ENV_DIR}/${id}.env"
   say "Removed ${id}. The agent row and its room stay in the workspace — delete them there if you want them gone."
 }
 
@@ -838,8 +936,9 @@ migrate_legacy() {
   local id="${1:-}"
   [[ -n "$id" ]] || { read_prompt id "Instance id for this workspace (e.g. vroxy): "; }
   [[ -n "$id" ]] || die "an instance id is required."
-  sudo -n test -e "${ENV_DIR}/${id}.env" 2>/dev/null &&
+  if [[ -f "${ENV_DIR}/${id}.env" ]] || { [[ "$SYSTEM_INSTALL" == "1" ]] && sudo -n test -e "${ENV_DIR}/${id}.env" 2>/dev/null; }; then
     die "${ENV_DIR}/${id}.env already exists — pick another id or remove that instance first."
+  fi
 
   local legacy
   legacy="$(sudo cat "$LEGACY_ENV" 2>/dev/null)" || die "cannot read $LEGACY_ENV"
@@ -874,14 +973,63 @@ migrate_legacy() {
   say "Migrating ${LEGACY_UNIT} → vroxy-dispatch@${id}.service (agent: ${agent_name})"
   write_env_file "$id" "$id" "$host" "$token" "$agent_name" "$code_root" "$project"
   install_unit
-  sudo systemctl enable "vroxy-dispatch@${id}.service" >/dev/null
+  ctl enable "vroxy-dispatch@${id}.service" >/dev/null
 
   # Out of band: this script may itself be running inside the unit it
-  # is about to stop.
+  # is about to stop.  The legacy unit is a system unit; the new one is
+  # whichever scope this run installed.
+  local start_cmd="systemctl"
+  if [[ "$SYSTEM_INSTALL" != "1" ]]; then
+    start_cmd="systemctl --user"
+  fi
   sudo systemd-run --on-active=2s --unit="vroxy-dispatch-migrate-$RANDOM" --collect \
-    bash -c "systemctl disable --now ${LEGACY_UNIT}; systemctl start vroxy-dispatch@${id}.service"
+    bash -c "systemctl disable --now ${LEGACY_UNIT}; ${start_cmd} start vroxy-dispatch@${id}.service"
   say "Scheduled. The old unit stops and the new one starts in ~2s;"
   say "in-flight work is spooled and replayed. Check: ./install.sh --list"
+}
+
+# Convert existing SYSTEM template units (/etc/vroxy-dispatch/<id>.env)
+# to rootless USER units.  Reads the system env via sudo, copies it to
+# the user's config dir (same install_id, so the server still resolves
+# the same agent row), then swaps the unit out of band.
+migrate_system() {
+  command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null \
+    || die "migrating from a system install needs passwordless sudo."
+  [[ "$SYSTEM_INSTALL" != "1" ]] || die "run as the dispatch user (not root, not VROXY_DISPATCH_SYSTEM=1)."
+  local sys_env="/etc/vroxy-dispatch"
+  local ids=() id
+  while read -r id; do
+    [[ -n "$id" ]] && ids+=("$id")
+  done < <(sudo -n find "$sys_env" -maxdepth 1 -name '*.env' -printf '%f\n' 2>/dev/null | sed 's/\.env$//' | sort)
+  [[ ${#ids[@]} -gt 0 ]] || die "no system installs under ${sys_env} to migrate."
+
+  ensure_venv
+  install_unit
+
+  for id in "${ids[@]}"; do
+    local sys_file="${sys_env}/${id}.env" user_file="${ENV_DIR}/${id}.env"
+    if [[ -e "$user_file" ]]; then
+      warn "${id}: ${user_file} already exists — skipping (remove it first to retry)."
+      continue
+    fi
+    local install_id
+    install_id="$(sudo -n sed -n 's/^VROXY_INSTALL_ID=//p' "$sys_file" 2>/dev/null | head -1)"
+    [[ -n "$install_id" ]] || { warn "${id}: no VROXY_INSTALL_ID — skipping (./install.sh --doctor first)."; continue; }
+
+    say "Migrating vroxy-dispatch@${id}.service → user unit…"
+    sudo -n cp "$sys_file" "$user_file"
+    sudo -n chown "$RUN_USER":"$(id -gn "$RUN_USER")" "$user_file"
+    chmod 600 "$user_file"
+    ctl enable "vroxy-dispatch@${id}.service" >/dev/null
+    # Stop the system unit out of band (this script may be inside it),
+    # then start the user unit a beat later so the two never overlap.
+    sudo systemd-run --on-active=2s --unit="vroxy-dispatch-migrate-${id}-$RANDOM" --collect \
+      systemctl disable --now "vroxy-dispatch@${id}.service"
+    systemd-run --user --on-active=4s --unit="vroxy-dispatch-migrate-start-${id}-$RANDOM" --collect \
+      systemctl --user start "vroxy-dispatch@${id}.service"
+  done
+  say "Migrations scheduled. Each instance spools in-flight work and replays on its user unit."
+  say "Then run: ./install.sh --list"
 }
 
 [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]] || return 0
@@ -893,6 +1041,7 @@ case "${1:-}" in
   --cli)        install_cli ;;
   --dispatch)   add_workspace ;;
   --migrate-legacy) migrate_legacy "${2:-}" ;;
+  --migrate-system) migrate_system ;;
   --update) update_all ;;
   --list)   list_instances ;;
   --doctor) doctor ;;

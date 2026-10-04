@@ -300,14 +300,23 @@ non-streamed one, which is why it never fixed the streamed path.
 `./install.sh --dispatch` creates the venv, installs a systemd
 TEMPLATE unit (`vroxy-dispatch@<workspace>.service`), asks for the
 vroxy host and a workspace API token, **confirms the workspace by
-name** before wiring anything to it, and writes
-`/etc/vroxy-dispatch/<id>.env` at 0640.
+name** before wiring anything to it, and writes the env file.
+
+**Rootless by default.** As a normal user it installs a systemd USER
+unit — `systemctl --user`, env under `~/.config/vroxy-dispatch/`
+(`0600`), no sudo anywhere. Install, start, stop, and every config
+change run as you. The one thing a rootless install can't do for
+itself is `loginctl enable-linger $USER` (root, once per box); the
+installer warns when it's off. `VROXY_DISPATCH_SYSTEM=1` (or running
+as root, e.g. cloud-init) installs the machine-wide system unit
+instead (`/etc/vroxy-dispatch/<id>.env`, `0640`).
 
 ```bash
-./install.sh --dispatch   # add a workspace (interactive)
-./install.sh --list       # what's installed, and whether it's up
-./install.sh --update     # git pull + deps + restart every instance
-./install.sh --remove ID  # stop, disable, forget one instance
+./install.sh --dispatch       # add a workspace (interactive)
+./install.sh --list           # what's installed, and whether it's up
+./install.sh --update         # git pull + deps + restart every instance
+./install.sh --remove ID      # stop, disable, forget one instance
+./install.sh --migrate-system # /etc/vroxy-dispatch → rootless user units
 ```
 
 **One process per workspace.** `AdminFeedbackChannel` streams for
@@ -371,7 +380,6 @@ attached to a User instead of a Tenant.
 | `VROXY_SERVICE_TOKEN` | *(required)*                        |
 | `CODE_ROOT`             | parent of this checkout             |
 | `PROJECT`               | `vroxy_web`                       |
-| `DISPATCH_ENGINE`       | first-boot default only (`claude`); `/harness` persists under `~/.cache/vroxy-dispatch/` |
 | `DISPATCH_TELEMETRY`    | `1` (set `0` to stop reporting the box) |
 | `DISPATCH_AUTO_UPDATE`  | `0` (set `1` to apply patch/minor releases on its own) |
 | `CLAUDE_CHAT_BIN`       | `./bin/claude-chat`                 |
@@ -452,14 +460,13 @@ replayed.
 The active harness is chosen at runtime with `/harness <engine>` in a
 dispatch room (or `/engine`). It persists under
 `~/.cache/vroxy-dispatch/engine-<unit>` — owned by the dispatch user,
-no root, no restart. An optional `DISPATCH_ENGINE` in the unit
-EnvironmentFile is only a first-boot default when that state file
-does not exist yet; `/harness` never rewrites the env file.
-
-Defaults to `claude`. Also runs `codex`, `cursor` (`cursor-agent`),
-`gemini`, `copilot_cli`, `opencode`, and `amp`. One process runs one
-engine — to have several, install a second systemd instance. An
-unrecognised value raises at the first run rather than falling back.
+no root, no restart. There is no `DISPATCH_ENGINE` env var: it used to
+live in the root-owned EnvironmentFile, which made flipping a harness
+a `sudo` job. Defaults to `claude`. Also runs `codex`, `cursor`
+(`cursor-agent`), `gemini`, `copilot_cli`, `opencode`, and `amp`. One
+process runs one engine — to have several, install a second systemd
+instance. An unrecognised value raises at the first run rather than
+falling back.
 
 `cursor` and `copilot_cli` were verified first; `opencode` now is
 too (real `--format json` capture on this box). Gemini's parser

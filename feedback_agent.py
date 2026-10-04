@@ -108,10 +108,11 @@ CLAUDE_CHAT_BIN = os.environ.get(
 )
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
 # Which CLI actually does the work.  Resolved again after
-# HARNESS_SPECS loads: state file (user-writable) wins, then an
-# optional DISPATCH_ENGINE env bootstrap, then `claude`.  `/harness`
-# never touches a root-owned EnvironmentFile.
-DISPATCH_ENGINE = os.environ.get("DISPATCH_ENGINE", "claude").strip().lower()
+# HARNESS_SPECS loads: the user-writable state file (owned by the
+# dispatch user, no root) wins, then `claude`.  There is no
+# DISPATCH_ENGINE env var — it used to live in the root-owned
+# EnvironmentFile, which made flipping a harness a `sudo` job.
+DISPATCH_ENGINE = "claude"
 
 # The model the CLI actually used on the last run, read off the stream
 # rather than from config: config says what was asked for, the stream
@@ -163,7 +164,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.21"
+AGENT_VERSION      = "vroxy_dispatch 0.51.22"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1655,12 +1656,12 @@ def update_attempts_path() -> Path:
 
 
 def resolve_dispatch_engine() -> str:
-    """State file → optional env bootstrap → `claude`.
+    """State file → `claude`.
 
     The state file is under the running user's `STATE_DIR`, so a
-    harness flip never needs root.  `DISPATCH_ENGINE` in the unit
-    EnvironmentFile is only a first-boot default for installs that
-    have never flipped."""
+    harness flip never needs root.  There is deliberately no
+    `DISPATCH_ENGINE` env fallback: it made the harness a unit-env
+    knob that only root could turn."""
     path = engine_state_path()
     try:
         raw = path.read_text(encoding="utf-8").strip().splitlines()[0].strip().lower()
@@ -1671,12 +1672,6 @@ def resolve_dispatch_engine() -> str:
         if eng in known_engines():
             return eng
         log.warning("ignoring unknown engine %r in %s", raw, path)
-    env = os.environ.get("DISPATCH_ENGINE", "").strip().lower()
-    if env:
-        eng = normalize_engine(env)
-        if eng in known_engines():
-            return eng
-        log.warning("ignoring unknown DISPATCH_ENGINE=%r", env)
     return "claude"
 
 
@@ -3855,6 +3850,22 @@ def take_restart_notice() -> dict | None:
     return notice
 
 
+def _unit_scope() -> str:
+    """`user` when this process runs under a systemd user manager,
+    else `system`.  A user unit is `systemctl --user`, needs no sudo
+    and has no `User=` line; a system unit is the opposite.  The
+    unit name alone doesn't say which, so ask the user manager."""
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "Id", "--value", SERVICE_UNIT],
+            capture_output=True, text=True, timeout=10)
+        if proc.returncode == 0 and SERVICE_UNIT in (proc.stdout or ""):
+            return "user"
+    except Exception:
+        pass
+    return "system"
+
+
 def schedule_restart() -> tuple[bool, str]:
     """Restart the unit from OUTSIDE our own cgroup.
 
@@ -3864,10 +3875,17 @@ def schedule_restart() -> tuple[bool, str]:
     command.  A transient timer owns it instead, so the restart
     survives us dying."""
     unit = f"vroxy-dispatch-self-restart-{uuid.uuid4().hex[:8]}"
-    cmd = ["systemd-run", f"--on-active={RESTART_DELAY_SECONDS}s",
-           f"--unit={unit}", "--collect",
-           "systemctl", "restart", SERVICE_UNIT]
-    if os.geteuid() != 0:
+    user = _unit_scope() == "user"
+    cmd = ["systemd-run"]
+    if user:
+        cmd += ["--user"]
+    cmd += [f"--on-active={RESTART_DELAY_SECONDS}s",
+            f"--unit={unit}", "--collect",
+            "systemctl"]
+    if user:
+        cmd += ["--user"]
+    cmd += ["restart", SERVICE_UNIT]
+    if not user and os.geteuid() != 0:
         cmd = ["sudo", "-n"] + cmd
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -3885,9 +3903,12 @@ def _exit_and_let_systemd_restart(reason: str) -> tuple[bool, str]:
     bring us back.  Only when that policy actually restarts on
     failure — exiting under `Restart=no` would take dispatch off the
     air until someone noticed, which is worse than running stale."""
+    ctl = ["systemctl"]
+    if _unit_scope() == "user":
+        ctl += ["--user"]
     try:
         shown = subprocess.run(
-            ["systemctl", "show", "-p", "Restart", "--value", SERVICE_UNIT],
+            ctl + ["show", "-p", "Restart", "--value", SERVICE_UNIT],
             capture_output=True, text=True, timeout=10)
         policy = (shown.stdout or "").strip()
     except Exception:

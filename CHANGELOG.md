@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.51.22
+
+### Changed
+- Dispatch no longer needs root to install, run, or change. As a
+  normal user, `install.sh` now installs a systemd USER unit
+  (`systemctl --user`, env under `~/.config/vroxy-dispatch/` at
+  `0600`) — no sudo anywhere. `VROXY_DISPATCH_SYSTEM=1` (or running
+  as root, e.g. cloud-init) keeps the machine-wide system unit, and
+  `install.sh --migrate-system` moves an existing `/etc/vroxy-dispatch`
+  install onto a rootless user unit (same install id, so the server
+  still resolves the same agent row). The one step a rootless install
+  can't do for itself is `loginctl enable-linger $USER` (root, once
+  per box) — the installer warns when it's off.
+- `DISPATCH_ENGINE` is gone as a runtime env var. The active harness
+  comes only from `~/.cache/vroxy-dispatch/engine-<unit>` (or
+  `claude`); there is no env fallback left to flip in a root-owned
+  EnvironmentFile. `install.sh --unattended` still reads
+  `DISPATCH_ENGINE` to seed that file at install time.
+
 ## 0.51.21
 
 ### Fixed

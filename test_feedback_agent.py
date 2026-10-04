@@ -1021,14 +1021,16 @@ class SetDispatchEngineTest(unittest.TestCase):
         fa.SERVICE_UNIT = "vroxy-dispatch-feedback-agent.service"
         self.assertEqual(1, len(fa.take_spooled_work()))
 
-    def test_resolve_prefers_state_over_env(self):
+    def test_resolve_reads_state(self):
         (self.state / "engine-test").write_text("opencode\n")
         os.environ["DISPATCH_ENGINE"] = "cursor"
-        self.assertEqual("opencode", fa.resolve_dispatch_engine())
+        self.assertEqual("opencode", fa.resolve_dispatch_engine(),
+                         "the state file wins; DISPATCH_ENGINE env is ignored")
 
-    def test_resolve_falls_back_to_env_when_no_state(self):
+    def test_resolve_defaults_to_claude_with_no_state(self):
         os.environ["DISPATCH_ENGINE"] = "cursor"
-        self.assertEqual("cursor", fa.resolve_dispatch_engine())
+        self.assertEqual("claude", fa.resolve_dispatch_engine(),
+                         "no state file means claude — the env var is not consulted")
 
     def test_no_sudo_on_flip(self):
         calls = []

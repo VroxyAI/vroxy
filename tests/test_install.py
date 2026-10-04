@@ -265,7 +265,7 @@ class InstallScriptTest(unittest.TestCase):
             "suggest_harnesses phleet"
         )
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertIn("/etc/vroxy-dispatch/phleet.env", result.stdout)
+        self.assertIn("~/.cache/vroxy-dispatch/engine-phleet", result.stdout)
         self.assertIn("vroxy-dispatch@phleet.service", result.stdout)
         self.assertNotIn("<id>", result.stdout)
 
