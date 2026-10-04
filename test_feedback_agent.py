@@ -715,7 +715,21 @@ class AttachmentTest(unittest.TestCase):
             fa.attachment_cli_flags("gemini", atts),
             ["--include-directories", parent])
         self.assertEqual(fa.attachment_cli_flags("claude", atts), [])
-        self.assertEqual(fa.attachment_cli_flags("opencode", atts), [])
+
+    def test_opencode_attaches_images_and_documents_via_file_flag(self):
+        shot = Path(self.tmp.name) / "shot.png"
+        shot.write_bytes(b"x")
+        doc = Path(self.tmp.name) / "notes.pdf"
+        doc.write_bytes(b"y")
+        atts = [
+            {"path": str(shot), "kind": "image"},
+            {"path": str(doc), "kind": "document"},
+        ]
+        flags = fa.attachment_cli_flags("opencode", atts)
+        self.assertEqual(
+            flags,
+            ["--file", str(shot), "--file", str(doc)],
+            "opencode attaches every file (image or PDF) with --file")
 
     def test_codex_stream_passes_images_on_argv(self):
         shot = Path(self.tmp.name) / "ui.png"

@@ -164,7 +164,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.23"
+AGENT_VERSION      = "vroxy_dispatch 0.51.24"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1239,11 +1239,16 @@ def _attachment_dirs(attachments: list[dict] | None) -> list[str]:
 
 
 def attachment_cli_flags(engine: str, attachments: list[dict] | None) -> list[str]:
-    """Extra argv so room screenshots reach every harness the same way.
+    """Extra argv so room attachments reach every harness the same way.
 
-    Codex takes images on the initial prompt (`-i`); Cursor and Gemini
-    need the cache dir added as a workspace root; Claude already has
-    full-FS permissions. Documents stay path-in-prompt for all of them."""
+    Native attachment (the model sees the bytes, not just a path):
+    Codex takes images on the initial prompt (`-i`) and OpenCode
+    attaches files with `--file` (images AND documents). The rest get
+    the cache dir added as a workspace root so their file tools can
+    reach it — Cursor (`--add-dir`), Gemini (`--include-directories`);
+    Claude already has full-FS permissions and no native image flag.
+    Documents stay path-in-prompt for the harnesses without a native
+    attach."""
     if not attachments:
         return []
     flags: list[str] = []
@@ -1252,6 +1257,11 @@ def attachment_cli_flags(engine: str, attachments: list[dict] | None) -> list[st
             flags += ["-i", path]
         for d in _attachment_dirs(attachments):
             flags += ["--add-dir", d]
+    elif engine == "opencode":
+        for a in attachments:
+            path = a.get("path")
+            if path:
+                flags += ["--file", str(path)]
     elif engine == "cursor":
         for d in _attachment_dirs(attachments):
             flags += ["--add-dir", d]

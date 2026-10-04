@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.51.24
+
+### Changed
+- OpenCode now receives room attachments natively: each downloaded
+  file (screenshot or document) is passed via `--file`, so the model
+  sees the bytes instead of only a path. Codex already attached images
+  with `-i`; Cursor/Gemini keep their workspace-dir flags and Claude
+  its full-FS Read. Verified the flag matrix on this box: Claude
+  2.1.285 has no `--image` (Read tool only), Codex has `-i`/`--add-dir`,
+  Cursor has `--add-dir` only, OpenCode 1.18.33 has `--file`.
+
 ## 0.51.23
 
 ### Added
