@@ -23,6 +23,7 @@ import tempfile
 import shutil
 import logging
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import feedback_agent as fa
@@ -896,61 +897,64 @@ class SetDispatchEngineTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.env = Path(self.tmp.name) / "vroxy-dispatch"
-        self.env.write_text("FOO=1\nDISPATCH_ENGINE=claude\nBAR=2\n")
-        self._prev = os.environ.get("VROXY_DISPATCH_ENV_FILE")
-        os.environ["VROXY_DISPATCH_ENV_FILE"] = str(self.env)
+        self.state = Path(self.tmp.name)
+        self._prev_state = fa.STATE_DIR
+        self._prev_unit = fa.SERVICE_UNIT
         self._prev_engine = fa.DISPATCH_ENGINE
         self._prev_model = fa._last_model
-        self.addCleanup(self._restore_env)
+        self._prev_env = os.environ.get("DISPATCH_ENGINE")
+        fa.STATE_DIR = self.state
+        fa.SERVICE_UNIT = "vroxy-dispatch@test.service"
+        os.environ.pop("DISPATCH_ENGINE", None)
+        self.addCleanup(self._restore)
 
-    def _restore_env(self):
+    def _restore(self):
+        fa.STATE_DIR = self._prev_state
+        fa.SERVICE_UNIT = self._prev_unit
         fa.DISPATCH_ENGINE = self._prev_engine
         fa._last_model = self._prev_model
-        if self._prev is None:
-            os.environ.pop("VROXY_DISPATCH_ENV_FILE", None)
+        if self._prev_env is None:
+            os.environ.pop("DISPATCH_ENGINE", None)
         else:
-            os.environ["VROXY_DISPATCH_ENV_FILE"] = self._prev
+            os.environ["DISPATCH_ENGINE"] = self._prev_env
 
-    def test_rewrites_existing_line(self):
+    def test_writes_user_state_not_an_env_file(self):
         ok, detail = fa.set_dispatch_engine("cursor")
         self.assertTrue(ok, detail)
-        text = self.env.read_text()
-        self.assertIn("DISPATCH_ENGINE=cursor\n", text)
-        self.assertIn("FOO=1\n", text)
-        self.assertIn("BAR=2\n", text)
-        self.assertEqual(1, text.count("DISPATCH_ENGINE="))
+        path = self.state / "engine-test"
+        self.assertEqual(path, Path(detail))
+        self.assertEqual("cursor", path.read_text().strip())
+        self.assertFalse((self.state / "vroxy-dispatch").exists())
 
     def test_already_set_is_ok(self):
+        (self.state / "engine-test").write_text("claude\n")
         ok, detail = fa.set_dispatch_engine("claude")
         self.assertTrue(ok)
         self.assertIn("already", detail)
 
     def test_already_set_still_adopts_in_process(self):
         fa.DISPATCH_ENGINE = "claude"
-        self.env.write_text("DISPATCH_ENGINE=cursor\n")
+        (self.state / "engine-test").write_text("cursor\n")
         ok, detail = fa.set_dispatch_engine("cursor")
         self.assertTrue(ok, detail)
         self.assertIn("already", detail)
         self.assertEqual("cursor", fa.DISPATCH_ENGINE,
-                         "a no-op file rewrite must still adopt — Holodeck "
-                         "restarted on claude while the wrong env file "
-                         "already said cursor, and the flip claimed success "
-                         "then kept running claude")
+                         "a no-op file rewrite must still adopt")
 
     def test_unknown_engine_refused(self):
+        (self.state / "engine-test").write_text("claude\n")
         ok, detail = fa.set_dispatch_engine("nope")
         self.assertFalse(ok)
         self.assertIn("unknown", detail)
-        self.assertIn("DISPATCH_ENGINE=claude\n", self.env.read_text())
+        self.assertEqual("claude", (self.state / "engine-test").read_text().strip())
 
     def test_alias_resolves(self):
         ok, _ = fa.set_dispatch_engine("claude_code")
         self.assertTrue(ok)
-        self.assertIn("DISPATCH_ENGINE=claude\n", self.env.read_text())
+        self.assertEqual("claude", (self.state / "engine-test").read_text().strip())
         ok, _ = fa.set_dispatch_engine("cursor-agent")
         self.assertTrue(ok)
-        self.assertIn("DISPATCH_ENGINE=cursor\n", self.env.read_text())
+        self.assertEqual("cursor", (self.state / "engine-test").read_text().strip())
 
     def test_adopts_the_engine_in_process(self):
         fa.DISPATCH_ENGINE = "claude"
@@ -967,32 +971,46 @@ class SetDispatchEngineTest(unittest.TestCase):
         self.assertIsNone(fa._last_model,
                           "a flip must not keep reporting the previous engine's model")
 
-    def test_engine_env_path_follows_the_unit(self):
-        prev_unit = os.environ.get("VROXY_DISPATCH_UNIT")
-        os.environ.pop("VROXY_DISPATCH_ENV_FILE", None)
-        os.environ["VROXY_DISPATCH_UNIT"] = "vroxy-dispatch@holodeck.service"
-        try:
-            self.assertEqual(
-                Path("/etc/vroxy-dispatch/holodeck.env"),
-                fa.engine_env_path(),
-                "a @instance must write its own env, not the default unit's")
-        finally:
-            if prev_unit is None:
-                os.environ.pop("VROXY_DISPATCH_UNIT", None)
-            else:
-                os.environ["VROXY_DISPATCH_UNIT"] = prev_unit
-            os.environ["VROXY_DISPATCH_ENV_FILE"] = str(self.env)
+    def test_state_path_is_per_unit(self):
+        fa.SERVICE_UNIT = "vroxy-dispatch@holodeck.service"
+        self.assertEqual(self.state / "engine-holodeck", fa.engine_state_path())
+        fa.SERVICE_UNIT = "vroxy-dispatch-feedback-agent.service"
+        self.assertEqual(
+            self.state / "engine-vroxy-dispatch-feedback-agent",
+            fa.engine_state_path())
+
+    def test_resolve_prefers_state_over_env(self):
+        (self.state / "engine-test").write_text("opencode\n")
+        os.environ["DISPATCH_ENGINE"] = "cursor"
+        self.assertEqual("opencode", fa.resolve_dispatch_engine())
+
+    def test_resolve_falls_back_to_env_when_no_state(self):
+        os.environ["DISPATCH_ENGINE"] = "cursor"
+        self.assertEqual("cursor", fa.resolve_dispatch_engine())
+
+    def test_no_sudo_on_flip(self):
+        calls = []
+        real_run = subprocess.run
+
+        def spy(*args, **kwargs):
+            calls.append(args[0] if args else kwargs.get("args"))
+            return real_run(*args, **kwargs)
+
+        with mock.patch.object(subprocess, "run", side_effect=spy):
+            ok, detail = fa.set_dispatch_engine("gemini")
+        self.assertTrue(ok, detail)
+        self.assertEqual([], calls, "a harness flip must not shell out at all")
+
 
 class EngineFlipTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.env = Path(self.tmp.name) / "vroxy-dispatch"
-        self.env.write_text("DISPATCH_ENGINE=claude\n")
-        self._prev_env = os.environ.get("VROXY_DISPATCH_ENV_FILE")
-        os.environ["VROXY_DISPATCH_ENV_FILE"] = str(self.env)
         self._saved = (fa.DISPATCH_ENGINE, fa.heartbeat, fa.clear_sessions,
-                       fa.schedule_restart, fa.RESTART_NOTICE_PATH)
+                       fa.schedule_restart, fa.RESTART_NOTICE_PATH,
+                       fa.STATE_DIR, fa.SERVICE_UNIT)
+        fa.STATE_DIR = Path(self.tmp.name)
+        fa.SERVICE_UNIT = "vroxy-dispatch@test.service"
         fa.DISPATCH_ENGINE = "claude"
         fa.RESTART_NOTICE_PATH = Path(self.tmp.name) / "restart-notice.json"
         self.heartbeats = []
@@ -1007,17 +1025,15 @@ class EngineFlipTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         (fa.DISPATCH_ENGINE, fa.heartbeat, fa.clear_sessions,
-         fa.schedule_restart, fa.RESTART_NOTICE_PATH) = self._saved
-        if self._prev_env is None:
-            os.environ.pop("VROXY_DISPATCH_ENV_FILE", None)
-        else:
-            os.environ["VROXY_DISPATCH_ENV_FILE"] = self._prev_env
+         fa.schedule_restart, fa.RESTART_NOTICE_PATH,
+         fa.STATE_DIR, fa.SERVICE_UNIT) = self._saved
 
     async def test_a_flip_adopts_in_process_without_a_restart(self):
         link = fa.CableLink()
         await fa.handle_engine_command(link, "rm123456", "codex", None)
 
         self.assertEqual("codex", fa.DISPATCH_ENGINE)
+        self.assertEqual("codex", (fa.STATE_DIR / "engine-test").read_text().strip())
         self.assertEqual([1], self.heartbeats,
                          "the heartbeat must fire immediately so the server moves the agent row")
         self.assertEqual([], self.restarts, "a flip must not schedule a restart")

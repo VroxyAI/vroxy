@@ -107,9 +107,10 @@ CLAUDE_CHAT_BIN = os.environ.get(
     str(Path(__file__).resolve().parent / "bin" / "claude-chat"),
 )
 SID_DIR         = Path.home() / ".cache" / "claude-chat"
-# Which CLI actually does the work.  `claude` or `codex`; anything
-# else is refused at startup rather than silently falling back, so a
-# typo in the unit file can't quietly run the wrong model.
+# Which CLI actually does the work.  Resolved again after
+# HARNESS_SPECS loads: state file (user-writable) wins, then an
+# optional DISPATCH_ENGINE env bootstrap, then `claude`.  `/harness`
+# never touches a root-owned EnvironmentFile.
 DISPATCH_ENGINE = os.environ.get("DISPATCH_ENGINE", "claude").strip().lower()
 
 # The model the CLI actually used on the last run, read off the stream
@@ -165,7 +166,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.19"
+AGENT_VERSION      = "vroxy_dispatch 0.51.20"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1623,22 +1624,51 @@ def known_engines() -> list[str]:
     return sorted({"claude", "codex", *HARNESS_SPECS.keys()})
 
 
-def engine_env_path() -> Path:
-    """Where `/harness` writes DISPATCH_ENGINE for THIS unit.
+def instance_slug() -> str:
+    """Stable id for this process's on-disk preferences.
 
-    Order: explicit `VROXY_DISPATCH_ENV_FILE` → the `@instance` env
-    derived from `VROXY_DISPATCH_UNIT` → the legacy single-unit file.
-    Deriving from the unit matters: a second install like Holodeck
-    must not rewrite `/etc/default/vroxy-dispatch` belonging to the
-    first agent on the box."""
-    override = os.environ.get("VROXY_DISPATCH_ENV_FILE")
-    if override:
-        return Path(override)
-    unit = os.environ.get("VROXY_DISPATCH_UNIT", "").strip()
+    `@holodeck` → `holodeck`; the legacy single unit keeps its full
+    service name so two installs on one box never share an engine
+    file."""
+    unit = (SERVICE_UNIT or "").strip()
     match = re.fullmatch(r"vroxy-dispatch@(.+)\.service", unit)
     if match:
-        return Path(f"/etc/vroxy-dispatch/{match.group(1)}.env")
-    return Path("/etc/default/vroxy-dispatch")
+        return match.group(1)
+    if unit.endswith(".service"):
+        return unit[:-len(".service")]
+    if INSTALL_ID:
+        return INSTALL_ID[:32]
+    return "default"
+
+
+def engine_state_path() -> Path:
+    return STATE_DIR / f"engine-{instance_slug()}"
+
+
+def resolve_dispatch_engine() -> str:
+    """State file → optional env bootstrap → `claude`.
+
+    The state file is under the running user's `STATE_DIR`, so a
+    harness flip never needs root.  `DISPATCH_ENGINE` in the unit
+    EnvironmentFile is only a first-boot default for installs that
+    have never flipped."""
+    path = engine_state_path()
+    try:
+        raw = path.read_text(encoding="utf-8").strip().splitlines()[0].strip().lower()
+    except (OSError, IndexError):
+        raw = ""
+    if raw:
+        eng = normalize_engine(raw)
+        if eng in known_engines():
+            return eng
+        log.warning("ignoring unknown engine %r in %s", raw, path)
+    env = os.environ.get("DISPATCH_ENGINE", "").strip().lower()
+    if env:
+        eng = normalize_engine(env)
+        if eng in known_engines():
+            return eng
+        log.warning("ignoring unknown DISPATCH_ENGINE=%r", env)
+    return "claude"
 
 
 def _adopt_engine(engine: str) -> None:
@@ -1659,53 +1689,30 @@ def _adopt_engine(engine: str) -> None:
 
 
 def set_dispatch_engine(engine: str) -> tuple[bool, str]:
-    """Rewrite DISPATCH_ENGINE in the unit's EnvironmentFile and adopt
-    it in-process, so a flip takes effect on the next run rather than
-    waiting for a restart.
+    """Persist the harness under STATE_DIR and adopt it in-process.
 
-    Returns (ok, detail). Needs write access (or passwordless sudo)
-    on that file — same bar schedule_restart already assumes."""
-    path = engine_env_path()
+    No EnvironmentFile, no sudo — the dispatch user owns the file.
+    Returns (ok, detail)."""
     engine = normalize_engine(engine)
     if engine not in known_engines():
         return False, f"unknown engine {engine!r} (want one of: {', '.join(known_engines())})"
+    path = engine_state_path()
     try:
-        text = path.read_text()
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        previous = ""
+        try:
+            previous = path.read_text(encoding="utf-8").strip().splitlines()[0].strip().lower()
+        except (OSError, IndexError):
+            pass
+        if normalize_engine(previous) != engine:
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+            tmp.write_text(engine + "\n", encoding="utf-8")
+            os.replace(tmp, path)
     except OSError as e:
-        return False, f"could not read {path}: {e}"
-
-    line = f"DISPATCH_ENGINE={engine}"
-    if re.search(r"(?m)^DISPATCH_ENGINE=", text):
-        new_text = re.sub(r"(?m)^DISPATCH_ENGINE=.*$", line, text, count=1)
-    else:
-        new_text = text.rstrip() + "\n" + line + "\n"
-
-    if new_text == text:
-        # File already matches — still adopt. A @instance that was
-        # writing the WRONG env file (or that restarted without
-        # DISPATCH_ENGINE in its own file) can be mid-claude while the
-        # file already says cursor; returning here without adopting
-        # claimed a flip and then kept running the old harness.
-        _adopt_engine(engine)
-        return True, f"already {engine}"
-
-    try:
-        path.write_text(new_text)
-        _adopt_engine(engine)
-        return True, str(path)
-    except OSError:
-        pass
-
-    cmd = ["sudo", "-n", "tee", str(path)]
-    try:
-        proc = subprocess.run(cmd, input=new_text, capture_output=True,
-                              text=True, timeout=15)
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()
-        return False, detail or f"sudo tee {path} failed"
+        return False, f"could not write {path}: {e}"
     _adopt_engine(engine)
+    if normalize_engine(previous) == engine:
+        return True, f"already {engine}"
     return True, str(path)
 
 
@@ -3309,6 +3316,11 @@ HARNESS_SPECS = {
     },
 }
 
+# HARNESS_SPECS has to exist before known_engines() can answer, so the
+# real preference (state file / env / claude) is applied here — not at
+# the top of the module where DISPATCH_ENGINE is first declared.
+DISPATCH_ENGINE = resolve_dispatch_engine()
+
 
 def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
                          allow_resume: bool = True,
@@ -3881,12 +3893,12 @@ def _exit_and_let_systemd_restart(reason: str) -> tuple[bool, str]:
 
 async def handle_engine_command(ws, room_id: str, target: str | None,
                                 reply_to: str | None) -> None:
-    """`/engine` / `/harness` — show or flip DISPATCH_ENGINE.
+    """`/engine` / `/harness` — show or flip the active harness.
 
     Bare (no target) posts a RoomAsk of the other available engines
-    so web / phone / watch can tap one. A flip rewrites the unit
-    EnvironmentFile AND adopts the engine in-process, so the next run
-    uses it without a restart."""
+    so web / phone / watch can tap one. A flip writes the preference
+    under STATE_DIR (no root) and adopts it in-process, so the next
+    run uses it without a restart."""
     current = DISPATCH_ENGINE
     available = known_engines()
     if not target:
@@ -3928,7 +3940,7 @@ async def handle_engine_command(ws, room_id: str, target: str | None,
     if not ok:
         await room_reply(
             ws, room_id,
-            f"⚠️ Couldn't set `DISPATCH_ENGINE={wanted}`: {detail}",
+            f"⚠️ Couldn't flip harness to `{wanted}`: {detail}",
             reply_to)
         return
 

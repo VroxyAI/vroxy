@@ -371,7 +371,7 @@ attached to a User instead of a Tenant.
 | `VROXY_SERVICE_TOKEN` | *(required)*                        |
 | `CODE_ROOT`             | parent of this checkout             |
 | `PROJECT`               | `vroxy_web`                       |
-| `DISPATCH_ENGINE`       | `claude` (or `codex`, `cursor`)     |
+| `DISPATCH_ENGINE`       | first-boot default only (`claude`); `/harness` persists under `~/.cache/vroxy-dispatch/` |
 | `DISPATCH_TELEMETRY`    | `1` (set `0` to stop reporting the box) |
 | `DISPATCH_AUTO_UPDATE`  | `0` (set `1` to apply patch/minor releases on its own) |
 | `CLAUDE_CHAT_BIN`       | `./bin/claude-chat`                 |
@@ -449,15 +449,18 @@ replayed.
 
 ## Which CLI does the work
 
-`DISPATCH_ENGINE` picks the engine for the whole process: `claude`
-(the default), `codex` for OpenAI's Codex CLI, or `cursor` for
-`cursor-agent`. One instance runs one engine — to have several,
-install a second systemd instance with its own `DISPATCH_ENGINE`, the
-same way a second project gets its own. An unrecognised value raises
-at the first run rather than falling back, because a typo that
-silently ran the other model is worse than a loud failure.
+The active harness is chosen at runtime with `/harness <engine>` in a
+dispatch room (or `/engine`). It persists under
+`~/.cache/vroxy-dispatch/engine-<unit>` — owned by the dispatch user,
+no root, no restart. An optional `DISPATCH_ENGINE` in the unit
+EnvironmentFile is only a first-boot default when that state file
+does not exist yet; `/harness` never rewrites the env file.
 
-`gemini`, `copilot_cli`, `opencode` and `amp` also have runners.
+Defaults to `claude`. Also runs `codex`, `cursor` (`cursor-agent`),
+`gemini`, `copilot_cli`, `opencode`, and `amp`. One process runs one
+engine — to have several, install a second systemd instance. An
+unrecognised value raises at the first run rather than falling back.
+
 `cursor` and `copilot_cli` were verified first; `opencode` now is
 too (real `--format json` capture on this box). Gemini's parser
 matches the CLI's stream-json emitter and a captured init/result
@@ -465,12 +468,9 @@ frame, but stays unverified until a successful turn (API key).
 Amp still needs a login before its Claude-shaped `--stream-json`
 can be confirmed live.
 
-The engine is reported in the heartbeat as `meta.engine`, and the
-server registers this install as a `claude_code`, `codex` or `cursor`
-DispatchAgent accordingly — which is what makes it @-mentionable
-under its own name. Flipping `DISPATCH_ENGINE` on an existing install
-MOVES that agent rather than creating a second one, so the room and
-its history follow.
+The engine is reported in the heartbeat as `meta.engine`. Flipping
+the harness on an existing install MOVES that agent rather than
+creating a second one, so the room and its history follow.
 
 Every local agent in a workspace subscribes to the same tenant
 channel, so a box running both engines sees each room message twice.

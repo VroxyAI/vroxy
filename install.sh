@@ -15,7 +15,8 @@
 #                             template.  Needs the agent's EXACT name.
 #
 # --unattended reads VROXY_TOKEN (required), VROXY_HOST, CODE_ROOT,
-# PROJECT, VROXY_AGENT_NAME, VROXY_INSTANCE_ID and DISPATCH_ENGINE.
+# PROJECT, VROXY_AGENT_NAME, VROXY_INSTANCE_ID and optional DISPATCH_ENGINE
+# (seeds ~/.cache/vroxy-dispatch/engine-<id>; /harness owns it after that).
 # It exists for cloud-init, which cannot answer a prompt.
 #
 # ONE PROCESS PER WORKSPACE. AdminFeedbackChannel streams for exactly
@@ -197,8 +198,9 @@ suggest_harnesses() {
   if [[ $npm_missing -eq 1 ]]; then
     say "(npm is not installed — run: $(node_setup_hint), or use opencode above, which needs no npm)"
   fi
-  say "Then set DISPATCH_ENGINE in ${ENV_DIR}/${id}.env to the one you installed,"
-  say "and restart: sudo systemctl restart vroxy-dispatch@${id}.service"
+  say "Then flip the harness in a dispatch room (/harness cursor), or seed"
+  say "~/.cache/vroxy-dispatch/engine-${id} with the engine name and restart:"
+  say "  sudo systemctl restart vroxy-dispatch@${id}.service"
 }
 
 python_setup_hint() {
@@ -461,7 +463,6 @@ VROXY_SERVICE_TOKEN=${token}
 VROXY_INSTALL_ID=${install_id}
 VROXY_AGENT_NAME=${agent_name}
 VROXY_DISPATCH_UNIT=vroxy-dispatch@${id}.service
-VROXY_DISPATCH_ENV_FILE=${ENV_DIR}/${id}.env
 CODE_ROOT=${code_root}
 PROJECT=${project}
 LOG_FILE=${HERE}/log/dispatch-${id}.log
@@ -470,10 +471,15 @@ PYTHONUNBUFFERED=1
 PATH=${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
 # DISPATCH_AUTO_UPDATE=0
 ENVFILE
-  [[ -z "${DISPATCH_ENGINE:-}" ]] \
-    || echo "DISPATCH_ENGINE=${DISPATCH_ENGINE}" | sudo tee -a "$env_file" >/dev/null
   sudo chown root:"$RUN_GROUP" "$env_file"
   sudo chmod 640 "$env_file"
+  # Harness preference is user-writable state, not the root-owned
+  # EnvironmentFile — /harness flips it without sudo.
+  if [[ -n "${DISPATCH_ENGINE:-}" ]]; then
+    local state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/vroxy-dispatch"
+    mkdir -p "$state_dir"
+    printf '%s\n' "$DISPATCH_ENGINE" > "${state_dir}/engine-${id}"
+  fi
 }
 
 # No prompts, no confirmations, and no token on the command line —

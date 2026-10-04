@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.51.20
+
+### Changed
+- Harness choice no longer lives in a root-owned EnvironmentFile.
+  `/harness` / `/engine` persist under
+  `~/.cache/vroxy-dispatch/engine-<unit>` (the dispatch user owns
+  it — no sudo, no restart). `DISPATCH_ENGINE` in the unit env is
+  only a first-boot default when that state file is missing.
+  `install.sh` seeds the state file instead of appending to the
+  env file.
+
 ## 0.51.19
 
 ### Fixed
