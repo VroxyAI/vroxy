@@ -402,7 +402,7 @@ latest release, its commit sha and its severity (`patch` / `minor` /
   newer than the running version, and no task is in flight. A `major`
   release never applies itself. Each release sha is tried at most once
   — attempts are remembered (atomically) in
-  `$VROXY_DISPATCH_STATE_DIR/update-attempts.json`, so a refused or
+  `$VROXY_DISPATCH_STATE_DIR/update-attempts-<instance>.json`, so a refused or
   failed release is not retried on every heartbeat.
 
 An update is `git fetch origin` then `git merge --ff-only <release sha>`

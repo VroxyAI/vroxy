@@ -149,14 +149,11 @@ RESTART_DELAY_SECONDS = int(os.environ.get("VROXY_DISPATCH_RESTART_DELAY", "5"))
 RESTART_HOLD_POLL_SECONDS = 1
 STATE_DIR       = Path(os.environ.get("VROXY_DISPATCH_STATE_DIR",
                                       str(Path.home() / ".cache" / "vroxy-dispatch")))
-RESTART_NOTICE_PATH = STATE_DIR / "restart-notice.json"
+UPDATE_ATTEMPTS_MAX = 20
 # Work that was queued or in flight when the process died.  The queue
 # lives in memory and the server broadcasts each message exactly once,
 # so anything still on it when systemd stops the unit is gone with no
 # trace — the asker just never hears back.
-WORK_SPOOL_PATH = STATE_DIR / "work-spool.json"
-UPDATE_ATTEMPTS_PATH = STATE_DIR / "update-attempts.json"
-UPDATE_ATTEMPTS_MAX = 20
 WORK_SPOOL_MAX = 50
 # Replaying a question from an hour ago is worse than dropping it:
 # the answer arrives with no context and the asker has moved on.
@@ -166,7 +163,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.20"
+AGENT_VERSION      = "vroxy_dispatch 0.51.21"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1643,6 +1640,18 @@ def instance_slug() -> str:
 
 def engine_state_path() -> Path:
     return STATE_DIR / f"engine-{instance_slug()}"
+
+
+def restart_notice_path() -> Path:
+    return STATE_DIR / f"restart-notice-{instance_slug()}.json"
+
+
+def work_spool_path() -> Path:
+    return STATE_DIR / f"work-spool-{instance_slug()}.json"
+
+
+def update_attempts_path() -> Path:
+    return STATE_DIR / f"update-attempts-{instance_slug()}.json"
 
 
 def resolve_dispatch_engine() -> str:
@@ -3816,7 +3825,7 @@ def write_restart_notice(room_id: str | None, reply_to: str | None,
         if engine_from and engine_to:
             payload["engine_from"] = engine_from
             payload["engine_to"] = engine_to
-        RESTART_NOTICE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+        restart_notice_path().write_text(json.dumps(payload), encoding="utf-8")
     except OSError as e:
         log.warning("could not write the restart notice: %s", e)
 
@@ -3826,12 +3835,13 @@ def take_restart_notice() -> dict | None:
     attempted, deliberately: every reconnect confirms the
     subscription again, and a notice that outlived one post would be
     re-announced on each of them."""
+    path = restart_notice_path()
     try:
-        raw = RESTART_NOTICE_PATH.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8")
     except OSError:
         return None
     with contextlib.suppress(OSError):
-        RESTART_NOTICE_PATH.unlink()
+        path.unlink()
     try:
         notice = json.loads(raw)
     except ValueError:
@@ -4022,7 +4032,7 @@ async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
 
     log.error("could not schedule a restart: %s", detail)
     with contextlib.suppress(OSError):
-        RESTART_NOTICE_PATH.unlink()
+        restart_notice_path().unlink()
     if room_id:
         await room_reply(link, room_id,
                          f"⚠️ I updated myself to {stamp} but couldn't restart "
@@ -4379,7 +4389,7 @@ async def run_deferred_update(link) -> dict | None:
 
 def load_update_attempts() -> list[str]:
     try:
-        attempts = json.loads(UPDATE_ATTEMPTS_PATH.read_text(encoding="utf-8"))
+        attempts = json.loads(update_attempts_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     return [a for a in attempts if isinstance(a, str)] if isinstance(attempts, list) else []
@@ -4387,12 +4397,12 @@ def load_update_attempts() -> list[str]:
 
 def record_update_attempt(sha: str) -> None:
     attempts = [a for a in load_update_attempts() if a != sha] + [sha]
-    tmp = UPDATE_ATTEMPTS_PATH.with_name(
-        f"{UPDATE_ATTEMPTS_PATH.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    path = update_attempts_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(attempts[-UPDATE_ATTEMPTS_MAX:]), encoding="utf-8")
-        os.replace(tmp, UPDATE_ATTEMPTS_PATH)
+        os.replace(tmp, path)
     except OSError as e:
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -4686,13 +4696,13 @@ def spool_pending_work() -> int:
 
     if not items:
         with contextlib.suppress(OSError):
-            WORK_SPOOL_PATH.unlink()
+            work_spool_path().unlink()
         return 0
 
     items = items[:WORK_SPOOL_MAX]
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        WORK_SPOOL_PATH.write_text(
+        work_spool_path().write_text(
             json.dumps({"at": time.time(), "items": items}), encoding="utf-8")
     except OSError as e:
         log.error("could not spool %d unfinished task(s): %s", len(items), e)
@@ -4704,12 +4714,13 @@ def spool_pending_work() -> int:
 def take_spooled_work() -> list[dict]:
     """Read and DELETE.  A spool that survived one boot would replay
     on every boot after it."""
+    path = work_spool_path()
     try:
-        raw = WORK_SPOOL_PATH.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8")
     except OSError:
         return []
     with contextlib.suppress(OSError):
-        WORK_SPOOL_PATH.unlink()
+        path.unlink()
     try:
         spool = json.loads(raw)
     except ValueError:

@@ -47,8 +47,11 @@ for self-update.
 
 4. **Optional restart notice** so the next process can post
    "✅ Back up on … — was …". Write
-   `$VROXY_DISPATCH_STATE_DIR/restart-notice.json` (default
-   `~/.cache/vroxy-dispatch/restart-notice.json`):
+   `$VROXY_DISPATCH_STATE_DIR/restart-notice-<instance>.json` (default
+   `~/.cache/vroxy-dispatch/restart-notice-<instance>.json`), where
+   `<instance>` is `holodeck` for `vroxy-dispatch@holodeck.service`
+   and `vroxy-dispatch-feedback-agent` for the main unit — another
+   unit must never pick up your notice:
 
    ```json
    {"room_id":"<hashid>","reply_to":"<message hashid or null>",

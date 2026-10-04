@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.51.21
+
+### Fixed
+- Several dispatch units on one box (the main unit, `@holodeck`,
+  `@arubamu`, …) no longer share per-process state. The restart
+  notice, work spool and update-attempt log are now
+  `restart-notice-<instance>.json`, `work-spool-<instance>.json` and
+  `update-attempts-<instance>.json` under the state dir, keyed the
+  same way as `engine-<instance>`. Before, whichever unit restarted
+  first took another unit's "Back up" notice (posting into the wrong
+  tenant's room while the real one stayed silent) and could replay
+  another unit's interrupted work in the wrong project. Old shared
+  files are ignored and expire on their own.
+
 ## 0.51.20
 
 ### Changed

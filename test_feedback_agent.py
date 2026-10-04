@@ -979,6 +979,48 @@ class SetDispatchEngineTest(unittest.TestCase):
             self.state / "engine-vroxy-dispatch-feedback-agent",
             fa.engine_state_path())
 
+    def test_per_process_state_files_are_keyed_by_instance(self):
+        def paths(unit):
+            fa.SERVICE_UNIT = unit
+            return (fa.restart_notice_path(), fa.work_spool_path(),
+                    fa.update_attempts_path())
+
+        main = paths("vroxy-dispatch-feedback-agent.service")
+        holodeck = paths("vroxy-dispatch@holodeck.service")
+        arubamu = paths("vroxy-dispatch@arubamu.service")
+        self.assertEqual(
+            (self.state / "restart-notice-vroxy-dispatch-feedback-agent.json",
+             self.state / "work-spool-vroxy-dispatch-feedback-agent.json",
+             self.state / "update-attempts-vroxy-dispatch-feedback-agent.json"),
+            main)
+        self.assertEqual(
+            (self.state / "restart-notice-holodeck.json",
+             self.state / "work-spool-holodeck.json",
+             self.state / "update-attempts-holodeck.json"),
+            holodeck)
+        every = [*main, *holodeck, *arubamu]
+        self.assertEqual(len(every), len(set(every)))
+
+    def test_another_instance_cannot_take_the_restart_notice(self):
+        fa.SERVICE_UNIT = "vroxy-dispatch-feedback-agent.service"
+        fa.write_restart_notice("kbqroyf4", None, "vroxy_dispatch 9.9.9")
+        fa.SERVICE_UNIT = "vroxy-dispatch@holodeck.service"
+        self.assertIsNone(fa.take_restart_notice())
+        fa.SERVICE_UNIT = "vroxy-dispatch-feedback-agent.service"
+        notice = fa.take_restart_notice()
+        self.assertEqual("kbqroyf4", (notice or {}).get("room_id"))
+
+    def test_another_instance_cannot_replay_the_work_spool(self):
+        fa.SERVICE_UNIT = "vroxy-dispatch-feedback-agent.service"
+        fa.work_spool_path().write_text(json.dumps({
+            "at": time.time(),
+            "items": [{"kind": "room", "payload": {"room_id": "kbqroyf4"}}],
+        }), encoding="utf-8")
+        fa.SERVICE_UNIT = "vroxy-dispatch@holodeck.service"
+        self.assertEqual([], fa.take_spooled_work())
+        fa.SERVICE_UNIT = "vroxy-dispatch-feedback-agent.service"
+        self.assertEqual(1, len(fa.take_spooled_work()))
+
     def test_resolve_prefers_state_over_env(self):
         (self.state / "engine-test").write_text("opencode\n")
         os.environ["DISPATCH_ENGINE"] = "cursor"
@@ -1007,12 +1049,11 @@ class EngineFlipTest(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self._saved = (fa.DISPATCH_ENGINE, fa.heartbeat, fa.clear_sessions,
-                       fa.schedule_restart, fa.RESTART_NOTICE_PATH,
+                       fa.schedule_restart,
                        fa.STATE_DIR, fa.SERVICE_UNIT)
         fa.STATE_DIR = Path(self.tmp.name)
         fa.SERVICE_UNIT = "vroxy-dispatch@test.service"
         fa.DISPATCH_ENGINE = "claude"
-        fa.RESTART_NOTICE_PATH = Path(self.tmp.name) / "restart-notice.json"
         self.heartbeats = []
         self.restarts = []
 
@@ -1025,7 +1066,7 @@ class EngineFlipTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         (fa.DISPATCH_ENGINE, fa.heartbeat, fa.clear_sessions,
-         fa.schedule_restart, fa.RESTART_NOTICE_PATH,
+         fa.schedule_restart,
          fa.STATE_DIR, fa.SERVICE_UNIT) = self._saved
 
     async def test_a_flip_adopts_in_process_without_a_restart(self):
@@ -1037,7 +1078,7 @@ class EngineFlipTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([1], self.heartbeats,
                          "the heartbeat must fire immediately so the server moves the agent row")
         self.assertEqual([], self.restarts, "a flip must not schedule a restart")
-        self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
+        self.assertFalse(fa.restart_notice_path().exists())
         replies = frames_of(link, "room_reply")
         self.assertEqual(1, len(replies))
         self.assertIn("Flipped", replies[0]["body"])
@@ -1587,18 +1628,17 @@ class SelfUpdateSandbox:
         self.helper.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
 
         self._saved = (fa._SELF_FILES, fa._BOOT_FINGERPRINT, fa.STATE_DIR,
-                       fa.RESTART_NOTICE_PATH, fa._restart_pending,
+                       fa._restart_pending,
                        fa._restart_scheduled)
         fa._SELF_FILES = (self.source, self.helper)
         fa._BOOT_FINGERPRINT = fa.source_fingerprint()
         fa.STATE_DIR = root / "state"
-        fa.RESTART_NOTICE_PATH = fa.STATE_DIR / "restart-notice.json"
         fa._restart_pending = None
         fa._restart_scheduled = False
 
     def stop_sandbox(self):
         (fa._SELF_FILES, fa._BOOT_FINGERPRINT, fa.STATE_DIR,
-         fa.RESTART_NOTICE_PATH, fa._restart_pending,
+         fa._restart_pending,
          fa._restart_scheduled) = self._saved
         self.tmp.cleanup()
 
@@ -1675,21 +1715,21 @@ class RestartNoticeTest(SelfUpdateStateTestCase):
         fa.write_restart_notice("room1234", None, "vroxy_dispatch 1.0.0")
         self.assertIsNotNone(fa.take_restart_notice())
         self.assertIsNone(fa.take_restart_notice())
-        self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
+        self.assertFalse(fa.restart_notice_path().exists())
 
     def test_no_notice_is_not_an_error(self):
         self.assertIsNone(fa.take_restart_notice())
 
     def test_a_stale_notice_is_dropped(self):
         fa.write_restart_notice("room1234", None, "vroxy_dispatch 1.0.0")
-        stale = json.loads(fa.RESTART_NOTICE_PATH.read_text())
+        stale = json.loads(fa.restart_notice_path().read_text())
         stale["at"] = stale["at"] - fa.RESTART_NOTICE_MAX_AGE_SECONDS - 60
-        fa.RESTART_NOTICE_PATH.write_text(json.dumps(stale), encoding="utf-8")
+        fa.restart_notice_path().write_text(json.dumps(stale), encoding="utf-8")
         self.assertIsNone(fa.take_restart_notice())
 
     def test_a_corrupt_notice_is_dropped_not_raised(self):
         fa.STATE_DIR.mkdir(parents=True, exist_ok=True)
-        fa.RESTART_NOTICE_PATH.write_text("{not json", encoding="utf-8")
+        fa.restart_notice_path().write_text("{not json", encoding="utf-8")
         self.assertIsNone(fa.take_restart_notice())
 
     def test_a_notice_with_no_room_is_dropped(self):
@@ -1731,7 +1771,7 @@ class RestartIfSelfUpdatedTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCa
         bodies = sent_bodies(link)
         self.assertEqual(1, len(bodies))
         self.assertIn("9.9.10", bodies[0])
-        notice = json.loads(fa.RESTART_NOTICE_PATH.read_text())
+        notice = json.loads(fa.restart_notice_path().read_text())
         self.assertEqual("room1234", notice["room_id"])
         self.assertEqual("msg5678", notice["reply_to"])
 
@@ -1756,7 +1796,7 @@ class RestartIfSelfUpdatedTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCa
         spooled = fa.spool_pending_work()
 
         self.assertEqual(1, spooled)
-        self.assertIn("keepme", fa.WORK_SPOOL_PATH.read_text())
+        self.assertIn("keepme", fa.work_spool_path().read_text())
 
     async def test_it_refuses_to_restart_into_a_build_that_will_not_compile(self):
         self.edit_source("def broken(:\n")
@@ -1764,7 +1804,7 @@ class RestartIfSelfUpdatedTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCa
         await fa.restart_if_self_updated(link, "room", self.ROOM)
 
         self.assertEqual([], self.scheduled, "a syntax error restarts into a crash loop")
-        self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
+        self.assertFalse(fa.restart_notice_path().exists())
         self.assertIn("doesn't compile", sent_bodies(link)[0])
 
     async def test_it_only_fires_once(self):
@@ -1783,7 +1823,7 @@ class RestartIfSelfUpdatedTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCa
         link = fa.CableLink()
         await fa.restart_if_self_updated(link, "room", self.ROOM)
 
-        self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
+        self.assertFalse(fa.restart_notice_path().exists())
         self.assertIn("couldn't restart", sent_bodies(link)[-1])
         self.assertIn("systemctl restart", sent_bodies(link)[-1])
 
@@ -1795,7 +1835,7 @@ class RestartIfSelfUpdatedTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCa
         await fa.restart_if_self_updated(link, "approve", {"feedback_id": "abc"})
         self.assertEqual([1], self.scheduled)
         self.assertEqual([], sent_bodies(link))
-        self.assertFalse(fa.RESTART_NOTICE_PATH.exists())
+        self.assertFalse(fa.restart_notice_path().exists())
 
 
 class ProgressTrailTest(unittest.TestCase):
@@ -1932,7 +1972,6 @@ class WorkSpoolTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         self.start_sandbox()
-        fa.WORK_SPOOL_PATH = fa.STATE_DIR / "work-spool.json"
         self._saved_queue, self._saved_work = fa._work_queue, fa._current_work
         fa._work_queue, fa._current_work = asyncio.Queue(), None
 
@@ -2002,7 +2041,7 @@ class WorkSpoolTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCase):
 
     async def test_nothing_pending_leaves_no_spool(self):
         self.assertEqual(0, fa.spool_pending_work())
-        self.assertFalse(fa.WORK_SPOOL_PATH.exists())
+        self.assertFalse(fa.work_spool_path().exists())
         self.assertEqual([], fa.take_spooled_work())
 
     async def test_taking_the_spool_deletes_it(self):
@@ -2014,17 +2053,17 @@ class WorkSpoolTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCase):
     async def test_a_stale_spool_is_dropped(self):
         fa._current_work = ("room", {"message": {"body": "x"}})
         fa.spool_pending_work()
-        stale = json.loads(fa.WORK_SPOOL_PATH.read_text())
+        stale = json.loads(fa.work_spool_path().read_text())
         stale["at"] = stale["at"] - fa.WORK_SPOOL_MAX_AGE_SECONDS - 60
-        fa.WORK_SPOOL_PATH.write_text(json.dumps(stale), encoding="utf-8")
+        fa.work_spool_path().write_text(json.dumps(stale), encoding="utf-8")
         self.assertEqual([], fa.take_spooled_work())
 
     async def test_a_corrupt_or_malformed_spool_is_dropped_not_raised(self):
         fa.STATE_DIR.mkdir(parents=True, exist_ok=True)
-        fa.WORK_SPOOL_PATH.write_text("{not json", encoding="utf-8")
+        fa.work_spool_path().write_text("{not json", encoding="utf-8")
         self.assertEqual([], fa.take_spooled_work())
 
-        fa.WORK_SPOOL_PATH.write_text(
+        fa.work_spool_path().write_text(
             json.dumps({"at": time.time(),
                         "items": [{"kind": "room"}, {"payload": {}}, {"kind": "room", "payload": {"ok": 1}}]}),
             encoding="utf-8")
@@ -2045,7 +2084,7 @@ class AnnounceRestartTest(SelfUpdateSandbox, unittest.IsolatedAsyncioTestCase):
 
     def write_notice(self, from_version):
         fa.STATE_DIR.mkdir(parents=True, exist_ok=True)
-        fa.RESTART_NOTICE_PATH.write_text(json.dumps({
+        fa.restart_notice_path().write_text(json.dumps({
             "room_id": "room1234", "reply_to": "msg5678",
             "from_version": from_version, "to_version": fa.AGENT_VERSION,
             "at": time.time(),
@@ -3245,13 +3284,12 @@ class AutoUpdateTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         ReleaseRepoTestCase.setUp(self)
         state = Path(self.tmp.name) / "state"
-        saved = (fa.DISPATCH_CHECKOUT, fa.STATE_DIR, fa.UPDATE_ATTEMPTS_PATH,
+        saved = (fa.DISPATCH_CHECKOUT, fa.STATE_DIR,
                  fa.AUTO_UPDATE_ENABLED, fa._current_work, fa._latest_release,
                  fa.schedule_restart, fa.AGENT_VERSION)
         self.addCleanup(self._restore, saved)
         fa.DISPATCH_CHECKOUT = self.checkout
         fa.STATE_DIR = state
-        fa.UPDATE_ATTEMPTS_PATH = state / "update-attempts.json"
         fa.AUTO_UPDATE_ENABLED = False
         fa._current_work = None
         fa.AGENT_VERSION = "vroxy_dispatch 1.0.0"
@@ -3259,7 +3297,7 @@ class AutoUpdateTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTestCase):
         fa.schedule_restart = lambda: (self.restarts.append(1), (True, "unit-test"))[1]
 
     def _restore(self, saved):
-        (fa.DISPATCH_CHECKOUT, fa.STATE_DIR, fa.UPDATE_ATTEMPTS_PATH,
+        (fa.DISPATCH_CHECKOUT, fa.STATE_DIR,
          fa.AUTO_UPDATE_ENABLED, fa._current_work, fa._latest_release,
          fa.schedule_restart, fa.AGENT_VERSION) = saved
 
@@ -3339,7 +3377,7 @@ class AutoUpdateTest(ReleaseRepoTestCase, unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(1, len(update_results(link)))
         self.assertEqual("refused", update_results(link)[0]["status"])
-        self.assertIn(sha, json.loads(fa.UPDATE_ATTEMPTS_PATH.read_text()))
+        self.assertIn(sha, json.loads(fa.update_attempts_path().read_text()))
 
     async def test_a_release_no_newer_than_ours_is_left_alone(self):
         fa.AUTO_UPDATE_ENABLED = True
