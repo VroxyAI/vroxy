@@ -1138,6 +1138,26 @@ class EngineFlipTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("codex", replies[0]["body"])
         self.assertIn("No restart", replies[0]["body"])
 
+    async def test_harness_set_frame_flips_from_the_sidebar(self):
+        link = fa.CableLink()
+        await fa.handle_harness_set(link, {"engine": "cursor"})
+
+        self.assertEqual("cursor", fa.DISPATCH_ENGINE)
+        self.assertEqual("cursor", (fa.STATE_DIR / "engine-test").read_text().strip())
+        self.assertEqual([1], self.heartbeats,
+                         "the flip must heartbeat so the server reflects the new active harness")
+        self.assertEqual([], self.restarts)
+
+    async def test_harness_set_ignores_a_frame_for_another_install(self):
+        fa.INSTALL_ID = "box-a"
+        try:
+            link = fa.CableLink()
+            await fa.handle_harness_set(link, {"engine": "cursor", "install_id": "box-b"})
+        finally:
+            fa.INSTALL_ID = ""
+        self.assertEqual("claude", fa.DISPATCH_ENGINE)
+        self.assertFalse((fa.STATE_DIR / "engine-test").exists())
+
 
 class SplitRoomBodyTest(unittest.TestCase):
     def test_short_body_is_one_chunk(self):

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.51.26
+
+### Added
+- A `harness.set` cable frame flips the active harness from the web or
+  mobile sidebar (no `/harness` room command): same write path — persist
+  under `STATE_DIR`, no root, adopt in-process, heartbeat immediately —
+  gated on `install_id` so a multi-agent box only flips the one the
+  person meant.
+
 ## 0.51.25
 
 ### Added

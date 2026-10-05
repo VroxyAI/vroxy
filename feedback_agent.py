@@ -164,7 +164,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.25"
+AGENT_VERSION      = "vroxy_dispatch 0.51.26"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -4187,6 +4187,25 @@ async def handle_priority_command(ws, room_id: str, args: list[str],
         reply_to)
 
 
+async def handle_harness_set(link, msg: dict) -> None:
+    """`harness.set` frame — a person flipped the harness from the web
+    or mobile sidebar, not from a `/harness` room command.  Same write
+    path: persist under STATE_DIR (no root) and adopt in-process."""
+    iid = str(msg.get("install_id") or "").strip()
+    if iid and INSTALL_ID and iid != INSTALL_ID:
+        log.debug("Ignoring harness.set for other install %s", iid)
+        return
+    engine = normalize_engine(str(msg.get("engine") or "").strip())
+    if engine not in known_engines():
+        log.warning("harness.set for unknown engine %r — ignoring", msg.get("engine"))
+        return
+    ok, detail = await asyncio.to_thread(set_dispatch_engine, engine)
+    if ok:
+        clear_sessions()
+        await heartbeat(link)
+    log.info("harness.set → %s ok=%s (%s)", engine, ok, detail)
+
+
 async def restart_if_self_updated(link, kind: str, payload: dict) -> None:
     """Called after each finished task, once its answer is already
     posted.
@@ -6115,6 +6134,8 @@ async def process_stream(link: CableLink, ws) -> None:
                              edited.get("hashid"))
             elif msg.get("type") in ("version.current", "update.requested"):
                 handle_update_frame(link, msg)
+            elif msg.get("type") == "harness.set":
+                await handle_harness_set(link, msg)
             elif msg.get("type") == "room_reply.posted":
                 # Tenant-stream acks carry install_id so multi-agent
                 # boxes on one tenant only claim their own. A missing
