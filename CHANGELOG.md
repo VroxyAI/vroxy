@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.51.27
+
+### Added
+- The heartbeat now reports disk usage on the box's root filesystem as
+  `meta.disk` (`total` / `used` / `free` bytes plus `used_percent`), so
+  the fleet view can show which boxes are running out of space. Rides
+  under `DISPATCH_TELEMETRY` like the harness inventory — opting out
+  erases it server-side, and a read failure reports `error` rather than
+  a fake number.
+
 ## 0.51.26
 
 ### Added

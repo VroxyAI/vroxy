@@ -29,6 +29,21 @@ from pathlib import Path
 import feedback_agent as fa
 
 
+class ProbeDiskTest(unittest.TestCase):
+    def test_disk_usage_reports_bytes_and_a_percent(self):
+        info = fa.probe_disk()
+
+        assert "total" in info and "used" in info and "free" in info
+        assert info["total"] > 0
+        assert 0 <= info["used"] <= info["total"]
+        assert 0 <= info["free"] <= info["total"]
+        assert 0.0 <= info["used_percent"] <= 100.0
+
+    def test_an_os_error_becomes_an_error_string(self):
+        with mock.patch.object(fa.shutil, "disk_usage", side_effect=OSError("nope")):
+            assert fa.probe_disk() == {"error": "nope"}
+
+
 class BuildPromptTest(unittest.TestCase):
     def test_full_payload_renders_all_sections(self):
         payload = {

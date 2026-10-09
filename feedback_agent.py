@@ -164,7 +164,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.26"
+AGENT_VERSION      = "vroxy_dispatch 0.51.27"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -827,6 +827,23 @@ def quotas(now: float | None = None) -> dict:
     return found
 
 
+def probe_disk() -> dict:
+    """Disk usage on the box's root filesystem, for the fleet view.
+
+    A `statvfs` call, so it never blocks — run inline in the heartbeat
+    rather than to_thread'd like the subprocess/HTTP probes."""
+    try:
+        total, used, free = shutil.disk_usage("/")
+    except OSError as exc:
+        return {"error": str(exc)}
+    return {
+        "total": total,
+        "used": used,
+        "free": free,
+        "used_percent": round(used / total * 100, 1) if total else 0.0,
+    }
+
+
 async def heartbeat(ws) -> None:
     """Heartbeat frame.  AdminFeedbackChannel#heartbeat writes it
     into Rails.cache under a tenant-scoped key with a 60 s TTL —
@@ -841,6 +858,7 @@ async def heartbeat(ws) -> None:
         meta["harnesses"] = await asyncio.to_thread(harnesses)
         meta["quotas"] = await asyncio.to_thread(quotas)
         meta["hostname"] = socket.gethostname()
+        meta["disk"] = probe_disk()
         if _last_model:
             meta["model"] = _last_model
     else:
