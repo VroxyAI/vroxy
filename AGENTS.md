@@ -18,6 +18,7 @@ Amp, Copilot CLI. Rules below apply no matter which
 | --- | --- |
 | `restart_dispatch` | Any time this process must reload — engine flip, forced restart, hung cable. **Never** a bare `systemctl restart` from inside a turn. |
 | `sleepingpill` | Host session timer (`agentsmith sleeping in Xm` in the room). Extend with `sleepingpill extend …` when asked; never cancel/set/start unless Will says so. Notes in `../vroxy_web/docs/sleepingpill.md`. |
+| `post_build_clean` | End of **every turn that built or ran docker images** (flutter test/linux, APK builds, `docker compose build`, desktop sandbox). Reclaims labeled throwaways, build cache, dangling images — never prunes volumes or other projects' images. Lives in `vroxy_box`; the box is ~116 GB shared by every project and a build at 100% fails with "No space left on device". |
 
 Real files live under `.claude/skills/<name>/` (Claude Code /
 Cursor) and are mirrored under `.agents/skills/<name>/` (OpenCode,

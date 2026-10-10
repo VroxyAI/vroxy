@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.51.28
+
+### Changed
+- `AGENTS.md` now lists the `post_build_clean` skill and the rule that
+  runs it at the end of every turn that built or ran docker images, so
+  every harness on the box (not only Claude Code) knows to reclaim
+  build cache and throwaway images before the ~116 GB shared disk fills
+  up.
+
 ## 0.51.27
 
 ### Added

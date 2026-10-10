@@ -1,6 +1,6 @@
 [project]
 name = "vroxy"
-version = "0.51.27"
+version = "0.51.28"
 description = "The vroxy CLI, and the dispatch agent that runs coding agents against your workspace"
 requires-python = ">=3.9"
 
