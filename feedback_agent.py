@@ -164,7 +164,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.28"
+AGENT_VERSION      = "vroxy_dispatch 0.51.29"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -440,6 +440,36 @@ def _account_problem(text: str) -> str | None:
         if needle in low:
             return label
     return None
+
+
+_RETRIABLE_TRANSPORT_HINTS = (
+    "refused_stream", "stream closed", "stream was closed",
+    "connection reset", "connection closed", "broken pipe",
+    "unexpected eof", "read timeout", "connection error",
+)
+
+
+def _retriable_transport(text: str) -> bool:
+    """A transient wire failure (HTTP/2 stream refused, connection
+    reset) rather than an account problem.  The session survives it, so
+    resuming once recovers the reply instead of cutting it short."""
+    if _account_problem(text):
+        return False
+    low = (text or "").lower()
+    return any(h in low for h in _RETRIABLE_TRANSPORT_HINTS)
+
+
+_transport_retried: set[str] = set()
+
+
+def _transport_retry_once(key: str) -> bool:
+    """True the first time `key` asks, False after — bounds a retriable
+    transport failure to a single resume so a persistent outage can't
+    recurse forever."""
+    if key in _transport_retried:
+        return False
+    _transport_retried.add(key)
+    return True
 
 
 _engine_fault: str | None = None
@@ -2889,6 +2919,17 @@ def run_claude_streamed(prompt: str, project: str, on_event,
             + (f": {_one_line(stderr_text, 300)}" if stderr_text else ""))
 
     if failed and not cancelled:
+        key = f"claude_{session_key or project}"
+        if (not produced_nothing and _retriable_transport(stderr_text)
+                and _transport_retry_once(key)):
+            log.warning("claude died on a retriable transport error — resuming once")
+            try:
+                return run_claude_streamed(prompt, project, on_event,
+                                           allow_resume=True, session_key=session_key,
+                                           work_dir_override=work_dir_override,
+                                           attachments=attachments, cancel_key=cancel_key)
+            finally:
+                _transport_retried.discard(key)
         return _cut_short("".join(final_text_chunks),
                           _one_line(stderr_text, 300) or
                           f"claude exited {proc.returncode} mid-run")
@@ -3170,6 +3211,17 @@ def run_codex_streamed(prompt: str, project: str, on_event,
             + (f": {reason}" if reason else ""))
 
     if failed and not cancelled:
+        key = f"codex_{session_key or project}"
+        if (not produced_nothing and _retriable_transport(reason)
+                and _transport_retry_once(key)):
+            log.warning("codex died on a retriable transport error — resuming once")
+            try:
+                return run_codex_streamed(prompt, project, on_event,
+                                          allow_resume=True, session_key=session_key,
+                                          work_dir_override=work_dir_override,
+                                          attachments=attachments, cancel_key=cancel_key)
+            finally:
+                _transport_retried.discard(key)
         return _cut_short(final_text, reason or
                           f"codex exited {proc.returncode} mid-run")
 
@@ -3725,6 +3777,18 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
             + (f": {_one_line(stderr_text, 300)}" if stderr_text else ""))
 
     if failed and not cancelled:
+        key = f"{engine}_{session_key or project}"
+        if (not produced_nothing and _retriable_transport(stderr_text)
+                and _transport_retry_once(key)):
+            log.warning("%s died on a retriable transport error — resuming once",
+                        engine)
+            try:
+                return run_harness_streamed(engine, prompt, project, on_event,
+                                            allow_resume=True, session_key=session_key,
+                                            work_dir_override=work_dir_override,
+                                            attachments=attachments, cancel_key=cancel_key)
+            finally:
+                _transport_retried.discard(key)
         return _cut_short("".join(answer_chunks),
                           _one_line(stderr_text, 300) or
                           f"{spec['label']} exited {proc.returncode} mid-run")

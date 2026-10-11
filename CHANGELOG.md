@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.51.29
+
+### Added
+- A run that dies on a transient transport error (`NGHTTP2_REFUSED_STREAM`,
+  "stream closed", connection reset, and the like) now resumes its session
+  once instead of cutting the reply short. Account problems (quota, auth,
+  billing) are deliberately excluded — those are not the wire flaking out.
+  The retry is bounded to one attempt per session so a persistent outage
+  can't recurse.
+
 ## 0.51.28
 
 ### Changed

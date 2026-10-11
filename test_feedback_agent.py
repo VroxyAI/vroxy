@@ -4515,3 +4515,39 @@ class HarnessAnswerTest(unittest.TestCase):
                            {"type": "result", "subtype": "success", "is_error": False}])
         self._run()
         self.assertEqual(fa._streamed_sid_file("cursor_proj").read_text().strip(), "s1")
+
+    def _fake_cursor_transport_blip_then_answer(self, answer):
+        marker = self.tmp / "attempt"
+        script = self.binhome / "cursor-agent"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            f"marker = {str(marker)!r}\n"
+            "if not os.path.exists(marker):\n"
+            "    open(marker, 'w').write('x')\n"
+            "    sys.stdout.write(json.dumps({'type':'system','subtype':'init',"
+            "'session_id':'s1','model':'Auto'}) + '\\n')\n"
+            "    sys.stdout.write(json.dumps({'type':'assistant','session_id':'s1',"
+            "'message':{'role':'assistant','content':[{'type':'text','text':'Partway.'}]}})"
+            " + '\\n')\n"
+            "    sys.stderr.write('RetriableError: [internal] Stream closed with "
+            "error code NGHTTP2_REFUSED_STREAM\\n')\n"
+            "    sys.exit(1)\n"
+            f"say = {answer!r}\n"
+            "sys.stdout.write(json.dumps({'type':'assistant','session_id':'s1',"
+            "'message':{'role':'assistant','content':[{'type':'text','text':say}]}})"
+            " + '\\n')\n"
+            "sys.stdout.write(json.dumps({'type':'result','subtype':'success',"
+            "'is_error':False,'usage':{}}) + '\\n')\n"
+        )
+        script.chmod(0o755)
+
+    def test_a_retriable_transport_error_resumes_once_and_recovers(self):
+        self._fake_cursor_transport_blip_then_answer("Shipped.")
+        self.assertEqual(self._run(), "Shipped.")
+
+    def test_a_retriable_transport_error_retries_once_not_forever(self):
+        self._fake_cursor_transport_blip_then_answer("Shipped.")
+        fa._transport_retried.clear()
+        self.assertEqual(self._run(), "Shipped.")
+        self.assertFalse(fa._transport_retried)
