@@ -164,7 +164,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.29"
+AGENT_VERSION      = "vroxy_dispatch 0.51.30"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -815,6 +815,33 @@ def _probe_claude_quota() -> dict:
     }
 
 
+def _probe_opencode_quota() -> dict:
+    auth = _read_json_file(Path.home() / ".local" / "share" / "opencode" / "auth.json")
+    providers = {k: v for k, v in (auth or {}).items() if isinstance(v, dict)}
+    deepseek = providers.get("deepseek")
+    key = deepseek.get("key") if isinstance(deepseek, dict) else None
+    if not key:
+        return {"ok": False, "error": "not_signed_in"}
+    status, data = _http_json(
+        "GET",
+        "https://api.deepseek.com/user/balance",
+        {"Authorization": f"Bearer {key}", "Accept": "application/json"},
+    )
+    if status != 200 or not isinstance(data, dict):
+        return {"ok": False, "error": f"http_{status or 'err'}"}
+    infos = data.get("balance_infos") if isinstance(data.get("balance_infos"), list) else []
+    balances = [
+        f"{i.get('currency', '')} {i.get('total_balance')}"
+        for i in infos if isinstance(i, dict) and i.get("total_balance") is not None
+    ]
+    available = data.get("is_available")
+    return {
+        "ok": True if available is None else bool(available),
+        "note": ("balance " + "; ".join(balances)) if balances else None,
+        "plan": "DeepSeek",
+    }
+
+
 def probe_quotas() -> dict:
     """Account remaining/limits for CLIs signed in on this box.
 
@@ -829,6 +856,7 @@ def probe_quotas() -> dict:
         ("cursor", _probe_cursor_quota),
         ("codex", _probe_codex_quota),
         ("claude", _probe_claude_quota),
+        ("opencode", _probe_opencode_quota),
     ):
         try:
             entry = probe()

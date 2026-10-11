@@ -2953,6 +2953,39 @@ class QuotaProbeTest(unittest.TestCase):
         self.assertEqual(row["error"], "not_signed_in")
         self.assertEqual(row["plan"], "max")
 
+    def test_opencode_shape_from_deepseek_balance(self):
+        payload = {
+            "is_available": True,
+            "balance_infos": [{"currency": "USD", "total_balance": "43.42"}],
+        }
+
+        def fake_http(method, url, headers, body=None):
+            self.assertIn("api.deepseek.com/user/balance", url)
+            self.assertIn("Authorization", headers)
+            return 200, payload
+
+        real_http, real_read = fa._http_json, fa._read_json_file
+        fa._http_json = fake_http
+        fa._read_json_file = lambda path: {"deepseek": {"type": "api", "key": "sk-x"}}
+        try:
+            row = fa._probe_opencode_quota()
+        finally:
+            fa._http_json, fa._read_json_file = real_http, real_read
+
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["plan"], "DeepSeek")
+        self.assertIn("43.42", row["note"])
+
+    def test_opencode_without_a_deepseek_key_is_not_signed_in(self):
+        real_read = fa._read_json_file
+        fa._read_json_file = lambda path: {}
+        try:
+            row = fa._probe_opencode_quota()
+        finally:
+            fa._read_json_file = real_read
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error"], "not_signed_in")
+
     def test_quotas_cache_avoids_reprobe(self):
         calls = []
         real = fa.probe_quotas

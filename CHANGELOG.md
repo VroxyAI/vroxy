@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.51.30
+
+### Added
+- `meta.quotas` now probes the OpenCode / DeepSeek account too, so the
+  engine actually driving the box reports its balance instead of being
+  invisible in `/usage`. Reads the DeepSeek key from opencode's
+  `auth.json` and hits `api.deepseek.com/user/balance`; the balance
+  rides `note` and `plan: "DeepSeek"` (no percentage window, so no
+  fake "used %" line).
+
 ## 0.51.29
 
 ### Added
