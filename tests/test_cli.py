@@ -518,5 +518,374 @@ class VersionHeaderTest(unittest.TestCase):
         self.assertIn("99.0.0 is available", err.getvalue())
 
 
+
+class _IsolatedConfig(unittest.TestCase):
+    def setUp(self):
+        from pathlib import Path
+        self.dir = Path(tempfile.mkdtemp())
+        for name, value in (("CONFIG_DIR", self.dir),
+                            ("CREDENTIALS", self.dir / "credentials.json")):
+            patcher = mock.patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in ("VROXY_HOST", "VROXY_TOKEN", "VROXY_PASSWORD"):
+            os.environ.pop(key, None)
+        self.requests = []
+
+    def serve(self, payload=None, error=None):
+        def fake(req, timeout=None):
+            self.requests.append(req)
+            if error is not None:
+                raise error
+            return _response(payload if payload is not None else {})
+        return mock.patch("urllib.request.urlopen", side_effect=fake)
+
+    def run_main(self, argv, payload=None, error=None, stdin=None):
+        out, err = StringIO(), StringIO()
+        patches = [self.serve(payload, error), mock.patch("sys.stdout", out),
+                   mock.patch("sys.stderr", err)]
+        if stdin is not None:
+            patches.append(mock.patch("sys.stdin", StringIO(stdin)))
+        for p in patches:
+            p.start()
+        try:
+            code = main(argv)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return code, out.getvalue(), err.getvalue()
+
+
+class AgentTokenRefusedTest(_IsolatedConfig):
+    REFUSED = {"error": "Agent tokens can't use this endpoint", "code": "agent_token_refused"}
+
+    def test_a_refused_agent_token_says_so_on_stderr_and_exits_nonzero(self):
+        config.save("https://x.test", "agent-tok")
+        code, out, err = self.run_main(["members", "ws1", "list"],
+                                       error=_http_error(403, self.REFUSED))
+        self.assertEqual(1, code)
+        self.assertEqual("", out)
+        self.assertEqual("vroxy: Agent tokens can't use this endpoint\n", err)
+
+    def test_json_mode_keeps_stdout_empty_on_a_refusal(self):
+        config.save("https://x.test", "agent-tok")
+        code, out, err = self.run_main(["--json", "members", "ws1", "list"],
+                                       error=_http_error(403, self.REFUSED))
+        self.assertEqual(1, code)
+        self.assertEqual("", out, "a script parsing stdout must never read an error as data")
+        self.assertIn("Agent tokens can't use this endpoint", err)
+
+    def test_the_refusal_code_survives_for_callers_of_the_client(self):
+        with self.serve(error=_http_error(403, self.REFUSED)):
+            with self.assertRaises(VroxyError) as cm:
+                Client(host="https://x.test", token="t").members("ws1")
+        self.assertEqual(403, cm.exception.status)
+        self.assertEqual("agent_token_refused", cm.exception.code)
+
+    def test_a_refused_logout_is_not_mistaken_for_a_revoked_token(self):
+        config.save("https://x.test", "agent-tok")
+        code, out, err = self.run_main(["logout"], error=_http_error(403, self.REFUSED))
+        self.assertEqual(0, code)
+        self.assertFalse(config.CREDENTIALS.exists())
+        self.assertIn("could not be revoked", err)
+        self.assertNotIn("the token is revoked", out)
+
+
+class RequestShapeTest(unittest.TestCase):
+    def capture(self, call):
+        seen = {}
+
+        def fake(req, timeout=None):
+            seen["method"] = req.get_method()
+            seen["path"] = req.full_url.split("/api/mobile/v1", 1)[1]
+            seen["body"] = json.loads(req.data) if req.data else None
+            seen["auth"] = req.get_header("Authorization")
+            seen["timeout"] = timeout
+            return _response({})
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake):
+            call(Client(host="https://x.test/", token="t"))
+        return seen
+
+    def test_every_client_call_hits_the_documented_route(self):
+        cases = [
+            (lambda c: c.logout(), "POST", "/logout", None),
+            (lambda c: c.me(), "GET", "/me", None),
+            (lambda c: c.workspaces(), "GET", "/workspaces", None),
+            (lambda c: c.rooms("ws1"), "GET", "/workspaces/ws1/rooms", None),
+            (lambda c: c.messages("ws1", "rm1", limit="5"), "GET",
+             "/workspaces/ws1/rooms/rm1/messages?limit=5", None),
+            (lambda c: c.post_message("ws1", "rm1", "hi"), "POST",
+             "/workspaces/ws1/rooms/rm1/messages", {"body": "hi"}),
+            (lambda c: c.dispatch_status("ws1"), "GET", "/workspaces/ws1/dispatch_status", None),
+            (lambda c: c.docs("ws1"), "GET", "/workspaces/ws1/docs", None),
+            (lambda c: c.docs("ws1", status="draft", q="refund policy"), "GET",
+             "/workspaces/ws1/docs?status=draft&q=refund+policy", None),
+            (lambda c: c.doc("ws1", "d1"), "GET", "/workspaces/ws1/docs/d1", None),
+            (lambda c: c.create_doc("ws1", title="T", body_md="B"), "POST",
+             "/workspaces/ws1/docs", {"doc": {"title": "T", "body_md": "B"}}),
+            (lambda c: c.update_doc("ws1", "d1", title=None, body_md="B"), "PATCH",
+             "/workspaces/ws1/docs/d1", {"doc": {"body_md": "B"}}),
+            (lambda c: c.publish_doc("ws1", "d1"), "POST", "/workspaces/ws1/docs/d1/publish", None),
+            (lambda c: c.publish_doc("ws1", "d1", published=False), "POST",
+             "/workspaces/ws1/docs/d1/unpublish", None),
+            (lambda c: c.delete_doc("ws1", "d1"), "DELETE", "/workspaces/ws1/docs/d1", None),
+            (lambda c: c.members("ws1"), "GET", "/workspaces/ws1/members", None),
+            (lambda c: c.tools("ws1"), "GET", "/workspaces/ws1/tools", None),
+            (lambda c: c.tool("ws1", "t1"), "GET", "/workspaces/ws1/tools/t1", None),
+            (lambda c: c.create_tool("ws1", name="n", kind="link", follow_origin=None), "POST",
+             "/workspaces/ws1/tools", {"tool": {"name": "n", "kind": "link"}}),
+            (lambda c: c.update_tool("ws1", "t1", label="L"), "PATCH",
+             "/workspaces/ws1/tools/t1", {"tool": {"label": "L"}}),
+            (lambda c: c.toggle_tool("ws1", "t1"), "POST", "/workspaces/ws1/tools/t1/toggle", None),
+            (lambda c: c.toggle_tool("ws1", "t1", enabled=True), "POST",
+             "/workspaces/ws1/tools/t1/toggle", {"enabled": True}),
+            (lambda c: c.toggle_tool("ws1", "t1", enabled=False), "POST",
+             "/workspaces/ws1/tools/t1/toggle", {"enabled": False}),
+            (lambda c: c.delete_tool("ws1", "t1"), "DELETE", "/workspaces/ws1/tools/t1", None),
+            (lambda c: c.search_rooms("ws1", "a&b=c #d"), "GET",
+             "/workspaces/ws1/rooms/search?q=a%26b%3Dc+%23d&limit=20", None),
+            (lambda c: c.chats("ws1"), "GET", "/workspaces/ws1/chats?filter=open", None),
+            (lambda c: c.chats("ws1", filter="all", q="x", page=2), "GET",
+             "/workspaces/ws1/chats?filter=all&q=x&page=2", None),
+            (lambda c: c.chat("ws1", "c1"), "GET", "/workspaces/ws1/chats/c1", None),
+            (lambda c: c.error("ws1", "fp 1", page=3), "GET",
+             "/workspaces/ws1/errors/fp%201?page=3", None),
+            (lambda c: c.visitors("ws1", identity="anonymous"), "GET",
+             "/workspaces/ws1/visitors?identity=anonymous", None),
+            (lambda c: c.targets("ws1", page=2), "GET",
+             "/workspaces/ws1/dispatch_targets?page=2", None),
+        ]
+        for call, method, path, body in cases:
+            with self.subTest(path=path, method=method):
+                seen = self.capture(call)
+                self.assertEqual(method, seen["method"])
+                self.assertEqual(path, seen["path"])
+                self.assertEqual(body, seen["body"])
+                self.assertEqual("Bearer t", seen["auth"])
+
+    def test_no_call_waits_longer_than_the_ninety_second_ceiling(self):
+        self.assertLessEqual(self.capture(lambda c: c.me())["timeout"], 90)
+
+    def test_a_non_numeric_limit_is_refused_before_any_request(self):
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            with self.assertRaises(ValueError):
+                Client(host="https://x.test", token="t").messages("ws1", "rm1", limit="5; drop")
+        urlopen.assert_not_called()
+
+    def test_login_is_the_one_call_that_carries_no_bearer(self):
+        seen = self.capture(lambda c: c.login("a@b.co", "pw"))
+        self.assertIsNone(seen["auth"])
+        self.assertEqual({"email": "a@b.co", "password": "pw", "client": "cli"}, seen["body"])
+
+    def test_an_unreachable_host_is_named_in_the_error(self):
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
+            with self.assertRaises(VroxyError) as cm:
+                Client(host="https://down.test", token="t").me()
+        self.assertIn("Could not reach https://down.test", str(cm.exception))
+        self.assertIn("refused", str(cm.exception))
+
+    def test_a_json_array_body_is_wrapped_not_crashed_on(self):
+        from vroxy_cli.client import _safe_json
+        self.assertEqual({"data": [1, 2]}, _safe_json("[1, 2]"))
+        self.assertEqual({}, _safe_json(""))
+        self.assertEqual({}, _safe_json("<html>"))
+
+
+class HostAndTokenResolutionTest(_IsolatedConfig):
+    def test_the_saved_host_and_token_are_used_by_default(self):
+        config.save("https://saved.test", "saved-tok")
+        self.run_main(["workspaces"], payload={"workspaces": []})
+        self.assertTrue(self.requests[0].full_url.startswith("https://saved.test/api/mobile/v1/"))
+        self.assertEqual("Bearer saved-tok", self.requests[0].get_header("Authorization"))
+
+    def test_a_token_is_never_sent_to_a_host_it_was_not_minted_for(self):
+        config.save("https://saved.test", "saved-tok")
+        code, out, err = self.run_main(["--host", "https://other.test", "workspaces"])
+        self.assertEqual(1, code)
+        self.assertEqual([], self.requests, "no request at all, let alone one with the token")
+        self.assertIn("vroxy login", err)
+
+    def test_vroxy_host_env_is_honoured_the_same_way(self):
+        config.save("https://saved.test", "saved-tok")
+        os.environ["VROXY_HOST"] = "https://other.test"
+        code, _, _ = self.run_main(["workspaces"])
+        self.assertEqual(1, code)
+        self.assertEqual([], self.requests)
+
+    def test_an_explicit_vroxy_token_wins_over_the_saved_one(self):
+        config.save("https://saved.test", "saved-tok")
+        os.environ["VROXY_TOKEN"] = "env-tok"
+        self.run_main(["workspaces"], payload={"workspaces": []})
+        self.assertEqual("Bearer env-tok", self.requests[0].get_header("Authorization"))
+
+    def test_nothing_saved_and_nothing_in_the_env_asks_you_to_log_in(self):
+        code, out, err = self.run_main(["whoami"])
+        self.assertEqual(1, code)
+        self.assertEqual("", out)
+        self.assertEqual("vroxy: Not signed in. Run: vroxy login\n", err)
+
+
+class ConfigFileModeTest(_IsolatedConfig):
+    def test_an_existing_world_readable_credentials_file_is_tightened(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        config.CREDENTIALS.write_text("{}")
+        os.chmod(config.CREDENTIALS, 0o644)
+        config.save("https://x.test", "tok")
+        self.assertEqual(0o600, stat.S_IMODE(os.stat(config.CREDENTIALS).st_mode))
+
+    def test_an_existing_world_readable_notice_file_is_tightened(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        config.notice_path().write_text("{}")
+        os.chmod(config.notice_path(), 0o644)
+        config.save_notice({"shown_at": 1})
+        self.assertEqual(0o600, stat.S_IMODE(os.stat(config.notice_path()).st_mode))
+
+    def test_a_corrupt_credentials_file_reads_as_signed_out(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        config.CREDENTIALS.write_text("{not json")
+        self.assertEqual({}, config.load())
+        self.assertIsNone(config.token_for("https://x.test"))
+
+    def test_a_notice_file_that_is_not_an_object_is_ignored(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        config.notice_path().write_text("[1, 2]")
+        self.assertEqual({}, config.load_notice())
+
+    def test_clear_with_nothing_saved_is_not_an_error(self):
+        self.assertFalse(config.clear())
+
+
+class LoginSafetyTest(_IsolatedConfig):
+    def test_a_password_flag_does_not_exist(self):
+        with mock.patch("sys.stderr", StringIO()):
+            with self.assertRaises(SystemExit):
+                main(["login", "--email", "a@b.co", "--password", "hunter2"])
+
+    def test_the_password_is_read_from_the_prompt_not_argv(self):
+        with mock.patch("getpass.getpass", return_value="pw-from-prompt") as prompt:
+            self.run_main(["--host", "https://x.test", "login", "--email", "a@b.co"],
+                          payload={"token": "t", "user": {"email": "a@b.co"}})
+        prompt.assert_called_once()
+        self.assertEqual("pw-from-prompt", json.loads(self.requests[0].data)["password"])
+
+    def test_a_login_that_returns_no_token_keeps_the_old_one_and_revokes_nothing(self):
+        config.save("https://x.test", "old-tok")
+        os.environ["VROXY_PASSWORD"] = "pw"
+        code, _, err = self.run_main(["--host", "https://x.test", "login", "--email", "a@b.co"],
+                                     payload={"user": {"email": "a@b.co"}})
+        self.assertEqual(1, code)
+        self.assertIn("no token", err)
+        self.assertEqual(1, len(self.requests))
+        self.assertEqual("old-tok", config.token_for("https://x.test"))
+
+    def test_logging_in_again_with_the_same_token_does_not_revoke_it(self):
+        config.save("https://x.test", "same-tok")
+        os.environ["VROXY_PASSWORD"] = "pw"
+        code, _, _ = self.run_main(["--host", "https://x.test", "login", "--email", "a@b.co"],
+                                   payload={"token": "same-tok", "user": {"email": "a@b.co"}})
+        self.assertEqual(0, code)
+        self.assertEqual(["/login"], [r.full_url.split("/api/mobile/v1")[1] for r in self.requests])
+
+    def test_the_old_token_is_revoked_on_the_host_that_minted_it(self):
+        config.save("https://old.test", "old-tok")
+        os.environ["VROXY_PASSWORD"] = "pw"
+        self.run_main(["--host", "https://new.test", "login", "--email", "a@b.co"],
+                      payload={"token": "new-tok", "user": {"email": "a@b.co"}})
+        revoke = self.requests[1]
+        self.assertTrue(revoke.full_url.startswith("https://old.test/"))
+        self.assertEqual("Bearer old-tok", revoke.get_header("Authorization"))
+        self.assertEqual("new-tok", config.token_for("https://new.test"))
+
+    def test_the_saved_file_never_holds_the_password(self):
+        os.environ["VROXY_PASSWORD"] = "hunter2-secret"
+        self.run_main(["--host", "https://x.test", "login", "--email", "a@b.co"],
+                      payload={"token": "t", "user": {"email": "a@b.co"}})
+        self.assertNotIn("hunter2-secret", config.CREDENTIALS.read_text())
+
+    def test_logout_revokes_on_the_saved_host_even_when_another_is_given(self):
+        config.save("https://saved.test", "tok")
+        self.run_main(["--host", "https://elsewhere.test", "logout"], payload={"ok": True})
+        self.assertTrue(self.requests[0].full_url.startswith("https://saved.test/"))
+
+
+class PostCommandTest(_IsolatedConfig):
+    def setUp(self):
+        super().setUp()
+        config.save("https://x.test", "tok")
+
+    def test_a_dash_reads_the_body_from_stdin(self):
+        code, out, _ = self.run_main(["post", "ws1", "rm1", "-"], payload={"message": {}},
+                                     stdin="  multi\nline  \n")
+        self.assertEqual(0, code)
+        self.assertEqual({"body": "multi\nline"}, json.loads(self.requests[0].data))
+        self.assertEqual("Posted.\n", out)
+
+    def test_empty_stdin_posts_nothing(self):
+        code, _, err = self.run_main(["post", "ws1", "rm1", "-"], stdin="   \n")
+        self.assertEqual(1, code)
+        self.assertEqual([], self.requests)
+        self.assertIn("Nothing to post", err)
+
+    def test_an_empty_argument_posts_nothing(self):
+        code, _, _ = self.run_main(["post", "ws1", "rm1", ""])
+        self.assertEqual(1, code)
+        self.assertEqual([], self.requests)
+
+
+class JsonPurityTest(_IsolatedConfig):
+    COMMANDS = [
+        (["whoami"], {"user": {"email": "a@b.co"}, "workspaces": []}),
+        (["workspaces"], {"workspaces": [{"hashid": "ws1", "name": "Acme"}]}),
+        (["rooms", "ws1"], {"rooms": [{"id": "rm1", "name": "general"}]}),
+        (["read", "ws1", "rm1"], {"messages": [{"body": "hi", "created_at": "2026-01-01T00:00"}]}),
+        (["dispatch", "ws1"], {"online": True, "summary": "ok"}),
+        (["docs", "ws1", "list"], {"docs": [{"hashid": "d1", "title": "T"}]}),
+        (["docs", "ws1", "show", "d1"], {"doc": {"title": "T", "body_md": "B"}}),
+        (["members", "ws1", "list"], {"members": [], "invitations": []}),
+        (["tools", "ws1", "list"], {"tools": [{"hashid": "t1", "name": "n"}]}),
+        (["search", "ws1", "refund"], {"results": [{"body": "refund"}]}),
+        (["chats", "ws1", "list"], {"chats": [{"id": "c1"}]}),
+        (["errors", "ws1", "list"], {"errors": [], "meta": {"total_pages": 3}}),
+        (["usage", "ws1"], {"plan": {"name": "Free"}, "metrics": []}),
+        (["visitors", "ws1", "list"], {"visitors": [], "meta": {"total_pages": 2}}),
+        (["targets", "ws1"], {"targets": []}),
+    ]
+
+    def test_json_mode_prints_one_parseable_document_and_nothing_else(self):
+        config.save("https://x.test", "tok")
+        for argv, payload in self.COMMANDS:
+            with self.subTest(argv=argv):
+                code, out, err = self.run_main(["--json", *argv], payload=payload)
+                self.assertEqual(0, code, err)
+                json.loads(out)
+                self.assertEqual("", err)
+
+    def test_plain_mode_renders_every_command_without_crashing(self):
+        config.save("https://x.test", "tok")
+        for argv, payload in self.COMMANDS:
+            with self.subTest(argv=argv):
+                code, out, err = self.run_main(argv, payload=payload)
+                self.assertEqual(0, code, err)
+                self.assertNotIn("Traceback", err)
+
+    def test_a_multi_page_list_says_how_to_get_the_next_page(self):
+        config.save("https://x.test", "tok")
+        _, out, _ = self.run_main(["errors", "ws1", "list"], payload={
+            "errors": [{"fingerprint": "fp1", "occurrences": 2, "message": "boom"}],
+            "meta": {"current_page": 1, "total_pages": 3, "total_count": 70}})
+        self.assertIn("page 1 of 3 (70 total)", out)
+
+
+class InterruptTest(unittest.TestCase):
+    def test_ctrl_c_exits_130_without_a_traceback(self):
+        with mock.patch("vroxy_cli.cli._client") as fake:
+            fake.return_value.workspaces.side_effect = KeyboardInterrupt
+            self.assertEqual(130, main(["workspaces"]))
+
+
 if __name__ == "__main__":
     unittest.main()

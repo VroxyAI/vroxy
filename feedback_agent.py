@@ -164,7 +164,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.30"
+AGENT_VERSION      = "vroxy_dispatch 0.51.31"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1686,11 +1686,14 @@ def clear_sessions(keys: list[str] | None = None) -> list[str]:
     Used by `--reset` and by the in-room `/reset` command."""
     if not SID_DIR.is_dir():
         return []
+    prefixes = [""] + [f"{engine}_" for engine in known_engines() if engine != "claude"]
     if keys:
-        targets = [SID_DIR / f"feedback_stream_{k}" for k in keys]
+        targets = [SID_DIR / f"feedback_stream_{prefix}{k}" for k in keys for prefix in prefixes]
     else:
-        targets = [_streamed_sid_file(PROJECT), SID_DIR / f"feedback_{PROJECT}"]
-        targets += [p for p in SID_DIR.glob(f"feedback_stream_room_*_{PROJECT}")]
+        targets = [SID_DIR / f"feedback_{PROJECT}"]
+        for prefix in prefixes:
+            targets.append(_streamed_sid_file(f"{prefix}{PROJECT}"))
+            targets += sorted(SID_DIR.glob(f"feedback_stream_{prefix}room_*_{PROJECT}"))
 
     removed = []
     for path in targets:
@@ -4087,6 +4090,14 @@ def write_restart_notice(room_id: str | None, reply_to: str | None,
         log.warning("could not write the restart notice: %s", e)
 
 
+def _age_of(stamp) -> float:
+    try:
+        age = time.time() - float(stamp or 0)
+    except (TypeError, ValueError):
+        return float("inf")
+    return age if age == age else float("inf")
+
+
 def take_restart_notice() -> dict | None:
     """Read and DELETE.  Unlinked before the announcement is
     attempted, deliberately: every reconnect confirms the
@@ -4105,7 +4116,7 @@ def take_restart_notice() -> dict | None:
         return None
     if not isinstance(notice, dict) or not notice.get("room_id"):
         return None
-    age = time.time() - float(notice.get("at") or 0)
+    age = _age_of(notice.get("at"))
     if age > RESTART_NOTICE_MAX_AGE_SECONDS:
         log.warning("dropping a restart notice %.0fs old — nobody is still waiting", age)
         return None
@@ -5072,14 +5083,14 @@ def take_spooled_work() -> list[dict]:
         spool = json.loads(raw)
     except ValueError:
         return []
-    if not isinstance(spool, dict):
+    if not isinstance(spool, dict) or not isinstance(spool.get("items"), list):
         return []
 
-    age = time.time() - float(spool.get("at") or 0)
+    age = _age_of(spool.get("at"))
     if age > WORK_SPOOL_MAX_AGE_SECONDS:
         log.warning("dropping a work spool %.0fs old — too late to be useful", age)
         return []
-    return [item for item in spool.get("items") or []
+    return [item for item in spool["items"]
             if isinstance(item, dict) and isinstance(item.get("payload"), dict)
             and item.get("kind")]
 
@@ -5183,6 +5194,13 @@ async def handle_approve(ws, payload: dict) -> None:
         await reply(ws, chat_id, f"⚠️ Can't apply: {project_dir} not found.")
         return
 
+    base_ref = policy.get("base_ref") or await asyncio.to_thread(_current_branch, project_dir)
+    on_base, err = await asyncio.to_thread(_ensure_on_base, project_dir, base_ref)
+    if not on_base:
+        await reply(ws, chat_id, f"⚠️ Couldn't switch to `{base_ref}`: {err[:200]}. "
+                                 f"Nothing was written.")
+        return
+
     # A proposal's `files` are the COMPLETE contents of each file as of
     # the commit it was generated against.  Writing them onto a branch
     # that has moved since silently reverts everything that landed in
@@ -5204,14 +5222,20 @@ async def handle_approve(ws, payload: dict) -> None:
     # with one bad entry is refused whole rather than half-applied.
     try:
         writes = []
+        applied = []
         for f in files:
             path, content = f.get("path"), f.get("content")
             if not path or content is None:
                 continue
             writes.append((safe_target(project_dir, path), content))
+            applied.append(f)
     except ValueError as e:
         log.error("refusing proposal: %s", e)
         await reply(ws, chat_id, f"⚠️ Refused — {e}. Nothing was written.")
+        return
+    if not writes:
+        await reply(ws, chat_id, "⚠️ Approve received but the proposal names no file "
+                                 "with content — nothing to apply.")
         return
 
     try:
@@ -5221,7 +5245,7 @@ async def handle_approve(ws, payload: dict) -> None:
 
         if mode == "pr":
             outcome, pr = await asyncio.to_thread(
-                _git_open_pr, project_dir, summary, files, policy,
+                _git_open_pr, project_dir, summary, applied, policy,
                 payload.get("feedback_id"))
             if pr:
                 await reply(ws, chat_id, outcome, kind="pull_request", pull_request=pr)
@@ -5229,7 +5253,7 @@ async def handle_approve(ws, payload: dict) -> None:
                 await reply(ws, chat_id, outcome)
         else:
             outcome = await asyncio.to_thread(_git_inline_ship, project_dir, summary,
-                                              files, policy)
+                                              applied, policy)
             await reply(ws, chat_id, outcome)
     except Exception as e:
         log.exception("apply failed")
@@ -5288,16 +5312,21 @@ def _git_inline_ship(project_dir: Path, summary: str, files: list[dict],
 
     # version_bump.sh rewrites the version constants and the
     # changelog; stage exactly those two, and only if it succeeded.
+    committed = list(paths)
     vb = project_dir / "version_bump.sh"
     if vb.is_file():
         rc, _, err = _run(["bash", "./version_bump.sh"], project_dir)
         if rc == 0:
-            _run(["git", "add", "--", "config/application.rb", "CHANGELOG.md"], project_dir)
+            bumped = [p for p in ("config/application.rb", "CHANGELOG.md")
+                      if (project_dir / p).exists()]
+            if bumped:
+                _run(["git", "add", "--"] + bumped, project_dir)
+                committed += bumped
         else:
             log.warning("version_bump.sh failed: %s", err[:200])
 
     msg = f"UI-feedback tweak: {summary}"
-    rc, _, err = _run(["git", "commit", "-m", msg], project_dir)
+    rc, _, err = _run(["git", "commit", "-m", msg, "--"] + committed, project_dir)
     if rc != 0:
         return f"\u26a0\ufe0f Commit failed: {err[:300]}"
 
@@ -5344,7 +5373,8 @@ def _git_open_pr(project_dir: Path, summary: str, files: list[dict],
             return f"\u26a0\ufe0f Branch failed: {err[:300]}", None
 
         _run(["git", "add", "--"] + paths, project_dir)
-        rc, _, err = _run(["git", "commit", "-m", f"UI feedback: {summary}"], project_dir)
+        rc, _, err = _run(["git", "commit", "-m", f"UI feedback: {summary}", "--"] + paths,
+                          project_dir)
         if rc != 0:
             return f"\u26a0\ufe0f Commit failed: {err[:300]}", None
 
@@ -6097,8 +6127,9 @@ async def worker_loop(link: CableLink) -> None:
             continue
         # To the BACK, never dropped: holding is a request to wait.
         if kind == "room" and is_paused(payload):
-            await asyncio.sleep(PAUSED_REQUEUE_DELAY_SECONDS)
             _work_queue.put_nowait((kind, payload))
+            _work_queue.task_done()
+            await asyncio.sleep(PAUSED_REQUEUE_DELAY_SECONDS)
             continue
         _current_work = (kind, payload)
         _current_work_started = time.time()
@@ -6205,9 +6236,9 @@ async def process_stream(link: CableLink, ws) -> None:
                              (msg.get("message") or {}).get("hashid"))
                     asyncio.create_task(_fast_lane_room(link, msg))
                 else:
+                    await _work_queue.put(("room", msg))
                     if msg.get("fast_lane"):
                         promote_queued((msg.get("message") or {}).get("hashid") or "")
-                    await _work_queue.put(("room", msg))
                     with contextlib.suppress(Exception):
                         await room_status(link, (msg.get("room") or {}).get("hashid"),
                                           (msg.get("message") or {}).get("hashid"), "queued")

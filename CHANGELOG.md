@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.51.31
+
+### Fixed
+- `/reset` clears every engine's session file (`feedback_stream_{engine}_{key}`),
+  not just claude's.
+- A garbage `at` in the restart notice or work spool no longer crashes boot;
+  a spool whose `items` isn't a list is dropped.
+- `handle_approve` switches to the base branch before writing files, refuses a
+  proposal with no usable entries, and commits only the files it applied.
+- Inline ship and PR ship commit only their named paths (`git commit -- paths`),
+  so unrelated staged work no longer rides along; version files are staged only
+  if they exist.
+- `worker_loop` re-queues a held message before its delay, so a shutdown during
+  the wait no longer loses it.
+- `process_stream` queues before `promote_queued`, so a fast-lane message can
+  actually jump the queue.
+
+### Added
+- Test modules `tests/test_agent_{state,frames,runner,ship}.py` and CLI
+  coverage in `tests/test_cli.py` pinning each fix above.
+
 ## 0.51.30
 
 ### Added
