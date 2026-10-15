@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.51.32
+
+### Fixed
+- A harness (opencode/cursor/gemini/amp/copilot) run that the stall
+  watchdog kills before it emits anything is now retried fresh once
+  before giving up — a transient bootstrap or wire stall recovers
+  instead of surfacing as "I crashed". When it still produces nothing,
+  the failure reads "produced nothing for Ns, so I killed it as wedged"
+  instead of an opaque `exited -15 without output` with raw stderr.
+
 ## 0.51.31
 
 ### Fixed

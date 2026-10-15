@@ -164,7 +164,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.31"
+AGENT_VERSION      = "vroxy_dispatch 0.51.32"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -469,6 +469,19 @@ def _transport_retry_once(key: str) -> bool:
     if key in _transport_retried:
         return False
     _transport_retried.add(key)
+    return True
+
+
+_wedged_retried: set[str] = set()
+
+
+def _wedged_retry_once(key: str) -> bool:
+    """True the first time `key` asks, False after — bounds a watchdog
+    kill to a single fresh retry so a persistently wedged engine can't
+    recurse forever."""
+    if key in _wedged_retried:
+        return False
+    _wedged_retried.add(key)
     return True
 
 
@@ -3803,6 +3816,26 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
              engine, tool_calls, text_chars, thinking_chars)
 
     if failed and produced_nothing:
+        # A run our own stall watchdog killed (a signal, so a negative
+        # return code) may have wedged on a transient bootstrap or wire
+        # stall rather than on the prompt itself. Give it ONE fresh
+        # retry before giving up — the same recovery a resumed session
+        # already gets, extended to a cold start.
+        if proc.returncode is not None and proc.returncode < 0:
+            key = f"wedged_{engine}_{session_key or project}"
+            if _wedged_retry_once(key):
+                log.warning("%s was killed by the stall watchdog with no output "
+                            "(rc=%s) — retrying fresh once",
+                            engine, proc.returncode)
+                _retire_session(sid_file, "watchdog kill produced nothing")
+                return run_harness_streamed(engine, prompt, project, on_event,
+                                            allow_resume=False, session_key=session_key,
+                                            work_dir_override=work_dir_override,
+                                            attachments=attachments, cancel_key=cancel_key)
+            waited = STALL_SECONDS * STALL_WINDOWS_BEFORE_KILL
+            raise RuntimeError(
+                f"{spec['label']} produced nothing for {waited}s, so I killed it "
+                f"as wedged rather than leave you waiting")
         raise RuntimeError(
             f"{spec['label']} exited {proc.returncode} without output"
             + (f": {_one_line(stderr_text, 300)}" if stderr_text else ""))
