@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.51.33
+
+### Fixed
+- Every dispatch unit shares one `~/.local/share/opencode/opencode.db`,
+  and at boot they all run `opencode auth list` in the same second
+  against a cold disk, so some got `database is locked` and the room
+  was told "OpenCode can't run: Error: Unexpected error." until the
+  next heartbeat 15 minutes later. The health probe now retries a
+  locked database with a short backoff, and a problem that persists
+  reads as the whole message (ANSI stripped) instead of only its
+  uninformative first line. A run that dies on the same lock before
+  producing anything is retried once, keeping its session.
+
 ## 0.51.32
 
 ### Fixed

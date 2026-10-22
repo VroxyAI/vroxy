@@ -4195,6 +4195,30 @@ class HarnessHealthTest(unittest.TestCase):
         self.assertFalse(healthy)
         self.assertIsNotNone(problem)
 
+    def _locked_for(self, calls):
+        count = Path(self.tmp) / "calls"
+        return self._script("x", (
+            f'n=0; [ -f {count} ] && read n < {count}; echo $((n+1)) > {count}\n'
+            f'if [ "$n" -lt {calls} ]; then printf "\\033[91mError: \\033[0mUnexpected error\\n\\ndatabase is locked\\n" >&2; exit 1; fi\n'
+            'echo "1 credentials"'))
+
+    def test_a_locked_database_at_boot_is_retried_not_reported(self):
+        fa.HARNESS_LOCK_BACKOFF, backoff = 0, fa.HARNESS_LOCK_BACKOFF
+        try:
+            self.assertEqual(fa._harness_health(self._locked_for(2), ["auth", "list"]),
+                             (True, None))
+        finally:
+            fa.HARNESS_LOCK_BACKOFF = backoff
+
+    def test_a_lock_that_never_clears_names_the_lock_without_escape_codes(self):
+        fa.HARNESS_LOCK_BACKOFF, backoff = 0, fa.HARNESS_LOCK_BACKOFF
+        try:
+            healthy, problem = fa._harness_health(self._locked_for(99), ["auth", "list"])
+        finally:
+            fa.HARNESS_LOCK_BACKOFF = backoff
+        self.assertFalse(healthy)
+        self.assertEqual(problem, "Error: Unexpected error database is locked")
+
     def test_a_missing_binary_is_a_failure_not_an_exception(self):
         healthy, problem = fa._harness_health("/nope/not/here", [])
         self.assertFalse(healthy)
@@ -4574,6 +4598,35 @@ class HarnessAnswerTest(unittest.TestCase):
             "'is_error':False,'usage':{}}) + '\\n')\n"
         )
         script.chmod(0o755)
+
+    def _fake_cursor_locked_then_answer(self, answer):
+        marker = self.tmp / "attempt"
+        script = self.binhome / "cursor-agent"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            f"marker = {str(marker)!r}\n"
+            "if not os.path.exists(marker):\n"
+            "    open(marker, 'w').write('x')\n"
+            "    sys.stderr.write('Error: Unexpected error\\n\\ndatabase is locked\\n')\n"
+            "    sys.exit(1)\n"
+            f"say = {answer!r}\n"
+            "sys.stdout.write(json.dumps({'type':'assistant','session_id':'s1',"
+            "'message':{'role':'assistant','content':[{'type':'text','text':say}]}})"
+            " + '\\n')\n"
+            "sys.stdout.write(json.dumps({'type':'result','subtype':'success',"
+            "'is_error':False,'usage':{}}) + '\\n')\n"
+        )
+        script.chmod(0o755)
+
+    def test_a_run_that_finds_the_database_locked_retries_once(self):
+        self._fake_cursor_locked_then_answer("Shipped.")
+        fa.HARNESS_LOCK_BACKOFF, backoff = 0, fa.HARNESS_LOCK_BACKOFF
+        try:
+            self.assertEqual(self._run(), "Shipped.")
+        finally:
+            fa.HARNESS_LOCK_BACKOFF = backoff
+        self.assertFalse(fa._transport_retried)
 
     def test_a_retriable_transport_error_resumes_once_and_recovers(self):
         self._fake_cursor_transport_blip_then_answer("Shipped.")

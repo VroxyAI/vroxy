@@ -164,7 +164,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.32"
+AGENT_VERSION      = "vroxy_dispatch 0.51.33"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -384,6 +384,8 @@ _ENGINE_BIN_LOOKUP = {
 # five seconds is the worst case and it is still well inside it.
 HARNESS_PROBE_TIMEOUT  = 5
 HARNESS_REPROBE_SECONDS = 900
+HARNESS_LOCK_RETRIES = 3
+HARNESS_LOCK_BACKOFF = 1.0
 QUOTA_PROBE_TIMEOUT = 8
 QUOTA_REPROBE_SECONDS = 300
 
@@ -459,6 +461,19 @@ def _retriable_transport(text: str) -> bool:
     return any(h in low for h in _RETRIABLE_TRANSPORT_HINTS)
 
 
+_LOCAL_LOCK_HINTS = ("database is locked", "sqlite_busy")
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _local_lock(text: str) -> bool:
+    """Another process on this box holds the harness's own state DB.
+
+    Every dispatch unit shares one opencode.db, and at boot they all
+    probe in the same second against a cold disk."""
+    low = (text or "").lower()
+    return any(h in low for h in _LOCAL_LOCK_HINTS)
+
+
 _transport_retried: set[str] = set()
 
 
@@ -514,17 +529,22 @@ def _harness_health(path: str, args: list[str]) -> tuple[bool, str | None]:
     failure — reporting a harness green because we couldn't parse why
     it was red is the bug this whole path exists to fix.
     """
-    try:
-        out = subprocess.run(
-            [path, *args], capture_output=True, text=True,
-            timeout=HARNESS_PROBE_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "it stopped responding"
-    except Exception as exc:
-        return False, f"could not be run ({type(exc).__name__})"
+    for attempt in range(HARNESS_LOCK_RETRIES + 1):
+        try:
+            out = subprocess.run(
+                [path, *args], capture_output=True, text=True,
+                timeout=HARNESS_PROBE_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "it stopped responding"
+        except Exception as exc:
+            return False, f"could not be run ({type(exc).__name__})"
 
-    text = f"{out.stdout or ''}\n{out.stderr or ''}".strip()
+        text = _ANSI_ESCAPE.sub("", f"{out.stdout or ''}\n{out.stderr or ''}").strip()
+        if out.returncode == 0 or not _local_lock(text) or attempt == HARNESS_LOCK_RETRIES:
+            break
+        time.sleep(HARNESS_LOCK_BACKOFF * (attempt + 1))
+
     problem = _account_problem(text)
     if out.returncode == 0:
         # Exit 0 is not always healthy: `doctor` reports problems in
@@ -533,8 +553,7 @@ def _harness_health(path: str, args: list[str]) -> tuple[bool, str | None]:
 
     if problem:
         return False, problem
-    first = _one_line(text.splitlines()[0], 120) if text else None
-    return False, first or f"exited {out.returncode}"
+    return False, _one_line(text, 120) or f"exited {out.returncode}"
 
 
 def probe_harnesses() -> list[dict]:
@@ -3794,6 +3813,20 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
     failed = proc.returncode not in (0, None)
     produced_nothing = not answer_chunks and tool_calls == 0
     cancelled = was_cancelled(cancel_key or "")
+
+    if failed and produced_nothing and not cancelled and _local_lock(stderr_text):
+        key = f"lock_{engine}_{session_key or project}"
+        if _transport_retry_once(key):
+            log.warning("%s found its database locked (rc=%s) — retrying once",
+                        engine, proc.returncode)
+            try:
+                time.sleep(HARNESS_LOCK_BACKOFF * HARNESS_LOCK_RETRIES)
+                return run_harness_streamed(engine, prompt, project, on_event,
+                                            allow_resume=allow_resume, session_key=session_key,
+                                            work_dir_override=work_dir_override,
+                                            attachments=attachments, cancel_key=cancel_key)
+            finally:
+                _transport_retried.discard(key)
 
     if resumed and failed and produced_nothing:
         log.warning("%s resume produced nothing (rc=%s) — dropping stale session",
