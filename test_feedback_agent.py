@@ -443,12 +443,15 @@ class HandleRoomMessageAskTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         self._run = fa.run_claude_streamed
+        self._engine = fa.DISPATCH_ENGINE
+        fa.DISPATCH_ENGINE = "claude"
         self._timeout = fa.ROOM_REPLY_ACK_TIMEOUT_SECONDS
         fa.ROOM_REPLY_ACK_TIMEOUT_SECONDS = 0.2
         fa._posted_message_acks.clear()
 
     async def asyncTearDown(self):
         fa.run_claude_streamed = self._run
+        fa.DISPATCH_ENGINE = self._engine
         fa.ROOM_REPLY_ACK_TIMEOUT_SECONDS = self._timeout
         fa._posted_message_acks.clear()
 
@@ -4219,6 +4222,22 @@ class HarnessHealthTest(unittest.TestCase):
         self.assertFalse(healthy)
         self.assertEqual(problem, "Error: Unexpected error database is locked")
 
+    def test_zero_credentials_is_logged_out_but_ten_is_not(self):
+        self.assertEqual(fa._account_problem("└  0 credentials"), "not logged in")
+        self.assertIsNone(fa._account_problem("└  10 credentials"))
+
+    def test_a_lock_that_survives_the_probe_is_reprobed_within_a_minute(self):
+        locked = [{"id": "opencode", "healthy": False,
+                   "problem": "Error: Unexpected error database is locked"}]
+        probe, fa.probe_harnesses = fa.probe_harnesses, lambda: locked
+        try:
+            fa.harnesses(now=1000.0)
+            fa.probe_harnesses = lambda: [{"id": "opencode", "healthy": True}]
+            self.assertFalse(fa.harnesses(now=1000.0 + fa.HARNESS_LOCK_REPROBE_SECONDS - 1)[0]["healthy"])
+            self.assertTrue(fa.harnesses(now=1000.0 + fa.HARNESS_LOCK_REPROBE_SECONDS + 1)[0]["healthy"])
+        finally:
+            fa.probe_harnesses = probe
+
     def test_a_missing_binary_is_a_failure_not_an_exception(self):
         healthy, problem = fa._harness_health("/nope/not/here", [])
         self.assertFalse(healthy)
@@ -4627,6 +4646,48 @@ class HarnessAnswerTest(unittest.TestCase):
         finally:
             fa.HARNESS_LOCK_BACKOFF = backoff
         self.assertFalse(fa._transport_retried)
+
+    def _fake_cursor_always_locked(self):
+        runs = self.tmp / "runs"
+        script = self.binhome / "cursor-agent"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"open({str(runs)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+            "sys.stderr.write('Error: Unexpected error\\n\\ndatabase is locked\\n')\n"
+            "sys.exit(1)\n"
+        )
+        script.chmod(0o755)
+        return runs
+
+    def test_a_lock_that_outlasts_the_retry_keeps_the_session(self):
+        runs = self._fake_cursor_always_locked()
+        sid_file = fa._streamed_sid_file("cursor_proj")
+        sid_file.parent.mkdir(parents=True, exist_ok=True)
+        sid_file.write_text("good-session")
+        fa.HARNESS_LOCK_BACKOFF, backoff = 0, fa.HARNESS_LOCK_BACKOFF
+        try:
+            with self.assertRaises(RuntimeError):
+                self._run()
+        finally:
+            fa.HARNESS_LOCK_BACKOFF = backoff
+        self.assertEqual(len(runs.read_text().splitlines()), 2)
+        self.assertEqual(sid_file.read_text().strip(), "good-session")
+
+    def test_a_stop_during_the_lock_backoff_cancels_the_retry(self):
+        runs = self._fake_cursor_always_locked()
+        fa.HARNESS_LOCK_BACKOFF, backoff = 0, fa.HARNESS_LOCK_BACKOFF
+        sleep, fa.time.sleep = fa.time.sleep, lambda seconds: fa.request_cancel("m1")
+        try:
+            with self.assertRaises(RuntimeError):
+                fa.run_harness_streamed("cursor", "go", "proj", lambda e: None,
+                                        work_dir_override=self.work, cancel_key="m1")
+        finally:
+            fa.HARNESS_LOCK_BACKOFF = backoff
+            fa.time.sleep = sleep
+            fa.clear_cancel("m1")
+            fa.set_paused("m1", False)
+        self.assertEqual(len(runs.read_text().splitlines()), 1)
 
     def test_a_retriable_transport_error_resumes_once_and_recovers(self):
         self._fake_cursor_transport_blip_then_answer("Shipped.")

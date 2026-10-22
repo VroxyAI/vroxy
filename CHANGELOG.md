@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.51.34
+
+### Fixed
+- A run whose opencode DB stays locked past the one retry no longer
+  falls into the "resume produced nothing" path that deleted the
+  room's session; a Stop pressed during the lock backoff now cancels
+  the retry instead of letting the whole turn run.
+- The lock backoff is jittered so units started together stop
+  retrying in lockstep, and a lock that survives the probe is
+  re-probed within a minute rather than cached as broken for 15.
+- `opencode auth list` reporting 10, 20, … credentials no longer
+  matches "0 credentials" and reads as logged out.
+- `vroxy_cli` carries the agent version again (it was left at 0.51.31),
+  and the room-ask tests pin the engine instead of inheriting the
+  box's `DISPATCH_ENGINE`.
+
 ## 0.51.33
 
 ### Fixed

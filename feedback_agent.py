@@ -56,6 +56,7 @@ import contextvars
 import functools
 import logging
 import os
+import random
 import re
 import shutil
 import signal
@@ -164,7 +165,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.33"
+AGENT_VERSION      = "vroxy_dispatch 0.51.34"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -386,6 +387,7 @@ HARNESS_PROBE_TIMEOUT  = 5
 HARNESS_REPROBE_SECONDS = 900
 HARNESS_LOCK_RETRIES = 3
 HARNESS_LOCK_BACKOFF = 1.0
+HARNESS_LOCK_REPROBE_SECONDS = 60
 QUOTA_PROBE_TIMEOUT = 8
 QUOTA_REPROBE_SECONDS = 300
 
@@ -430,7 +432,6 @@ _AUTH_HINTS = (
     ('"loggedin": false', "not logged in"),
     ('"loggedin":false',  "not logged in"),
     # `opencode auth list` prints a footer count, not an error.
-    ("0 credentials",     "not logged in"),
     ("no credentials",    "not logged in"),
 )
 
@@ -441,6 +442,8 @@ def _account_problem(text: str) -> str | None:
     for needle, label in _AUTH_HINTS:
         if needle in low:
             return label
+    if re.search(r"(?<!\d)0 credentials", low):
+        return "not logged in"
     return None
 
 
@@ -543,7 +546,7 @@ def _harness_health(path: str, args: list[str]) -> tuple[bool, str | None]:
         text = _ANSI_ESCAPE.sub("", f"{out.stdout or ''}\n{out.stderr or ''}").strip()
         if out.returncode == 0 or not _local_lock(text) or attempt == HARNESS_LOCK_RETRIES:
             break
-        time.sleep(HARNESS_LOCK_BACKOFF * (attempt + 1))
+        time.sleep(HARNESS_LOCK_BACKOFF * (attempt + 1) * random.uniform(0.5, 1.5))
 
     problem = _account_problem(text)
     if out.returncode == 0:
@@ -623,7 +626,9 @@ def harnesses(now: float | None = None) -> list[dict]:
     if _harness_cache and (now - _harness_cache[0]) < HARNESS_REPROBE_SECONDS:
         return _harness_cache[1]
     found = probe_harnesses()
-    _harness_cache = (now, found)
+    still_locked = any(_local_lock(h.get("problem") or "") for h in found)
+    stamp = now - HARNESS_REPROBE_SECONDS + HARNESS_LOCK_REPROBE_SECONDS if still_locked else now
+    _harness_cache = (stamp, found)
     log.info("harnesses on this box: %s",
              ", ".join(f"{h['id']}={h.get('version', '?')}" for h in found) or "none")
     return found
@@ -3814,21 +3819,24 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
     produced_nothing = not answer_chunks and tool_calls == 0
     cancelled = was_cancelled(cancel_key or "")
 
-    if failed and produced_nothing and not cancelled and _local_lock(stderr_text):
+    locked = failed and produced_nothing and _local_lock(stderr_text)
+    if locked and not cancelled:
         key = f"lock_{engine}_{session_key or project}"
         if _transport_retry_once(key):
             log.warning("%s found its database locked (rc=%s) — retrying once",
                         engine, proc.returncode)
             try:
-                time.sleep(HARNESS_LOCK_BACKOFF * HARNESS_LOCK_RETRIES)
-                return run_harness_streamed(engine, prompt, project, on_event,
-                                            allow_resume=allow_resume, session_key=session_key,
-                                            work_dir_override=work_dir_override,
-                                            attachments=attachments, cancel_key=cancel_key)
+                time.sleep(HARNESS_LOCK_BACKOFF * HARNESS_LOCK_RETRIES * random.uniform(0.5, 1.5))
+                cancelled = was_cancelled(cancel_key or "")
+                if not cancelled:
+                    return run_harness_streamed(engine, prompt, project, on_event,
+                                                allow_resume=allow_resume, session_key=session_key,
+                                                work_dir_override=work_dir_override,
+                                                attachments=attachments, cancel_key=cancel_key)
             finally:
                 _transport_retried.discard(key)
 
-    if resumed and failed and produced_nothing:
+    if resumed and failed and produced_nothing and not locked:
         log.warning("%s resume produced nothing (rc=%s) — dropping stale session",
                     engine, proc.returncode)
         _retire_session(sid_file, "resume produced nothing")
