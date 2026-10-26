@@ -9,7 +9,7 @@ and the dogfood feedback loop. Sibling of `vroxy_web` under
 
 This file is what every harness on this box reads when it works
 here — Claude Code, Cursor Agent, Codex, Gemini CLI, OpenCode,
-Amp, Copilot CLI. Rules below apply no matter which
+Amp, Copilot CLI, Cline, Kiro CLI, Devin CLI, OpenClaw. Rules below apply no matter which
 `DISPATCH_ENGINE` is live.
 
 ## Skills in this repo

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.52.0
+
+### Added
+- Four more harnesses: `cline`, `kiro` (`kiro-cli`), `devin` and
+  `openclaw`; `windsurf` is an alias for `devin` (Windsurf has no CLI
+  of its own). Kiro and Devin runs are gated on their auth check, so
+  a logged-out CLI fails fast instead of waiting on a device login.
+  All four are unverified until logged in on this box.
+- `/steer` and the room's **Steer** action send a message into the run
+  in flight instead of queueing it. Claude runs now take their prompt
+  on stdin (`--input-format stream-json`) and keep it open until the
+  turn's result, so a steer lands at the next tool boundary. Other
+  engines, or a steer after the turn ended, fall back to the front of
+  the queue. A steered message is reported `steered`.
+- Sub-agents are reported as `agent` progress lines with their type,
+  description, the prompt they were spun up with, and a summary when
+  done — from Claude's task lifecycle, and from the spawning tool call
+  for the other harnesses (closed when the run ends).
+
+### Fixed
+- A harness whose `--version` fails no longer reports its error text
+  as the version (gemini showed a Node stack trace).
+
 ## 0.51.34
 
 ### Fixed

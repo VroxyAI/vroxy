@@ -474,7 +474,8 @@ only matters when `/harness` hasn't pinned a choice; a pinned harness
 always wins.
 
 Also runs `codex`, `cursor` (`cursor-agent`), `gemini`,
-`copilot_cli`, `opencode`, and `amp`. One process runs one engine —
+`copilot_cli`, `opencode`, `amp`, `cline`, `kiro`, `devin` and
+`openclaw`. One process runs one engine —
 to have several, install a second systemd instance. An unrecognised
 value raises at the first run rather than falling back.
 
@@ -484,6 +485,60 @@ matches the CLI's stream-json emitter and a captured init/result
 frame, but stays unverified until a successful turn (API key).
 Amp still needs a login before its Claude-shaped `--stream-json`
 can be confirmed live.
+
+`cline`, `kiro` (`kiro-cli`), `devin` and `openclaw` are drivable
+too, all unverified until someone logs them in on this box:
+
+- **Cline** — `cline --json`, NDJSON `run_start` / `agent_event` /
+  `run_result`. Tools auto-approve by default; `-y` is avoided because
+  it swaps in a reduced toolset without `spawn_agent`.
+- **Kiro** — `kiro-cli chat --no-interactive --trust-all-tools
+  --output-format stream-json`. Logged out, `chat` starts a device
+  login and waits forever, so every run is gated on `kiro-cli whoami`
+  first and fails fast instead.
+- **Devin** — `devin -p`, plain text only (there is no JSON print
+  mode; structured output needs ACP). Gated on `devin auth status`,
+  which exits 0 when logged out, so the TEXT is what is checked.
+  **Windsurf** has no CLI of its own any more — it became Devin
+  Desktop — so `windsurf` is an alias for `devin`.
+- **OpenClaw** — `openclaw agent exec --json` prints one envelope when
+  the run ends, so the trail shows the tool summary rather than live
+  steps. It needs Node ≥ 24.22; `~/.local/bin/openclaw` is a wrapper
+  that pins that node.
+
+npm-installed CLIs in `~/.local/bin` (gemini, copilot, cline, pi) are
+wrappers that exec nvm's node, not symlinks: the units' PATH puts
+`/usr/bin/node` (18) first, and gemini 0.6x dies on it.
+
+### Steering a run in progress
+
+A room message normally queues behind the run in flight. `/steer
+<text>` — or **Steer** on a queued message — sends it INTO that run
+instead, when the harness can take input mid-turn. Claude can:
+the runner drives `claude -p --input-format stream-json`, writes the
+prompt as the first stdin line, and keeps stdin open until the
+`result`, so a steer lands at the next tool boundary of the same turn
+(verified live). The message is marked `steered` and gets no reply of
+its own. Any other engine, or a steer that arrives after the turn
+ended, falls back to the queue at the front.
+
+Harnesses that could steer but are not wired yet: codex (`app-server`
+`turn/steer`), opencode (`serve`, `delivery: "steer"`), copilot
+(`--headless`, `mode: "immediate"`), amp (`--stream-json-input`),
+pi (`--mode rpc`). Gemini and cursor cancel the running turn on a new
+prompt, so they never will.
+
+### Sub-agents
+
+A run that spawns sub-agents reports each one as an `agent` progress
+line carrying `{id, type, description, prompt, state, summary,
+duration_ms, engine, parent_id}` — `started` then `done`/`error`. The
+room shows "N agents running" and the prompt each was spun up with.
+Claude reports the whole lifecycle (`system/task_started` →
+`task_notification`, `local_agent` tasks only — background shells are
+tasks too). The others only report the tool call that spawned one
+(`Task`, `invoke_agent`, `spawn_agent`, `use_subagent`), so their
+sub-agents close when the run does.
 
 The engine is reported in the heartbeat as `meta.engine`. Flipping
 the harness on an existing install MOVES that agent rather than

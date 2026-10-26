@@ -1,6 +1,6 @@
 ---
 name: restart_dispatch
-description: Safely restart a vroxy_dispatch systemd unit without killing the turn mid-reply. Use whenever dispatch needs to reload itself (engine flip, shipped self-update, hung cable, operator ask) — never a bare systemctl restart from inside the unit. Applies to every DISPATCH_ENGINE (claude, cursor, codex, gemini, opencode, amp, copilot).
+description: Safely restart a vroxy_dispatch systemd unit without killing the turn mid-reply. Use whenever dispatch needs to reload itself (engine flip, shipped self-update, hung cable, operator ask) — never a bare systemctl restart from inside the unit. Applies to every DISPATCH_ENGINE (claude, cursor, codex, gemini, opencode, amp, copilot, cline, kiro, devin, openclaw).
 user-invocable: true
 ---
 

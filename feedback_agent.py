@@ -165,7 +165,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.51.34"
+AGENT_VERSION      = "vroxy_dispatch 0.52.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -363,6 +363,13 @@ KNOWN_HARNESSES = (
      "health": ["status"], "auth": ["status"]},
     {"id": "amp",    "label": "Amp",           "bin": "amp",          "engine": "amp"},
     {"id": "goose",  "label": "Goose",         "bin": "goose",        "engine": None},
+    {"id": "cline",  "label": "Cline",         "bin": "cline",        "engine": "cline"},
+    {"id": "kiro",   "label": "Kiro CLI",      "bin": "kiro-cli",     "engine": "kiro",
+     "auth": ["whoami", "--format", "json"]},
+    {"id": "devin",  "label": "Devin CLI (Windsurf)", "bin": "devin", "engine": "devin",
+     "auth": ["auth", "status"]},
+    {"id": "openclaw", "label": "OpenClaw",    "bin": "openclaw",     "engine": "openclaw",
+     "health": ["models", "status", "--check"]},
 )
 
 # The order dispatch tries when no harness has been chosen via
@@ -405,7 +412,7 @@ def _harness_version(path: str) -> str | None:
     except Exception:
         return None
     text = (out.stdout or out.stderr or "").strip()
-    if not text:
+    if out.returncode != 0 or not text:
         return None
     return _one_line(text.splitlines()[0], 60)
 
@@ -1769,6 +1776,11 @@ ENGINE_ALIASES = {
     "copilot": "copilot_cli",
     "github-copilot": "copilot_cli",
     "github_copilot": "copilot_cli",
+    "kiro-cli": "kiro",
+    "kiro_cli": "kiro",
+    "windsurf": "devin",
+    "devin-cli": "devin",
+    "cline-cli": "cline",
 }
 
 
@@ -2763,6 +2775,118 @@ def _cut_short(text: str, reason: str) -> str:
     return f"{text}\n\n{note}" if text else note
 
 
+class _LiveInput:
+    """The stdin of a `--input-format stream-json` claude run.  Open
+    until the run's `result`, and while open a user message written to
+    it lands in the turn at the next tool boundary instead of waiting
+    for the turn to end."""
+
+    def __init__(self, proc):
+        self._proc = proc
+        self._lock = threading.Lock()
+        self._closed = proc.stdin is None
+        self.steered: list[str] = []
+
+    def send(self, text: str) -> bool:
+        line = json.dumps({"type": "user",
+                           "message": {"role": "user", "content": text}})
+        with self._lock:
+            if self._closed or self._proc.poll() is not None:
+                return False
+            try:
+                self._proc.stdin.write(line + "\n")
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                self._closed = True
+                return False
+            self.steered.append(text)
+            return True
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            with contextlib.suppress(BrokenPipeError, OSError, ValueError):
+                self._proc.stdin.close()
+
+
+_live_inputs: dict[str, _LiveInput] = {}
+
+
+class _ResultTotals:
+    """A steer that lands after a turn's last tool call, or a sub-agent
+    still running in the background, makes claude answer in a second
+    turn with its own `result`.  The run's cost is all of them."""
+
+    def __init__(self):
+        self.usage: dict = {}
+        self.cost: float | None = None
+        self.duration: int | None = None
+        self.turns: int | None = None
+
+    def add(self, event: dict) -> None:
+        for key, value in (event.get("usage") or {}).items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                self.usage[key] = self.usage.get(key, 0) + value
+        for attr, key in (("cost", "total_cost_usd"), ("duration", "duration_ms"),
+                          ("turns", "num_turns")):
+            value = event.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                setattr(self, attr, (getattr(self, attr) or 0) + value)
+
+    def snapshot(self) -> dict:
+        return {"usage": dict(self.usage), "cost_usd": self.cost,
+                "duration_ms": self.duration, "num_turns": self.turns}
+_room_inflight: dict[str, str] = {}
+
+STEERABLE_ENGINES = {"claude"}
+
+
+def _claude_task_event(event: dict, open_agents: dict[str, float]) -> dict | None:
+    """Claude's sub-agent lifecycle as an `agent` event.
+
+    `task_started` fires for background shells too, so only a
+    `local_agent` task (or one naming a subagent type) counts, and a
+    `task_notification` only closes an id this run saw start."""
+    subtype = event.get("subtype")
+    task_id = event.get("task_id")
+    if not task_id:
+        return None
+    if subtype == "task_started":
+        if event.get("task_type") != "local_agent" and not event.get("subagent_type"):
+            return None
+        open_agents[task_id] = time.monotonic()
+        return {"type": "agent", "id": task_id, "state": "started",
+                "agent_type": event.get("subagent_type"),
+                "description": event.get("description"),
+                "prompt": event.get("prompt"),
+                "background": bool(event.get("is_backgrounded")),
+                "parent_id": event.get("parent_task_id"),
+                "engine": "claude"}
+    if subtype == "task_notification" and task_id in open_agents:
+        started = open_agents.pop(task_id)
+        status = (event.get("status") or "").lower()
+        return {"type": "agent", "id": task_id,
+                "state": "done" if status in ("completed", "success", "done") else "error",
+                "summary": event.get("summary"),
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "engine": "claude"}
+    return None
+
+
+def _with_steers(prompt: str, live: _LiveInput) -> str:
+    return "\n\n".join([prompt, *live.steered])
+
+
+def steer_live_run(cancel_key: str, text: str) -> bool:
+    """Write `text` into the in-flight run `cancel_key` names.  False
+    when that run cannot take it — not running, a harness that only
+    reads its prompt once, or a turn that has already finished."""
+    live = _live_inputs.get(cancel_key or "")
+    return bool(live and live.send(text))
+
+
 def run_claude_streamed(prompt: str, project: str, on_event,
                         allow_resume: bool = True,
                         session_key: str | None = None,
@@ -2790,7 +2914,8 @@ def run_claude_streamed(prompt: str, project: str, on_event,
     sid_file = _streamed_sid_file(session_key or project)
     sid_file.parent.mkdir(parents=True, exist_ok=True)
 
-    argv = [claude_bin, "-p", prompt,
+    argv = [claude_bin, "-p",
+            "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--verbose",  # required alongside stream-json in current CLIs
             "--dangerously-skip-permissions"]
@@ -2807,14 +2932,26 @@ def run_claude_streamed(prompt: str, project: str, on_event,
              work_dir, sid_file, resumed)
     proc = subprocess.Popen(
         argv, cwd=work_dir, env=os.environ.copy(),
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
         start_new_session=True,
     )
     global _current_proc
     _current_proc = proc
+    live_input = _LiveInput(proc)
+
+    def feed_prompt() -> None:
+        if live_input.send(prompt) and cancel_key:
+            live_input.steered.clear()
+            _live_inputs[cancel_key] = live_input
+
+    threading.Thread(target=feed_prompt, daemon=True).start()
 
     final_text_chunks: list[str] = []
+    turn_answers: list[str] = []
+    totals = _ResultTotals()
     new_sid: str | None = None
+    open_agents: dict[str, float] = {}
 
     # Compact tally so the log summary at end shows what Claude did.
     tool_calls = 0
@@ -2904,25 +3041,32 @@ def run_claude_streamed(prompt: str, project: str, on_event,
                         marker = "⚠️ error" if is_error else "ok"
                         log.info("  ← tool_result %s %s", marker, preview)
 
+            elif etype == "system":
+                agent_event = _claude_task_event(event, open_agents)
+                if agent_event:
+                    log.info("  ⇉ agent %s %s", agent_event["state"],
+                             _one_line(agent_event.get("description") or "", 120))
+                    try:
+                        on_event(agent_event)
+                    except Exception:
+                        log.exception("on_event agent raised")
+
             elif etype == "result":
+                live_input.close()
                 r = event.get("result")
                 if isinstance(r, str) and r.strip():
-                    final_text_chunks = [ r ]
+                    turn_answers.append(r)
+                    final_text_chunks = ["\n\n".join(turn_answers)]
                 usage = event.get("usage") or {}
                 if usage:
                     log.info("  · usage %s", usage)
+                totals.add(event)
                 # The CLI is the only thing that knows what the run
                 # actually cost — cache reads and writes price nothing
                 # like base input, so this is reported, never derived.
                 try:
-                    on_event({
-                        "type":        "result",
-                        "usage":       usage,
-                        "cost_usd":    event.get("total_cost_usd"),
-                        "duration_ms": event.get("duration_ms"),
-                        "num_turns":   event.get("num_turns"),
-                        "is_error":    bool(event.get("is_error")),
-                    })
+                    on_event({"type": "result", **totals.snapshot(),
+                              "is_error": bool(event.get("is_error"))})
                 except Exception:
                     log.exception("on_event result raised")
 
@@ -2933,6 +3077,9 @@ def run_claude_streamed(prompt: str, project: str, on_event,
             _kill_process_tree(proc)
     finally:
         _current_proc = None
+        live_input.close()
+        if cancel_key and _live_inputs.get(cancel_key) is live_input:
+            _live_inputs.pop(cancel_key, None)
         if proc.stdout: proc.stdout.close()
         stderr_text = ""
         if proc.stderr:
@@ -2965,7 +3112,7 @@ def run_claude_streamed(prompt: str, project: str, on_event,
                     "id and retrying fresh", proc.returncode)
         try: sid_file.unlink(missing_ok=True)
         except Exception: log.exception("clearing session id failed")
-        return run_claude_streamed(prompt, project, on_event,
+        return run_claude_streamed(_with_steers(prompt, live_input), project, on_event,
                                    allow_resume=False, session_key=session_key,
                                    work_dir_override=work_dir_override,
                                    attachments=attachments,
@@ -2992,7 +3139,7 @@ def run_claude_streamed(prompt: str, project: str, on_event,
                 and _transport_retry_once(key)):
             log.warning("claude died on a retriable transport error — resuming once")
             try:
-                return run_claude_streamed(prompt, project, on_event,
+                return run_claude_streamed(_with_steers(prompt, live_input), project, on_event,
                                            allow_resume=True, session_key=session_key,
                                            work_dir_override=work_dir_override,
                                            attachments=attachments, cancel_key=cancel_key)
@@ -3548,6 +3695,150 @@ def _opencode_shaped(event: dict):
     return out, sid, model
 
 
+SUBAGENT_TOOLS = {"task", "agent", "invoke_agent", "spawn_agent", "use_subagent"}
+
+
+def _subagent_from_tool(name: str | None, args: dict | None) -> dict | None:
+    """A tool call that spawns a sub-agent, as an `agent` start event.
+
+    Every harness but Claude reports a sub-agent only as the tool call
+    that launched it, so the run's end is the only end it gets."""
+    if (name or "").strip().lower() not in SUBAGENT_TOOLS:
+        return None
+    args = args if isinstance(args, dict) else {}
+
+    def pick(*keys):
+        for key in keys:
+            value = args.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    prompt = pick("prompt", "task", "query", "initialQuery", "message", "systemPrompt")
+    description = pick("description", "title", "name") or _one_line(prompt or name or "", 80)
+    return {"type": "agent", "state": "started",
+            "agent_type": pick("subagent_type", "subagentType", "agent_name", "agentName",
+                               "profile", "agent"),
+            "description": description, "prompt": prompt,
+            "model": pick("model"),
+            "background": bool(args.get("run_in_background") or args.get("background"))}
+
+
+def _cline_shaped(event: dict):
+    """`cline --json`.  NDJSON `{ts, type, ...}`; `run_start` names the
+    session and model, `agent_event.event` carries content blocks, and
+    `run_result` closes with usage.  The error/run_result frames were
+    captured logged out on this box; the content shapes are from the
+    CLI's source."""
+    out: list[dict] = []
+    sid = None
+    model = None
+    etype = event.get("type")
+
+    if etype == "run_start":
+        sid = event.get("sessionId")
+        model = event.get("modelId")
+    elif etype == "agent_event":
+        inner = event.get("event") if isinstance(event.get("event"), dict) else {}
+        if inner.get("type") == "content_start":
+            kind = inner.get("contentType")
+            if kind == "text" and inner.get("text"):
+                out.append({"type": "text_delta", "text": inner["text"]})
+            elif kind == "reasoning" and inner.get("reasoning"):
+                out.append({"type": "thinking", "text": inner["reasoning"]})
+            elif kind == "tool":
+                out.append({"type": "tool_use",
+                            "name": _title_tool(inner.get("toolName")),
+                            "input": inner.get("input")
+                            if isinstance(inner.get("input"), dict) else {}})
+    elif etype == "run_result":
+        usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        mapped = {
+            "input_tokens":            usage.get("inputTokens"),
+            "output_tokens":           usage.get("outputTokens"),
+            "cache_read_input_tokens": usage.get("cacheReadTokens"),
+        }
+        model = event.get("model")
+        out.append({"type": "result",
+                    "usage": {k: v for k, v in mapped.items() if v is not None},
+                    "cost_usd": usage.get("totalCost"),
+                    "is_error": event.get("finishReason") in ("error", "aborted"),
+                    "final_text": None})
+    return out, sid, model
+
+
+def _kiro_shaped(event: dict):
+    """`kiro-cli chat --output-format stream-json`.  Envelope
+    `{type, data}` with ACP-style `sessionUpdate` payloads; the event
+    names are from the binary, the layout from published samples — no
+    logged-in run on this box yet."""
+    out: list[dict] = []
+    sid = None
+    model = None
+    etype = event.get("type")
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+
+    if etype == "runStarted":
+        sid = data.get("sessionId")
+        model = data.get("model")
+    elif etype == "sessionUpdate":
+        sid = data.get("sessionId")
+        update = data.get("update") if isinstance(data.get("update"), dict) else {}
+        kind = update.get("sessionUpdate")
+        content = update.get("content") if isinstance(update.get("content"), dict) else {}
+        if kind == "agent_message_chunk" and content.get("text"):
+            out.append({"type": "text_delta", "text": content["text"]})
+        elif kind == "agent_thought_chunk" and content.get("text"):
+            out.append({"type": "thinking", "text": content["text"]})
+        elif kind == "tool_call":
+            raw = update.get("rawInput")
+            out.append({"type": "tool_use",
+                        "name": _title_tool(update.get("name") or update.get("title")),
+                        "input": raw if isinstance(raw, dict) else {}})
+    elif etype in ("runFinished", "runError"):
+        final = data.get("finalText")
+        out.append({"type": "result",
+                    "usage": {},
+                    "cost_usd": None,
+                    "is_error": etype == "runError",
+                    "final_text": final if isinstance(final, str) and final.strip() else None})
+    return out, sid, model
+
+
+def _openclaw_shaped(event: dict):
+    """`openclaw agent exec --json` prints ONE envelope when the run
+    ends — no per-tool frames, so the trail only shows the summary.
+    The failure envelope was captured on this box."""
+    out: list[dict] = []
+    if "ok" not in event and "final" not in event and "payloads" not in event:
+        return out, None, None
+    final = event.get("final")
+    if not isinstance(final, str) or not final.strip():
+        final = "\n\n".join(p.get("text") for p in (event.get("payloads") or [])
+                            if isinstance(p, dict) and isinstance(p.get("text"), str))
+    summary = event.get("toolSummary") if isinstance(event.get("toolSummary"), dict) else {}
+    for tool in (summary.get("tools") or []):
+        name = tool.get("name") if isinstance(tool, dict) else tool
+        if isinstance(name, str) and name:
+            out.append({"type": "tool_use", "name": _title_tool(name), "input": {}})
+    if final:
+        out.append({"type": "text_delta", "text": final})
+    usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+    error = event.get("error")
+    out.append({"type": "result",
+                "usage": {k: v for k, v in (("input_tokens", usage.get("input")),
+                                            ("output_tokens", usage.get("output")))
+                          if v is not None},
+                "cost_usd": event.get("costUsd"),
+                "is_error": event.get("ok") is False,
+                "final_text": None if final else (str(error) if error else None)})
+    return out, event.get("sessionId"), event.get("model")
+
+
+def _no_json(event: dict):
+    return [], None, None
+
+
 HARNESS_SPECS = {
     "gemini": {
         "bin": "gemini",
@@ -3557,7 +3848,7 @@ HARNESS_SPECS = {
         # --skip-trust is required for headless runs outside a trusted
         # folder; without it stream-json emits nothing and stderr
         # says to pass the flag.  -r resumes by session id.
-        "argv": lambda b, prompt, sid: (
+        "argv": lambda b, prompt, sid, cwd=None: (
             [b, "--skip-trust", "-y", "-p", prompt, "-o", "stream-json"]
             + (["-r", sid] if sid else [])),
     },
@@ -3571,7 +3862,7 @@ HARNESS_SPECS = {
         # --print-logs is how the model name reaches us: the JSON
         # stream omits it, and stderr's "llm runtime selected" line
         # is the only place opencode says it.
-        "argv": lambda b, prompt, sid: (
+        "argv": lambda b, prompt, sid, cwd=None: (
             [b, "run", "--format", "json", "--auto", "--print-logs"]
             + (["-s", sid] if sid else []) + [prompt]),
     },
@@ -3580,7 +3871,7 @@ HARNESS_SPECS = {
         "label": "Amp",
         "parse": _claude_shaped,
         "verified": False,
-        "argv": lambda b, prompt, sid: (
+        "argv": lambda b, prompt, sid, cwd=None: (
             ([b, "threads", "continue", sid, "-x", prompt]
              if sid else [b, "-x", prompt])
             + ["--stream-json", "--stream-json-thinking"]),
@@ -3594,16 +3885,63 @@ HARNESS_SPECS = {
         # flag, not the prompt flag — and `--resume` takes an OPTIONAL
         # value, so the prompt has to come last or it gets eaten as
         # the session id.
-        "argv": lambda b, prompt, sid: (
+        "argv": lambda b, prompt, sid, cwd=None: (
             [b, "-p", "--output-format", "stream-json", "--force"]
             + (["--resume", sid] if sid else []) + [prompt]),
+    },
+    "cline": {
+        "bin": "cline",
+        "label": "Cline",
+        "parse": _cline_shaped,
+        "verified": False,
+        # Tools auto-approve by default; -y would swap in a reduced
+        # toolset without search or spawn_agent.
+        "argv": lambda b, prompt, sid, cwd=None: (
+            [b, "--json"] + (["-c", cwd] if cwd else [])
+            + (["--id", sid] if sid else []) + [prompt]),
+    },
+    "kiro": {
+        "bin": "kiro-cli",
+        "label": "Kiro CLI",
+        "parse": _kiro_shaped,
+        "verified": False,
+        # Logged out, `chat` starts a device-code login and waits
+        # forever instead of failing.
+        "preflight": ["whoami", "--format", "json"],
+        "argv": lambda b, prompt, sid, cwd=None: (
+            [b, "chat", "--no-interactive", "--trust-all-tools",
+             "--output-format", "stream-json"]
+            + (["--resume-id", sid] if sid else []) + [prompt]),
+    },
+    "devin": {
+        "bin": "devin",
+        "label": "Devin CLI",
+        "parse": _no_json,
+        "plain": True,
+        "verified": False,
+        # `auth status` exits 0 logged out; the text is the signal.
+        "preflight": ["auth", "status"],
+        "argv": lambda b, prompt, sid, cwd=None: (
+            [b, "--permission-mode", "dangerous",
+             "--respect-workspace-trust", "false"]
+            + (["-r", sid] if sid else []) + ["-p", prompt]),
+    },
+    "openclaw": {
+        "bin": "openclaw",
+        "label": "OpenClaw",
+        "parse": _openclaw_shaped,
+        "verified": False,
+        "argv": lambda b, prompt, sid, cwd=None: (
+            [b, "agent", "--local", "--session-id", sid, "-m", prompt, "--json"]
+            if sid else
+            [b, "agent", "exec", prompt, "--json"] + (["--cwd", cwd] if cwd else [])),
     },
     "copilot_cli": {
         "bin": "copilot",
         "label": "GitHub Copilot CLI",
         "parse": _copilot_shaped,
         "verified": True,
-        "argv": lambda b, prompt, sid: (
+        "argv": lambda b, prompt, sid, cwd=None: (
             [b, "-p", prompt, "--allow-all-tools",
              "--output-format", "json", "--stream", "on"]
             + (["--resume", sid] if sid else [])),
@@ -3650,7 +3988,12 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
             stored_sid = ""
     resumed = bool(allow_resume and stored_sid)
 
-    argv = spec["argv"](binpath, prompt, stored_sid if resumed else None)
+    if spec.get("preflight"):
+        ready, problem = _harness_health(binpath, spec["preflight"])
+        if not ready:
+            raise RuntimeError(f"{spec['label']} cannot run a turn: {problem or 'not logged in'}")
+
+    argv = spec["argv"](binpath, prompt, stored_sid if resumed else None, work_dir)
     extra = attachment_cli_flags(engine, attachments) + model_cli_flags(engine, _agent_model)
     if extra:
         # Prompt is last for cursor; for the others options can sit
@@ -3682,7 +4025,7 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
     final_text_chunks: list[str] = []
     narration: list[str] = []
     new_sid: str | None = None
-    tool_calls = text_chars = thinking_chars = 0
+    tool_calls = text_chars = thinking_chars = subagents = 0
     stalled_windows = 0
     run_usage: dict = {}
     run_cost: float | None = None
@@ -3708,6 +4051,15 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
                 continue
             stalled_windows = 0
             line = raw.strip()
+            if spec.get("plain"):
+                final_text_chunks.append(raw.rstrip("\n") + "\n")
+                text_chars += len(raw)
+                if line:
+                    try:
+                        on_event({"type": "text_delta", "text": line})
+                    except Exception:
+                        log.exception("on_event text raised")
+                continue
             if not line:
                 continue
             try:
@@ -3743,6 +4095,15 @@ def run_harness_streamed(engine: str, prompt: str, project: str, on_event,
                         final_text_chunks = []
                     log.info("  → tool_use %s(%s)", out["name"],
                              _compact_tool_args(out.get("input") or {}))
+                    spawned = _subagent_from_tool(out.get("name"), out.get("input"))
+                    if spawned:
+                        subagents += 1
+                        spawned["id"] = f"{engine}-{subagents}"
+                        spawned["engine"] = engine
+                        try:
+                            on_event(spawned)
+                        except Exception:
+                            log.exception("on_event agent raised")
                 elif etype == "text_delta":
                     text_chars += len(out["text"])
                     final_text_chunks.append(out["text"])
@@ -4999,6 +5360,52 @@ def promote_queued(message_hashid: str) -> bool:
     return bool(match)
 
 
+def queued_room_payload(message_hashid: str) -> dict | None:
+    """The queued room task for `message_hashid`, left in place."""
+    if _work_queue is None or not message_hashid:
+        return None
+    for kind, payload in list(getattr(_work_queue, "_queue", [])):
+        if kind == "room" and (payload.get("message") or {}).get("hashid") == message_hashid:
+            return payload
+    return None
+
+
+STEER_PATTERN = re.compile(r"^\s*(?:/[a-z0-9][a-z0-9_-]*\s+)?/steer(?:\s+|$)", re.I)
+
+
+def _strip_steer(payload: dict) -> None:
+    msg = payload.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("body"), str):
+        msg["body"] = STEER_PATTERN.sub("", msg["body"], count=1).strip()
+
+
+async def steer_room_message(ws, payload: dict) -> bool:
+    """Send a room message into the run already working in that room.
+
+    Only a harness that keeps its input open mid-turn can take it, and
+    only while that run is still going; otherwise the caller queues
+    the message as before."""
+    room_id = (payload.get("room") or {}).get("hashid")
+    msg = payload.get("message") or {}
+    target = _room_inflight.get(room_id or "")
+    if not target or DISPATCH_ENGINE not in STEERABLE_ENGINES:
+        return False
+    body = (msg.get("body") or "").strip()
+    if not body:
+        return False
+    sender = (payload.get("sender") or {}).get("name") or "Someone in the room"
+    text = (f"{sender} added this in the room while you were working — "
+            f"take it into account in the task you are doing now:\n\n{body}")
+    if not await asyncio.to_thread(steer_live_run, target, text):
+        return False
+    log.info("steered message=%s into run=%s room=%s", msg.get("hashid"), target, room_id)
+    with contextlib.suppress(Exception):
+        await room_status(ws, room_id, msg.get("hashid"), "steered")
+    await _emit_room_progress(ws, room_id, target, "tool",
+                              f"↪ {sender}: {_one_line(body, ROOM_PROGRESS_TEXT_MAX)}")
+    return True
+
+
 def drop_queued(message_hashid: str) -> bool:
     """Remove one queued room task entirely. The room message stays;
     the agent simply never picks it up. Distinct from pause (which
@@ -5646,7 +6053,7 @@ async def _emit_room_run(ws, room_id: str, reply_to: str | None,
 
 
 async def _emit_room_progress(ws, room_id: str, reply_to: str | None,
-                              kind: str, text: str) -> None:
+                              kind: str, text: str, agent: dict | None = None) -> None:
     """One `room_progress` action — Rails broadcasts it on the room's
     channel and keeps it in Redis for three days, so a refresh finds
     the trail but nothing lands in the database.  Non-fatal on error:
@@ -5658,9 +6065,50 @@ async def _emit_room_progress(ws, room_id: str, reply_to: str | None,
             "reply_to": reply_to,
             "kind":     kind,
             "text":     text,
+            **({"agent": agent} if agent else {}),
         })
     except Exception:
         log.exception("emit_room_progress failed")
+
+
+AGENT_PROMPT_MAX = 4000
+AGENT_SUMMARY_MAX = 500
+AGENT_STATES = ("started", "done", "error")
+
+
+def _agent_progress_hash(event: dict) -> dict | None:
+    """A harness's sub-agent event in the shape Rails stores and the
+    room renders — `agent_type` becomes `type`, text fields capped."""
+    agent_id = str(event.get("id") or "").strip()
+    state = event.get("state")
+    if not agent_id or state not in AGENT_STATES:
+        return None
+
+    def capped(key: str, limit: int) -> str | None:
+        value = event.get(key)
+        return value.strip()[:limit] if isinstance(value, str) and value.strip() else None
+
+    duration = event.get("duration_ms")
+    return {
+        "id": agent_id[:80],
+        "type": capped("agent_type", 80),
+        "description": capped("description", 200),
+        "prompt": capped("prompt", AGENT_PROMPT_MAX),
+        "state": state,
+        "model": capped("model", 80),
+        "background": bool(event.get("background")),
+        "summary": capped("summary", AGENT_SUMMARY_MAX),
+        "duration_ms": int(duration) if isinstance(duration, (int, float)) else None,
+        "engine": capped("engine", 20) or DISPATCH_ENGINE,
+        "parent_id": capped("parent_id", 80),
+    }
+
+
+def _agent_progress_line(agent: dict) -> str:
+    label = agent.get("type") or "Agent"
+    what = agent.get("description") or _one_line(agent.get("prompt") or "", 80)
+    verb = {"started": "started", "done": "finished", "error": "failed"}[agent["state"]]
+    return f"{label} {verb} — {what}" if what else f"{label} {verb}"
 
 
 async def _emit_progress(ws, chat_id: str, name: str, input_dict: dict | None) -> None:
@@ -6093,9 +6541,31 @@ async def handle_room_message(ws, payload: dict) -> None:
         send_line(kind, text)
 
     trail = ProgressTrail(emit, ROOM_PROGRESS_TEXT_MAX)
+    live_agents: dict[str, dict] = {}
+
+    def emit_agent(event: dict) -> None:
+        agent = _agent_progress_hash(event)
+        if not agent:
+            return
+        if agent["state"] == "started":
+            live_agents[agent["id"]] = agent
+            text = _agent_progress_line(agent)
+        else:
+            started = live_agents.pop(agent["id"], None) or {}
+            text = _agent_progress_line({**started, **{k: v for k, v in agent.items()
+                                                       if v is not None}})
+            agent = {k: v for k, v in agent.items() if v is not None and k != "background"}
+        if len(steps) < ROOM_RUN_STEPS_MAX:
+            steps.append({"kind": "agent", "text": text, "agent": agent})
+        fut = asyncio.run_coroutine_threadsafe(
+            _emit_room_progress(ws, room_id, msg.get("hashid"), "agent", text, agent=agent), loop)
+        fut.add_done_callback(_log_future_error)
 
     def on_stream_event(event: dict) -> None:
         etype = event.get("type")
+        if etype == "agent":
+            emit_agent(event)
+            return
         if etype == "model":
             fut = asyncio.run_coroutine_threadsafe(
                 room_status(ws, room_id, msg.get("hashid"), "working",
@@ -6112,9 +6582,21 @@ async def handle_room_message(ws, payload: dict) -> None:
         session_key = (
             f"fast_{msg.get('hashid')}" if fast else _room_session_key(room_id)
         )
-        raw = await asyncio.to_thread(
-            run_agent_streamed, prompt, PROJECT, on_stream_event,
-            allow_resume, session_key, None, attachments, msg.get("hashid"))
+        if not fast:
+            _room_inflight[room_id] = msg.get("hashid") or ""
+        crashed = True
+        try:
+            raw = await asyncio.to_thread(
+                run_agent_streamed, prompt, PROJECT, on_stream_event,
+                allow_resume, session_key, None, attachments, msg.get("hashid"))
+            crashed = False
+        finally:
+            if _room_inflight.get(room_id) == msg.get("hashid"):
+                _room_inflight.pop(room_id, None)
+            failed = crashed or bool(result.get("is_error")) or was_cancelled(msg.get("hashid") or "")
+            for agent_id in list(live_agents):
+                emit_agent({"type": "agent", "id": agent_id,
+                            "state": "error" if failed else "done"})
     except subprocess.TimeoutExpired:
         await room_reply(ws, room_id, "⚠️ I timed out after 30 minutes.", msg.get("hashid"))
         result["is_error"] = True
@@ -6300,7 +6782,20 @@ async def process_stream(link: CableLink, ws) -> None:
             elif msg.get("type") == "room.message":
                 if claim_pending_login(link, msg):
                     continue
-                if msg.get("fast_lane") and _current_work is not None:
+                if msg.get("steer") and STEER_PATTERN.sub("", (msg.get("message") or {}).get("body") or "", count=1).strip():
+                    _strip_steer(msg)
+                    ours = _is_ours(msg)
+                    if ours and await steer_room_message(link, msg):
+                        continue
+                    msg["fast_lane"] = None
+                    await _work_queue.put(("room", msg))
+                    promote_queued((msg.get("message") or {}).get("hashid") or "")
+                    if not ours:
+                        continue
+                    with contextlib.suppress(Exception):
+                        await room_status(link, (msg.get("room") or {}).get("hashid"),
+                                          (msg.get("message") or {}).get("hashid"), "queued")
+                elif msg.get("fast_lane") and _current_work is not None:
                     # Main lane is busy — answer in parallel on a
                     # fresh non-resuming session so a question does
                     # not wait behind a build. Same checkout, so this
@@ -6326,6 +6821,18 @@ async def process_stream(link: CableLink, ws) -> None:
                 mid = (msg.get("message") or {}).get("hashid")
                 moved = promote_queued(mid or "")
                 log.info("room work promoted message=%s moved=%s", mid, moved)
+            elif msg.get("type") == "room.steer":
+                mid = (msg.get("message") or {}).get("hashid") or ""
+                queued = queued_room_payload(mid)
+                if queued is not None and _is_ours(queued) and drop_queued(mid):
+                    if (msg.get("message") or {}).get("body"):
+                        queued.setdefault("message", {})["body"] = msg["message"]["body"]
+                    _strip_steer(queued)
+                    steered = await steer_room_message(link, queued)
+                    if not steered:
+                        await _work_queue.put(("room", queued))
+                        promote_queued(mid)
+                    log.info("room work steer message=%s steered=%s", mid, steered)
             elif msg.get("type") == "room.drop":
                 mid = (msg.get("message") or {}).get("hashid")
                 removed = drop_queued(mid or "")
