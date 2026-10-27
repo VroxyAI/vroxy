@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Headless browser for dispatch agents — runs with the dispatch venv's
+# Python so playwright (installed there) is importable. Symlink this
+# into ~/.local/bin so any harness can call `vroxy-browser`.
+set -euo pipefail
+REAL="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$REAL")" && pwd)"
+VENV_PY="$SCRIPT_DIR/../.venv/bin/python"
+if [[ -x "$VENV_PY" ]]; then
+  exec "$VENV_PY" "$SCRIPT_DIR/../vroxy_browser.py" "$@"
+fi
+exec python3 "$SCRIPT_DIR/../vroxy_browser.py" "$@"

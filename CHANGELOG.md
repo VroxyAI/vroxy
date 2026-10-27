@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.53.0
+
+### Added
+- `vroxy-browser` (`bin/vroxy-browser` → `vroxy_browser.py`): a headless
+  Playwright browser any harness can shell out to, so an agent can
+  actually LOOK at a page — `shot <url>` (full-page screenshot),
+  `text <url>` (rendered text), and `login <magic-link>` (clicks the
+  one-time admin login link and persists the session under
+  `~/.cache/vroxy-browser`, 0700). The `browser` skill documents the
+  magic-link flow and the "look, don't act" boundary.
+
 ## 0.52.0
 
 ### Added
