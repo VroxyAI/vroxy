@@ -1,13 +1,35 @@
 ---
 name: browser
-description: See a web page with a headless browser — screenshot it or read its rendered text — instead of asking the operator to describe what's broken. Use when a message says something "looks broken", a page renders wrong, or you need to actually see a UI. Sign-in rides a single-use magic link the operator issues. Applies to every harness.
+description: Use a real browser — the `vroxy-browser` MCP tools (navigate, click, type, fill forms, read the page, console, screenshots) or the `vroxy-browser` CLI for a one-shot screenshot/text — instead of asking the operator to describe what's broken. Use when a page "looks broken", a UI change needs checking, a flow needs clicking through, or you need to actually see a UI. Sign-in rides a single-use magic link the operator issues. Applies to every harness.
 user-invocable: true
 ---
 
-Look at a page with the box's headless browser
-(`~/.local/bin/vroxy-browser`, Playwright + Chromium, no window).
+Two ways to use the box's headless Chromium (Playwright, no window).
 
-## Commands
+## MCP tools — drive the page (preferred)
+
+Every harness on the box has the **`vroxy-browser`** MCP server
+registered (`bin/install-browser-mcp` in vroxy_dispatch did it). Its
+tools appear as `browser_*` — in some harnesses prefixed with the
+server name (`vroxy-browser_browser_click`, `mcp__vroxy-browser__…`):
+
+- `browser_navigate` / `browser_navigate_back` / `browser_tabs`
+- `browser_snapshot` — the page as an accessibility tree with `ref`s;
+  read it before acting, then pass a ref as `target` to
+- `browser_click`, `browser_type`, `browser_fill_form`,
+  `browser_select_option`, `browser_press_key`, `browser_hover`
+- `browser_console_messages`, `browser_network_requests` — what broke
+- `browser_take_screenshot`, `browser_wait_for`, `browser_evaluate`
+
+Each harness run gets its own in-memory profile: concurrent agents never
+share cookies, and nothing persists after the run. A run starts signed
+OUT; to sign in, navigate to a magic link the operator pasted (below).
+Snapshots and screenshots land in `~/.cache/vroxy-browser-mcp`.
+
+## CLI — one-shot look
+
+`~/.local/bin/vroxy-browser`, for a quick screenshot or text dump from
+a shell:
 
 ```bash
 vroxy-browser shot <url> [--out /tmp/x.png]   # full-page screenshot
@@ -47,8 +69,10 @@ in the profile so the next `shot`/`text` is signed in.
 
 - Do not mint login links yourself, and do not store one in a file or
   past a screenshot of it anywhere. A link is the person's password.
-- Do not use the browser session to act *as* the person (post, change,
-  approve). It is for LOOKING — read screenshots and text, then make
-  the change through the normal write paths.
+- Clicking through a UI to test it is the point — local dev stacks,
+  your own test accounts, public pages. But do not use a session signed
+  in with someone's magic link to act *as* them (post, change, approve,
+  pay). With their session, LOOK; make the change through the normal
+  write paths.
 - Do not leave the profile's cookies readable by others; the tool
   already chmods `~/.cache/vroxy-browser` to 0700, keep it that way.

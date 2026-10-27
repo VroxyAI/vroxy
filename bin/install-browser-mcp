@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+REAL="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$REAL")/.." && pwd)"
+exec python3 "$ROOT/install_browser_mcp.py" "$@"

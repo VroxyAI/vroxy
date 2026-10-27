@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.54.0
+
+### Added
+- `vroxy-browser` MCP server: Playwright MCP (navigate, click, type, fill
+  forms, snapshot, console, network, screenshots) on headless Chromium,
+  registered with every harness on the box by `bin/install-browser-mcp` —
+  claude, codex, gemini, amp, copilot, devin and openclaw through their own
+  `mcp add`; cursor, opencode, cline and kiro by editing their config file.
+  Each run gets an isolated in-memory profile and starts signed out.
+  Verified live: claude, opencode, codex, cursor and copilot each opened a
+  page, clicked a button and read the result through it.
+
+### Fixed
+- `vroxy_cli` carries the agent version again (0.53.0 left it at 0.52.0).
+
 ## 0.53.0
 
 ### Added

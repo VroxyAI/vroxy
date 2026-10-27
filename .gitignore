@@ -11,3 +11,4 @@ dist/
 build/
 *.egg-info/
 .venv-cli/
+browser_mcp/node_modules/

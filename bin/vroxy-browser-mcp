@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+REAL="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$REAL")/.." && pwd)"
+CLI="$ROOT/browser_mcp/node_modules/@playwright/mcp/cli.js"
+
+if [[ ! -f "$CLI" ]]; then
+  echo "vroxy-browser-mcp: not installed — run $ROOT/bin/install-browser-mcp" >&2
+  exit 69
+fi
+
+pick_node() {
+  if [[ -n "${VROXY_NODE:-}" && -x "$VROXY_NODE" ]]; then echo "$VROXY_NODE"; return; fi
+  local newest
+  newest="$(ls -d "$HOME"/.nvm/versions/node/v*/bin/node 2>/dev/null | sort -V | tail -1)"
+  if [[ -n "$newest" ]]; then echo "$newest"; return; fi
+  command -v node
+}
+
+NODE="$(pick_node)"
+OUT="${VROXY_BROWSER_MCP_OUT:-${XDG_CACHE_HOME:-$HOME/.cache}/vroxy-browser-mcp}"
+mkdir -p "$OUT"
+chmod 700 "$OUT"
+
+exec "$NODE" "$CLI" \
+  --headless \
+  --browser "${VROXY_BROWSER_ENGINE:-chromium}" \
+  --isolated \
+  --viewport-size "${VROXY_BROWSER_VIEWPORT:-1280x900}" \
+  --output-dir "$OUT" \
+  --file-paths absolute \
+  --idle-timeout "${VROXY_BROWSER_IDLE_MS:-600000}" \
+  "$@"

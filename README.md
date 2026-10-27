@@ -578,6 +578,38 @@ What differs, deliberately:
   bypass every shell call returns "Operation not permitted" and the
   model reports failure instead of working.
 
+## A browser for every agent
+
+`vroxy-browser` is a Playwright MCP server (`@playwright/mcp`, pinned in
+`browser_mcp/package.json`) registered with every harness on the box, so
+any agent — in a dispatch run or a terminal session — can navigate,
+click, type, fill forms, read the accessibility snapshot, and check the
+console and network of a real headless Chromium.
+
+```bash
+bin/install-browser-mcp              # npm ci, Chrome for Testing, link, register everywhere
+bin/install-browser-mcp --register   # re-register only (after installing a new harness)
+bin/install-browser-mcp --dry-run    # show what would change
+```
+
+Registration uses each CLI's own `mcp add` where it has a
+non-interactive one (claude, codex, gemini, amp, copilot, devin,
+openclaw) and edits the config file where it doesn't (cursor
+`~/.cursor/mcp.json`, opencode `~/.config/opencode/opencode.json`, cline
+`~/.cline/data/settings/cline_mcp_settings.json`, kiro
+`~/.kiro/settings/mcp.json` — its `mcp add` refuses while logged out).
+A file it edits is backed up beside itself as `*.bak-vroxy-browser`.
+
+`bin/vroxy-browser-mcp` runs it under nvm's newest node (the units' PATH
+has `/usr/bin/node` 18 first), headless, with `--isolated`: every harness
+run gets its own in-memory profile, so the units running side by side
+never fight over a profile lock or see each other's cookies, and a run
+starts signed out. Output (snapshots, screenshots) goes to
+`~/.cache/vroxy-browser-mcp` (0700); an idle browser closes after
+`VROXY_BROWSER_IDLE_MS` (10 min). The one-shot `vroxy-browser shot|text`
+CLI stays for a quick look from a shell. Usage rules are in the `browser`
+skill.
+
 ## Harness inventory
 
 Every heartbeat carries `meta.harnesses` — which coding CLIs this box

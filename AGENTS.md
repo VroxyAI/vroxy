@@ -59,6 +59,7 @@ stream — verify against a live run before flipping
 | --- | --- |
 | Safe restart | `restart_dispatch` skill |
 | Flip harness | `/harness <engine>` in a dispatch room (persists under `~/.cache/vroxy-dispatch/engine-<unit>`, no root, no restart) |
+| Browser for an agent | `vroxy-browser` MCP tools (`browser_navigate`, `browser_click`, `browser_snapshot`, …) in every harness; `bin/install-browser-mcp` installs/re-registers. Rules in the `browser` skill |
 | Self-update after shipping | automatic via `restart_if_self_updated` once the turn ends |
 | Pull a release | "Update now" at `/w/…/dispatch` (matched on `install_id`), or `DISPATCH_AUTO_UPDATE=1` for patch/minor (default `0`) — ff-only to the pinned sha with hooks/replace objects disabled, deps into a staging venv, refused on a dirty or diverged checkout. README "Updating from a release" |
 | Install / pull all units | `./install.sh --update` |

@@ -1,0 +1,9 @@
+{
+  "name": "vroxy-browser-mcp",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Playwright MCP server pinned for every agent harness on the box",
+  "dependencies": {
+    "@playwright/mcp": "0.0.83"
+  }
+}
