@@ -23,7 +23,7 @@
 # (or running as root, e.g. cloud-init) keeps the machine-wide system unit.
 #
 # --unattended reads VROXY_TOKEN (required), VROXY_HOST, CODE_ROOT,
-# PROJECT, VROXY_AGENT_NAME, VROXY_INSTANCE_ID and optional DISPATCH_ENGINE
+# PROJECT, PROJECTS, VROXY_AGENT_NAME, VROXY_INSTANCE_ID and optional DISPATCH_ENGINE
 # (seeds ~/.cache/vroxy-dispatch/engine-<id>; /harness owns it after that).
 # It exists for cloud-init, which cannot answer a prompt.
 #
@@ -515,6 +515,14 @@ write_env_file() {
   local perm_mode="0640"
   [[ "$SYSTEM_INSTALL" == "1" ]] || perm_mode="0600"
 
+  # Carried through from the environment on --unattended, and left as
+  # a commented hint otherwise: an operator who wants one agent across
+  # several checkouts should not have to find the variable name.
+  local projects_line="# PROJECTS="
+  if [[ -n "${PROJECTS:-}" ]]; then
+    projects_line="PROJECTS=${PROJECTS}"
+  fi
+
   mkdir -p "$ENV_DIR"
   tee "$env_file" >/dev/null <<ENVFILE
 # vroxy_dispatch — ${name}
@@ -531,6 +539,10 @@ LOG_LEVEL=INFO
 PYTHONUNBUFFERED=1
 PATH=${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
 # DISPATCH_AUTO_UPDATE=0
+# Checkouts a room may switch into with /project, under CODE_ROOT.
+# Unset keeps this agent on PROJECT alone, which is the old
+# behaviour.  \`*\` means every checkout under CODE_ROOT.
+${projects_line}
 ENVFILE
   if [[ "$SYSTEM_INSTALL" == "1" ]]; then
     chown root:"$RUN_GROUP" "$env_file"
@@ -755,7 +767,7 @@ doctor() {
 
   say "Checking ${#ids[@]} instance(s)…"
   for id in "${ids[@]}"; do
-    local contents token install_id agent_name unit code_root project
+    local contents token install_id agent_name unit code_root project projects
     contents="$(read_env "$id")"
     token="$(env_field "$contents" VROXY_SERVICE_TOKEN)"
     install_id="$(env_field "$contents" VROXY_INSTALL_ID)"
@@ -763,6 +775,7 @@ doctor() {
     unit="$(env_field "$contents" VROXY_DISPATCH_UNIT)"
     code_root="$(env_field "$contents" CODE_ROOT)"
     project="$(env_field "$contents" PROJECT)"
+    projects="$(env_field "$contents" PROJECTS)"
 
     say ""
     say "${id} — agent \"${agent_name:-?}\""
@@ -816,6 +829,28 @@ doctor() {
       warn "  !! CODE_ROOT/PROJECT doesn't resolve: ${code_root}/${project} is not a directory"
       warn "     fix: CODE_ROOT is the PARENT folder and PROJECT the repo name under it, or point CODE_ROOT straight at the repo"
       problems=$((problems + 1))
+    fi
+
+    # A typo in PROJECTS silently shortens the /project menu, which
+    # reads in the room as "that checkout isn't allowed" rather than
+    # "you misspelled it in the env file".
+    if [[ -n "$projects" && "$projects" != "*" && "$projects" != "all" ]]; then
+      local base name bad=0
+      base="$code_root"
+      repo_resolves "$code_root" "$project" || ! is_git_repo "$code_root" ||
+        base="$(dirname "$code_root")"
+      for name in ${projects//,/ }; do
+        if ! is_git_repo "${base}/${name}"; then
+          warn "  !! PROJECTS entry \"${name}\" is not a checkout at ${base}/${name} — /project will not offer it"
+          bad=$((bad + 1))
+        fi
+      done
+      if (( bad )); then
+        warn "     fix: names are folders under ${base}, comma or space separated"
+        problems=$((problems + 1))
+      else
+        say "  ok  /project can switch between: ${projects//,/ }"
+      fi
     fi
 
     if ctl is-active --quiet "vroxy-dispatch@${id}.service" 2>/dev/null; then

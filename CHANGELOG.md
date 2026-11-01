@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.55.0
+
+### Added
+- A room can pick which checkout it works in: `/project <name>`
+  (aliases `/cd`, `/repo`), bare for the menu with each candidate's
+  current branch. One agent already answered many rooms; the checkout
+  was the last thing still global to the process, so a box that keeps
+  a checkout per branch needed one agent per checkout. Now it needs
+  one.
+- `PROJECTS` in the unit env file is the allowlist of checkouts under
+  `CODE_ROOT` a room may reach — opt-in, so an agent with it unset
+  stays on `PROJECT` alone exactly as before. `PROJECTS=*` allows
+  every checkout under `CODE_ROOT`. Neither a room nor the server can
+  name anything outside it, and revoking an entry releases the rooms
+  still pinned to it.
+- A run resolves its checkout from the routed frame's `agent.project`
+  (that run), then the room's `/project` binding (until changed), then
+  `PROJECT`. The frame field is the hook for setting this from the web
+  against a `DispatchTarget`; nothing sends it yet, so it is inert
+  until the server does.
+- Each `(room, checkout)` pair keeps its own harness session, so
+  moving a room between trees doesn't blend their context. A full
+  `--reset` now clears room sessions for every allowlisted checkout,
+  not just the pinned one.
+- The heartbeat reports `projects` and `code_root_base` when more than
+  one checkout is allowed, so a workspace can offer the list.
+  `room_run` reports the checkout the run actually happened in.
+- `./install.sh --doctor` names a `PROJECTS` entry that isn't a
+  checkout — a typo there would otherwise just silently shorten the
+  `/project` menu. `--unattended` carries `PROJECTS` through.
+
 ## 0.54.0
 
 ### Added

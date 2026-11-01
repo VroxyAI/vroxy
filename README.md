@@ -232,6 +232,65 @@ Rules that hold in both modes:
 room's Claude session and starts fresh. It answers immediately
 without spending a Claude run.
 
+### A checkout per room
+
+One agent answers many rooms, and by default every one of them runs
+in `CODE_ROOT/PROJECT`. On a box that keeps a checkout per branch,
+that meant one agent per checkout. A room can instead pick which
+checkout it works in:
+
+```
+/project                 what this room works in, and what else it could
+/project brev81          this room now runs in CODE_ROOT/brev81
+```
+
+Aliases: `/cd`, `/repo`. Unlike `/harness`, a bare checkout name is
+**not** a switch — saying the word `brev81` in a room would otherwise
+move it.
+
+**It is opt-in per agent.** `PROJECTS` in the unit env file is the
+allowlist, and nothing outside it is reachable:
+
+```ini
+CODE_ROOT=/home/you/code/brevitas
+PROJECT=brevitas
+PROJECTS=brevitas,brev72true,brev734,brev81
+```
+
+Unset `PROJECTS` keeps the agent on `PROJECT` alone — exactly how
+every install behaved before. `PROJECTS=*` allows every git checkout
+directly under `CODE_ROOT`. Commas or spaces both separate. A name
+that isn't a checkout is dropped with a warning at startup, and
+`./install.sh --doctor` names it.
+
+How a run resolves its checkout, widest authority first:
+
+| Source | Set by | Scope |
+| --- | --- | --- |
+| `agent.project` on the routed frame | the workspace (web) | that one run |
+| the room's `/project` binding | anyone in the room | until changed |
+| `PROJECT` | the unit env file | the agent |
+
+Every layer is filtered through `PROJECTS`: the env file is the
+operator's boundary, and neither a room nor the server can step
+outside it. Pulling a name back out of `PROJECTS` releases the rooms
+still pinned to it rather than leaving them on a revoked tree.
+
+Two details worth knowing:
+
+- **Each `(room, checkout)` pair keeps its own harness session**, so
+  moving a room to `brev81` and back doesn't blend two trees'
+  context. `/reset` clears the session for the checkout the room is
+  on; `vroxy dispatch --reset` clears all of them.
+- The binding lives in `~/.cache/vroxy-dispatch/project-<unit>-<room>`
+  — the dispatch user's own state, so switching needs no root and no
+  restart, same as `/harness`.
+
+The heartbeat reports `projects` and `code_root_base` when more than
+one checkout is allowed, so a workspace can offer the list instead of
+making someone type `/project` blind. `DispatchRun` records the
+checkout each run actually happened in.
+
 ### Asking the room a question
 
 When Claude needs a decision it ends its reply with a fenced `ask`
@@ -380,6 +439,7 @@ attached to a User instead of a Tenant.
 | `VROXY_SERVICE_TOKEN` | *(required)*                        |
 | `CODE_ROOT`             | parent of this checkout             |
 | `PROJECT`               | `vroxy_web`                       |
+| `PROJECTS`              | *(unset — the agent stays on `PROJECT`; see "A checkout per room")* |
 | `DISPATCH_TELEMETRY`    | `1` (set `0` to stop reporting the box) |
 | `DISPATCH_AUTO_UPDATE`  | `0` (set `1` to apply patch/minor releases on its own) |
 | `CLAUDE_CHAT_BIN`       | `./bin/claude-chat`                 |
@@ -962,6 +1022,12 @@ partial cases), `parse_proposal` (plain / inline_ship /
 pull_request / malformed JSON) and `parse_room_ask` +
 `ask_fallback` (valid / malformed / absent / 30 options / caps /
 prose that already restates the question).
+
+`tests/test_room_projects.py` covers the per-room checkout: the
+`PROJECTS` allowlist (unset / `*` / typos / non-checkouts), the
+resolution order, refusing a path traversal or a revoked project,
+per-`(room, checkout)` session isolation, and what the heartbeat
+reports.
 
 ## See also
 

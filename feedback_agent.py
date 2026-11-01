@@ -103,6 +103,15 @@ def resolve_project(code_root: Path, project: str) -> tuple[Path, str]:
 
 
 CODE_ROOT, PROJECT = resolve_project(CODE_ROOT, PROJECT)
+# Checkouts a room is allowed to switch to with `/project`, as names
+# under CODE_ROOT.  Opt-in: unset means this agent stays pinned to
+# PROJECT forever, which is how every install behaved before rooms
+# could pick.  Letting a room redirect the agent into a sibling repo
+# widens what a room can touch, so the operator says which ones —
+# `PROJECTS=a,b,c`, or `PROJECTS=*` for every checkout under
+# CODE_ROOT.
+PROJECTS_RAW    = os.environ.get("PROJECTS", "").strip()
+PROJECT_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 CLAUDE_CHAT_BIN = os.environ.get(
     "CLAUDE_CHAT_BIN",
     str(Path(__file__).resolve().parent / "bin" / "claude-chat"),
@@ -165,7 +174,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.54.0"
+AGENT_VERSION      = "vroxy_dispatch 0.55.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -953,6 +962,14 @@ async def heartbeat(ws) -> None:
     meta = {"status": _current_status, "project": PROJECT,
             "engine": DISPATCH_ENGINE,
             "code_root": str(CODE_ROOT / PROJECT)}
+    # What a room could be pointed at, so the web can offer the list
+    # instead of making someone type `/project` blind.  Only when the
+    # operator allowlisted more than the pinned one — a single-project
+    # agent has nothing to choose.
+    allowed = allowed_projects()
+    if len(allowed) > 1:
+        meta["projects"] = allowed
+        meta["code_root_base"] = str(CODE_ROOT)
     if TELEMETRY_ENABLED:
         # Probing blocks on subprocesses / HTTP, so it never runs on
         # the event loop — a slow `--version` or quota call would
@@ -1445,7 +1462,8 @@ def model_cli_flags(engine: str, model: str | None) -> list[str]:
     return []
 
 
-def build_room_prompt(payload: dict, attachments: list[dict] | None = None) -> str:
+def build_room_prompt(payload: dict, attachments: list[dict] | None = None,
+                      project: str | None = None) -> str:
     """Compose the prompt for an `AdminFeedbackChannel` `room.message`
     event.  The envelope carries the room, the triggering message, and
     up to ROOM_HISTORY_LIMIT prior turns (oldest first) so a Claude
@@ -1463,7 +1481,8 @@ def build_room_prompt(payload: dict, attachments: list[dict] | None = None) -> s
     lines.append(f"## Room: #{name}")
     if topic:
         lines.append(f"Topic: {topic}")
-    lines.append(f"Repo: {PROJECT} (you are running inside its checkout)")
+    lines.append(f"Repo: {project or PROJECT} "
+                 f"(you are running inside its checkout)")
     lines.append("")
 
     if history:
@@ -1631,10 +1650,12 @@ def _streamed_sid_file(project: str) -> Path:
     return SID_DIR / f"feedback_stream_{project}"
 
 
-def _room_session_key(room_hashid: str) -> str:
+def _room_session_key(room_hashid: str, project: str | None = None) -> str:
     """Each room gets its own Claude session so two rooms (and the
-    feedback queue) never inherit each other's context."""
-    return f"room_{room_hashid}_{PROJECT}"
+    feedback queue) never inherit each other's context.  A room that
+    moved checkout with `/project` gets one per checkout for the same
+    reason — two trees are two conversations."""
+    return f"room_{room_hashid}_{project or PROJECT}"
 
 
 def _session_meta_file(sid_file: Path) -> Path:
@@ -1737,7 +1758,12 @@ def clear_sessions(keys: list[str] | None = None) -> list[str]:
         targets = [SID_DIR / f"feedback_{PROJECT}"]
         for prefix in prefixes:
             targets.append(_streamed_sid_file(f"{prefix}{PROJECT}"))
-            targets += sorted(SID_DIR.glob(f"feedback_stream_{prefix}room_*_{PROJECT}"))
+            # Every allowlisted checkout, not just the pinned one: a
+            # room that moved with `/project` has its session keyed
+            # under that project and a full reset means all of them.
+            for proj in allowed_projects():
+                targets += sorted(SID_DIR.glob(
+                    f"feedback_stream_{prefix}room_*_{proj}"))
 
     removed = []
     for path in targets:
@@ -1811,6 +1837,29 @@ def engine_command(body: str) -> tuple[str, str | None] | None:
     return None
 
 
+PROJECT_COMMANDS = {"/project", "/cd", "/repo"}
+
+
+def project_command(body: str) -> tuple[str, str | None] | None:
+    """Leading `/project` (aliases `/cd`, `/repo`), optionally with a
+    checkout name.
+
+    Returns `(cmd, arg)` with `arg` None for status.  Unlike
+    `engine_command` there is no bare-name form: a one-word message
+    that happens to match a directory is far likelier to be someone
+    talking about the repo than asking to switch into it."""
+    parts = (body or "").strip().split(maxsplit=1)
+    if not parts:
+        return None
+    head = parts[0].lower()
+    if head not in PROJECT_COMMANDS:
+        return None
+    arg = None
+    if len(parts) > 1:
+        arg = parts[1].strip().split(maxsplit=1)[0] or None
+    return head, arg
+
+
 def priority_command(body: str) -> tuple[str, list[str]] | None:
     """Leading `/priority`, optionally with the new order after it.
 
@@ -1867,6 +1916,137 @@ def update_attempts_path() -> Path:
 
 def engine_priority_path() -> Path:
     return STATE_DIR / f"engine-priority-{instance_slug()}"
+
+
+# ── Per-room projects ─────────────────────────────────────────────
+# One agent already answers many rooms, each with its own harness
+# session.  The checkout was the one thing still global to the
+# process: every room ran in CODE_ROOT/PROJECT.  A room can now pick
+# any checkout the operator allowlisted, so one agent on a box full
+# of branch checkouts can give each room its own tree.
+#
+# Resolution order for a run, widest authority first:
+#   1. the routed frame's `agent.project` (set from the web)
+#   2. the room's own `/project` binding under STATE_DIR
+#   3. PROJECT from the unit env — what every install did before
+# Every layer is filtered through `allowed_projects()`: the env file
+# is the operator's boundary and neither a room nor the server gets
+# to step outside it.
+
+def room_project_path(room_id: str) -> Path:
+    """Where a room's `/project` choice is remembered.  Room hashids
+    are alphanumeric, but this builds a filename — anything else is
+    squeezed out rather than trusted."""
+    slug = re.sub(r"[^A-Za-z0-9_-]", "", str(room_id or ""))[:40] or "unknown"
+    return STATE_DIR / f"project-{instance_slug()}-{slug}"
+
+
+def _is_checkout(name: str) -> bool:
+    return bool(PROJECT_NAME_RE.match(name)) and (CODE_ROOT / name / ".git").exists()
+
+
+def discovered_projects() -> list[str]:
+    """Every direct child of CODE_ROOT that is a git checkout."""
+    try:
+        names = [p.name for p in CODE_ROOT.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+    return sorted(n for n in names if _is_checkout(n))
+
+
+def allowed_projects() -> list[str]:
+    """Checkouts a room may switch to, PROJECT always included.
+
+    Unset `PROJECTS` means "no switching" — the pinned project only.
+    `PROJECTS=*` means every checkout under CODE_ROOT.  Names that
+    aren't checkouts are dropped with a warning, because a typo in
+    the env file should not silently shrink the menu."""
+    if PROJECTS_RAW in ("*", "all"):
+        return sorted(set(discovered_projects()) | {PROJECT})
+    wanted = [n for n in re.split(r"[,\s]+", PROJECTS_RAW) if n]
+    out = [PROJECT]
+    for name in wanted:
+        if name in out:
+            continue
+        if not PROJECT_NAME_RE.match(name):
+            log.warning("ignoring malformed PROJECTS entry %r", name)
+        elif not _is_checkout(name):
+            log.warning("ignoring PROJECTS entry %r — %s is not a git checkout",
+                        name, CODE_ROOT / name)
+        else:
+            out.append(name)
+    return out
+
+
+def project_work_dir(project: str) -> Path:
+    return CODE_ROOT / project
+
+
+def load_room_project(room_id: str) -> str | None:
+    """The room's pinned checkout, or None.  A binding that is no
+    longer allowed reads as None: pulling a name out of `PROJECTS`
+    has to actually revoke it, not leave rooms on it."""
+    try:
+        name = room_project_path(room_id).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if name and name in allowed_projects():
+        return name
+    if name:
+        log.warning("room %s is pinned to %r, which is no longer allowed — "
+                    "falling back to %s", room_id, name, PROJECT)
+    return None
+
+
+def set_room_project(room_id: str, project: str) -> tuple[bool, str]:
+    """Pin a room to a checkout.  Returns (ok, detail).
+
+    Same shape as `set_dispatch_engine`: a file under the dispatch
+    user's own STATE_DIR, so no root and no restart."""
+    name = (project or "").strip()
+    allowed = allowed_projects()
+    if name not in allowed:
+        if len(allowed) == 1:
+            return False, (f"this agent is pinned to `{PROJECT}` — set "
+                           f"`PROJECTS` in its env file to let rooms switch")
+        return False, (f"unknown project {name!r} "
+                       f"(want one of: {', '.join(allowed)})")
+    work_dir = project_work_dir(name)
+    if not work_dir.is_dir():
+        return False, f"{work_dir} is gone"
+    path = room_project_path(room_id)
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        tmp.write_text(name + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        return False, f"could not write {path}: {e}"
+    return True, str(work_dir)
+
+
+def frame_project(payload: dict | None) -> str | None:
+    """`agent.project` off a routed frame, when the server names one.
+
+    Rides the same block that already carries the web-configured
+    model.  Filtered through the allowlist: the operator's env file
+    outranks the server."""
+    agent = (payload or {}).get("agent")
+    if not isinstance(agent, dict):
+        return None
+    name = str(agent.get("project") or "").strip()
+    if not name:
+        return None
+    if name in allowed_projects():
+        return name
+    log.warning("server routed this run to project %r, which is not in "
+                "PROJECTS — using %s", name, PROJECT)
+    return None
+
+
+def resolve_room_project(room_id: str, payload: dict | None = None) -> str:
+    """Which checkout this room's run happens in."""
+    return frame_project(payload) or load_room_project(room_id) or PROJECT
 
 
 def load_engine_priority() -> list[str]:
@@ -4743,6 +4923,57 @@ async def handle_priority_command(ws, room_id: str, args: list[str],
         reply_to)
 
 
+def _project_menu(room_id: str) -> str:
+    """The `/project` status block: where this room works, and where
+    else it could.  Branches come off disk because that is what the
+    operator is actually picking between on a box of checkouts."""
+    current = resolve_room_project(room_id)
+    allowed = allowed_projects()
+    lines = [f"Working in **{current}** — `{project_work_dir(current)}`"
+             f" (branch `{_current_branch(project_work_dir(current))}`)"]
+    if len(allowed) == 1:
+        lines.append("")
+        lines.append(f"This agent is pinned to `{PROJECT}`. To let rooms "
+                     f"switch, set `PROJECTS=a,b,c` (or `*`) in its env "
+                     f"file — checkouts under `{CODE_ROOT}`.")
+        return "\n".join(lines)
+    lines.append("")
+    lines.append("Switch with `/project <name>`:")
+    for name in allowed:
+        marker = "  ← this room" if name == current else ""
+        lines.append(f"- `{name}` (branch `{_current_branch(project_work_dir(name))}`)"
+                     f"{marker}")
+    return "\n".join(lines)
+
+
+async def handle_project_command(ws, room_id: str, target: str | None,
+                                 reply_to: str | None) -> None:
+    """`/project` — show or set the checkout this room works in.
+
+    Bare shows the menu.  With a name it pins the room under
+    STATE_DIR (no root, no restart) and the next run happens in that
+    tree.  Each (room, project) pair keeps its own harness session,
+    so switching away and back does not blend two trees' context."""
+    if not target:
+        await room_reply(ws, room_id,
+                         await asyncio.to_thread(_project_menu, room_id),
+                         reply_to)
+        return
+
+    ok, detail = await asyncio.to_thread(set_room_project, room_id, target)
+    if not ok:
+        await room_reply(ws, room_id, f"⚠️ Couldn't switch: {detail}", reply_to)
+        return
+
+    branch = await asyncio.to_thread(_current_branch, Path(detail))
+    await room_reply(
+        ws, room_id,
+        f"📁 This room now works in **{target}** — `{detail}` "
+        f"(branch `{branch}`). Its session for this checkout is kept "
+        f"separate, so I start here with whatever we last said about "
+        f"`{target}`.", reply_to)
+
+
 async def handle_harness_set(link, msg: dict) -> None:
     """`harness.set` frame — a person flipped the harness from the web
     or mobile sidebar, not from a `/harness` room command.  Same write
@@ -6012,7 +6243,8 @@ def _stall_line(event: dict) -> str:
 
 
 async def _emit_room_run(ws, room_id: str, reply_to: str | None,
-                         steps: list[dict], result: dict) -> None:
+                         steps: list[dict], result: dict,
+                         project: str | None = None) -> None:
     """One `room_run` action at the end of a run — Rails writes a
     DispatchRun row holding the working log, the token counts and the
     CLI's own cost figure.  Sent once rather than per step: a long run
@@ -6022,11 +6254,13 @@ async def _emit_room_run(ws, room_id: str, reply_to: str | None,
     goes out, and bookkeeping must never be what breaks a reply."""
     try:
         usage = result.get("usage") or {}
+        project = project or PROJECT
         git_refs: list[dict] = []
         try:
             since = time.time() - (result.get("duration_ms") or 0) / 1000.0
             since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
-            git_refs = await asyncio.to_thread(_collect_git_refs, str(CODE_ROOT / PROJECT), since_iso)
+            git_refs = await asyncio.to_thread(
+                _collect_git_refs, str(project_work_dir(project)), since_iso)
         except Exception:
             log.exception("git ref collection failed")
         await cable_send(ws, "message", {
@@ -6040,7 +6274,7 @@ async def _emit_room_run(ws, room_id: str, reply_to: str | None,
             # telemetry off has to mean the data stops existing, not
             # that one surface keeps reporting it.
             "model":         _last_model if TELEMETRY_ENABLED else None,
-            "project":       PROJECT,
+            "project":       project,
             "usage":         usage,
             "cost_usd":      result.get("cost_usd"),
             "duration_ms":   result.get("duration_ms"),
@@ -6475,14 +6709,19 @@ async def handle_room_message(ws, payload: dict) -> None:
 
     note_agent_config(payload)
     body = (msg.get("body") or "").strip()
+    # Which checkout this room works in — server frame, then the
+    # room's own `/project`, then the unit's PROJECT.  Everything
+    # downstream (session key, prompt, work dir) follows from it.
+    project = resolve_room_project(room_id, payload)
+    work_dir = project_work_dir(project)
     set_task_label(f"#{room.get('name') or room_id} {body}")
-    log.info("Handling room message room=%s (#%s) from=%s body=%s",
-             room_id, room.get("name"), sender.get("name"),
+    log.info("Handling room message room=%s (#%s) from=%s project=%s body=%s",
+             room_id, room.get("name"), sender.get("name"), project,
              _one_line(body, ROOM_LOG_BODY_MAX))
 
     command = room_command(body)
     if command:
-        removed = clear_sessions([_room_session_key(room_id)])
+        removed = clear_sessions([_room_session_key(room_id, project)])
         await room_reply(ws, room_id,
                          "🧹 Fresh session — I've forgotten this room's history."
                          if removed else
@@ -6505,10 +6744,26 @@ async def handle_room_message(ws, payload: dict) -> None:
         await handle_priority_command(ws, room_id, prio[1], msg.get("hashid"))
         return
 
+    proj = project_command(body)
+    if proj:
+        await handle_project_command(ws, room_id, proj[1], msg.get("hashid"))
+        return
+
+    # A checkout that has been moved or deleted is worth saying out
+    # loud: the run would otherwise fail deep in the harness with a
+    # cwd error that reads like a harness bug.
+    if not work_dir.is_dir():
+        await room_reply(ws, room_id,
+                         f"⚠️ Can't answer: `{work_dir}` is not there. "
+                         f"Check `PROJECT`/`PROJECTS` for this agent, or "
+                         f"`/project` to pick another checkout.",
+                         reply_to=msg.get("hashid"))
+        return
+
     # Fetched before the prompt is built so the paths can go in it,
     # and off the event loop because it's blocking network I/O.
     attachments = await asyncio.to_thread(download_attachments, msg)
-    prompt = build_room_prompt(payload, attachments)
+    prompt = build_room_prompt(payload, attachments, project)
     loop = asyncio.get_running_loop()
     sent = 0
     truncated = False
@@ -6580,15 +6835,17 @@ async def handle_room_message(ws, payload: dict) -> None:
         fast = bool(payload.get("fast_lane"))
         allow_resume = not fast
         session_key = (
-            f"fast_{msg.get('hashid')}" if fast else _room_session_key(room_id)
+            f"fast_{msg.get('hashid')}" if fast
+            else _room_session_key(room_id, project)
         )
         if not fast:
             _room_inflight[room_id] = msg.get("hashid") or ""
         crashed = True
         try:
             raw = await asyncio.to_thread(
-                run_agent_streamed, prompt, PROJECT, on_stream_event,
-                allow_resume, session_key, None, attachments, msg.get("hashid"))
+                run_agent_streamed, prompt, project, on_stream_event,
+                allow_resume, session_key, work_dir, attachments,
+                msg.get("hashid"))
             crashed = False
         finally:
             if _room_inflight.get(room_id) == msg.get("hashid"):
@@ -6600,7 +6857,8 @@ async def handle_room_message(ws, payload: dict) -> None:
     except subprocess.TimeoutExpired:
         await room_reply(ws, room_id, "⚠️ I timed out after 30 minutes.", msg.get("hashid"))
         result["is_error"] = True
-        await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
+        await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result,
+                             project)
         return
     except Exception as e:
         # A stop the operator asked for is not a crash.
@@ -6612,7 +6870,8 @@ async def handle_room_message(ws, payload: dict) -> None:
         log.exception("claude crashed on room message")
         await room_reply(ws, room_id, f"⚠️ I crashed: {type(e).__name__}: {e}", msg.get("hashid"))
         result["is_error"] = True
-        await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
+        await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result,
+                             project)
         return
     # A kill can end the stream cleanly with partial text rather than
     # raising, so both paths have to check.
@@ -6625,7 +6884,8 @@ async def handle_room_message(ws, payload: dict) -> None:
     if not raw:
         await room_reply(ws, room_id, "(I came back with an empty response.)", msg.get("hashid"))
         result["is_error"] = True
-        await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
+        await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result,
+                             project)
         return
 
     body_text, ask = parse_room_ask(raw)
@@ -6650,7 +6910,8 @@ async def handle_room_message(ws, payload: dict) -> None:
     # which the server turns into the run summary in the work log — a
     # separate summary line in the room would be a second notification
     # for the same answer.
-    await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result)
+    await _emit_room_run(ws, room_id, msg.get("hashid"), steps, result,
+                         project)
 
 
 # The work queue and its worker live for the PROCESS, not for one
