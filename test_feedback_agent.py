@@ -268,6 +268,36 @@ class ParseRoomAskTest(unittest.TestCase):
         self.assertEqual("", body)
         self.assertIn("Ship or PR?", fa.ask_fallback(body, ask))
 
+    def test_batch_parses_every_fence_in_order(self):
+        raw = ("Three open questions.\n\n"
+               + ask_fence({"prompt": "Which repo?", "mode": "one",
+                            "options": ["web", "mobile"]})
+               + "\n"
+               + ask_fence({"prompt": "How should I land it?", "mode": "one",
+                            "options": ["Ship", "PR"]})
+               + "\n"
+               + ask_fence({"prompt": "Any notes?", "mode": "text"}))
+        body, asks = fa.parse_room_asks(raw)
+        self.assertEqual("Three open questions.", body)
+        self.assertEqual(["Which repo?", "How should I land it?", "Any notes?"],
+                         [a["prompt"] for a in asks])
+        self.assertEqual(["one", "one", "text"], [a["mode"] for a in asks])
+
+    def test_batch_with_one_unusable_block_leaves_the_reply_alone(self):
+        raw = ("Two questions, one malformed.\n\n"
+               + ask_fence({"prompt": "Which repo?", "mode": "one", "options": ["web"]})
+               + "\n```ask\n{not json,}\n```")
+        body, asks = fa.parse_room_asks(raw)
+        self.assertEqual(raw, body)
+        self.assertEqual([], asks)
+
+    def test_single_ask_view_takes_the_first_question(self):
+        raw = (ask_fence({"prompt": "First?", "mode": "one", "options": ["a"]})
+               + "\n" + ask_fence({"prompt": "Second?", "mode": "one", "options": ["b"]}))
+        body, ask = fa.parse_room_ask(raw)
+        self.assertEqual("", body)
+        self.assertEqual("First?", ask["prompt"])
+
 
 class AskFallbackTest(unittest.TestCase):
     """The widget and older mobile builds render no buttons at all,

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.55.1
+
+### Added
+- Batched asks: a reply may fence several `ask` blocks, and each becomes
+  a separate question under the one message (`parse_room_asks`). The
+  prose fallback is applied per question, and one malformed block leaves
+  the whole reply as text rather than half-stripping it.
+
 ## 0.55.0
 
 ### Added

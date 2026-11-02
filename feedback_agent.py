@@ -174,7 +174,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.55.0"
+AGENT_VERSION      = "vroxy_dispatch 0.55.1"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -6567,46 +6567,54 @@ def _ask_options(raw) -> list[dict]:
     return options
 
 
-def _parse_room_ask(raw: str) -> tuple[str, dict | None]:
-    match = ASK_FENCE_RE.search(raw or "")
-    if not match:
-        return raw, None
+def _parse_room_asks(raw: str) -> tuple[str, list[dict]]:
+    matches = list(ASK_FENCE_RE.finditer(raw or ""))
+    if not matches:
+        return raw, []
 
-    blob = match.group(1)
-    if len(blob) > ASK_JSON_MAX:
-        log.warning("Ask block is %d chars — leaving it as text", len(blob))
-        return raw, None
+    asks: list[dict] = []
+    for match in matches:
+        blob = match.group(1)
+        if len(blob) > ASK_JSON_MAX:
+            log.warning("Ask block is %d chars — leaving it as text", len(blob))
+            return raw, []
+        try:
+            declared = json.loads(blob)
+        except ValueError as e:
+            log.warning("Ask JSON invalid: %s — leaving it as text", e)
+            return raw, []
+        if not isinstance(declared, dict):
+            return raw, []
+
+        prompt  = str(declared.get("prompt") or "").strip()[:ASK_PROMPT_MAX]
+        mode    = str(declared.get("mode") or "one").strip().lower()
+        mode    = mode if mode in ASK_MODES else "one"
+        options = _ask_options(declared.get("options"))
+        if not prompt or (not options and mode != "text"):
+            log.warning("Ask block unusable (mode=%s, %d options) — leaving it as text",
+                        mode, len(options))
+            return raw, []
+        asks.append({"prompt": prompt, "mode": mode, "options": options})
+
+    return ASK_FENCE_RE.sub("", raw).strip(), asks
+
+
+def parse_room_asks(raw: str) -> tuple[str, list[dict]]:
+    """Splits Claude's room answer into (body, asks), stripping every
+    `ask` fence out of the body.  A block this can't turn into a
+    renderable question leaves the raw text exactly as it came."""
     try:
-        declared = json.loads(blob)
-    except ValueError as e:
-        log.warning("Ask JSON invalid: %s — leaving it as text", e)
-        return raw, None
-    if not isinstance(declared, dict):
-        return raw, None
-
-    prompt  = str(declared.get("prompt") or "").strip()[:ASK_PROMPT_MAX]
-    mode    = str(declared.get("mode") or "one").strip().lower()
-    mode    = mode if mode in ASK_MODES else "one"
-    options = _ask_options(declared.get("options"))
-    if not prompt or (not options and mode != "text"):
-        log.warning("Ask block unusable (mode=%s, %d options) — leaving it as text",
-                    mode, len(options))
-        return raw, None
-
-    return ASK_FENCE_RE.sub("", raw).strip(), {
-        "prompt": prompt, "mode": mode, "options": options,
-    }
+        return _parse_room_asks(raw)
+    except Exception as e:
+        log.warning("Ask parse failed (%s: %s) — leaving it as text", type(e).__name__, e)
+        return raw, []
 
 
 def parse_room_ask(raw: str) -> tuple[str, dict | None]:
-    """Splits Claude's room answer into (body, ask_or_None), with the
-    fence stripped out of the body.  A block this can't turn into a
-    renderable question leaves the raw text exactly as it came."""
-    try:
-        return _parse_room_ask(raw)
-    except Exception as e:
-        log.warning("Ask parse failed (%s: %s) — leaving it as text", type(e).__name__, e)
-        return raw, None
+    """Single-ask view over parse_room_asks — the first question, for
+    callers that predate batching."""
+    body, asks = parse_room_asks(raw)
+    return body, (asks[0] if asks else None)
 
 
 def ask_fallback(body: str, ask: dict) -> str:
@@ -6888,8 +6896,8 @@ async def handle_room_message(ws, payload: dict) -> None:
                              project)
         return
 
-    body_text, ask = parse_room_ask(raw)
-    if ask:
+    body_text, asks = parse_room_asks(raw)
+    for ask in asks:
         body_text = ask_fallback(body_text, ask)
 
     # Threaded under the message that asked.  A room where three
@@ -6898,11 +6906,11 @@ async def handle_room_message(ws, payload: dict) -> None:
     posted = await post_room_reply(ws, room_id, split_room_body(body_text),
                                    msg.get("hashid"))
 
-    if ask:
+    for ask in asks:
         try:
             await room_ask(ws, room_id, posted, ask)
         except Exception:
-            log.exception("could not send the ask — the reply is already posted")
+            log.exception("could not send an ask — the reply is already posted")
 
     # After the answer: the run is only worth recording once the
     # person has it, and a failure here must not look like a failure
