@@ -13,7 +13,8 @@ from .version import VERSION
 def _client(args):
     host = getattr(args, "host", None) or os.environ.get("VROXY_HOST") or config.load().get("host")
     token = os.environ.get("VROXY_TOKEN") or config.token_for(host)
-    return Client(host=host, token=token)
+    mobile_token = os.environ.get("VROXY_MOBILE_TOKEN") or config.token_for(host, mobile=True)
+    return Client(host=host, token=token, mobile_token=mobile_token)
 
 
 def _emit(args, rows, plain):
@@ -29,17 +30,25 @@ def cmd_login(args):
     # Never accepted as an argument: argv is world-readable via /proc
     # and lands in shell history.
     password = os.environ.get("VROXY_PASSWORD") or getpass.getpass("Password: ")
+    mobile = args.mobile
 
     previous = config.load()
-    result = Client(host=host).login(email, password, device=socket.gethostname() or None)
+    result = Client(host=host).login(email, password, device=socket.gethostname() or None, mobile=mobile)
     token = result.get("token")
     if not token:
         raise VroxyError("Login succeeded but returned no token.")
-    path = config.save(host, token, email=result.get("user", {}).get("email") or email)
-    print(f"Signed in as {result.get('user', {}).get('email') or email} — token saved to {path}")
+    save_kwargs = {"email": result.get("user", {}).get("email") or email}
+    if mobile:
+        save_kwargs["mobile_token"] = token
+    else:
+        save_kwargs["token"] = token
+    path = config.save(host, **save_kwargs)
+    scope = "mobile" if mobile else "agent"
+    print(f"Signed in as {save_kwargs['email']} ({scope} token) — saved to {path}")
 
-    if previous.get("token") and previous["token"] != token:
-        revoked, reason = _revoke(previous.get("host") or host, previous["token"])
+    prev_key = "mobile_token" if mobile else "token"
+    if previous.get(prev_key) and previous[prev_key] != token:
+        revoked, reason = _revoke(previous.get("host") or host, previous[prev_key])
         if not revoked:
             print(f"Couldn't revoke the previous token ({reason}). "
                   f"Revoke it under Settings → Agent / CLI.", file=sys.stderr)
@@ -47,17 +56,22 @@ def cmd_login(args):
 
 def cmd_logout(_args):
     saved = config.load()
-    if not saved.get("token"):
+    tokens = [t for t in (saved.get("token"), saved.get("mobile_token")) if t]
+    if not tokens:
         print("Nothing to sign out of.")
         return
 
-    revoked, reason = _revoke(saved.get("host"), saved["token"])
+    failures = 0
+    for token in tokens:
+        revoked, reason = _revoke(saved.get("host"), token)
+        if not revoked:
+            failures += 1
     config.clear()
-    if revoked:
-        print("Signed out — the token is revoked.")
+    if failures:
+        print(f"Signed out locally, but {failures} token(s) could not be revoked. "
+              f"Revoke them under Settings → Agent / CLI.", file=sys.stderr)
     else:
-        print(f"Signed out locally, but the token could not be revoked ({reason}). "
-              f"Revoke it under Settings → Agent / CLI.", file=sys.stderr)
+        print("Signed out — the token(s) are revoked.")
 
 
 def _revoke(host, token):
@@ -82,7 +96,20 @@ def cmd_whoami(args):
 
 
 def cmd_workspaces(args):
-    rows = _client(args).workspaces()
+    client = _client(args)
+    action = getattr(args, "action", "list") or "list"
+
+    if action == "create":
+        row = client.create_workspace(args.name)
+        w = row.get("workspace") or {}
+        return _emit(args, row, lambda: print(f"Created {w.get('hashid')} — {w.get('name')}"))
+
+    if action == "rename":
+        row = client.rename_workspace(args.workspace, name=args.name, slug=args.slug)
+        w = row.get("workspace") or {}
+        return _emit(args, row, lambda: print(f"Renamed {w.get('hashid')} — {w.get('name')}"))
+
+    rows = client.workspaces()
 
     def plain():
         if not rows:
@@ -97,7 +124,15 @@ def cmd_workspaces(args):
 
 
 def cmd_rooms(args):
-    rows = _client(args).rooms(args.workspace)
+    client = _client(args)
+    action = getattr(args, "action", "list") or "list"
+
+    if action == "create":
+        row = client.create_room(args.workspace, args.name, topic=args.topic)
+        r = row.get("room") or {}
+        return _emit(args, row, lambda: print(f"Created #{r.get('name')} ({r.get('id')})"))
+
+    rows = client.rooms(args.workspace)
 
     def plain():
         for r in rows:
@@ -207,6 +242,26 @@ def cmd_members(args):
                 print(f"{'pending':<8} {inv.get('role', ''):<9} {inv.get('email')}  ({inv.get('hashid')})")
 
         return _emit(args, payload, plain)
+
+    if action == "invite":
+        row = client.invite_member(args.workspace, args.email, args.role)
+        inv = row.get("invitation") or {}
+        return _emit(args, row, lambda: print(
+            f"Invited {inv.get('email')} as {inv.get('role')} ({inv.get('hashid')})"))
+
+    if action == "role":
+        row = client.update_member(args.workspace, args.membership_id, args.role)
+        m = row.get("member") or {}
+        return _emit(args, row, lambda: print(
+            f"{m.get('name') or args.membership_id} is now {m.get('role') or args.role}."))
+
+    if action == "remove":
+        row = client.remove_member(args.workspace, args.membership_id)
+        return _emit(args, row, lambda: print("Removed."))
+
+    if action == "revoke":
+        row = client.revoke_invite(args.workspace, args.invitation)
+        return _emit(args, row, lambda: print("Revoked."))
 
 
 def cmd_tools(args):
@@ -430,15 +485,32 @@ def build_parser():
 
     login = sub.add_parser("login", help="Sign in and save a token")
     login.add_argument("--email")
+    login.add_argument("--mobile", action="store_true",
+                       help="Mint a mobile-scoped token for workspace/room/member writes")
     login.set_defaults(func=cmd_login)
 
-    sub.add_parser("logout", help="Revoke the saved token and forget it").set_defaults(func=cmd_logout)
+    sub.add_parser("logout", help="Revoke the saved tokens and forget them").set_defaults(func=cmd_logout)
     sub.add_parser("whoami", help="Who the saved token belongs to").set_defaults(func=cmd_whoami)
-    sub.add_parser("workspaces", help="Workspaces you hold a seat in").set_defaults(func=cmd_workspaces)
+
+    workspaces = sub.add_parser("workspaces", help="Workspaces you hold a seat in")
+    ws_sub = workspaces.add_subparsers(dest="action")
+    ws_sub.add_parser("list")
+    ws_create = ws_sub.add_parser("create", help="Create a workspace (mobile token)")
+    ws_create.add_argument("name")
+    ws_rename = ws_sub.add_parser("rename", help="Rename a workspace (mobile token)")
+    ws_rename.add_argument("workspace")
+    ws_rename.add_argument("--name")
+    ws_rename.add_argument("--slug")
+    workspaces.set_defaults(func=cmd_workspaces, action="list")
 
     rooms = sub.add_parser("rooms", help="Rooms in a workspace")
     rooms.add_argument("workspace")
-    rooms.set_defaults(func=cmd_rooms)
+    rooms_sub = rooms.add_subparsers(dest="action")
+    rooms_sub.add_parser("list")
+    rooms_create = rooms_sub.add_parser("create", help="Create a room (mobile token)")
+    rooms_create.add_argument("name")
+    rooms_create.add_argument("--topic")
+    rooms.set_defaults(func=cmd_rooms, action="list")
 
     read = sub.add_parser("read", help="Recent messages in a room")
     read.add_argument("workspace")
@@ -479,6 +551,16 @@ def build_parser():
     members.add_argument("workspace")
     members_sub = members.add_subparsers(dest="action", required=True)
     members_sub.add_parser("list")
+    members_invite = members_sub.add_parser("invite", help="Invite a member (mobile token)")
+    members_invite.add_argument("email")
+    members_invite.add_argument("--role", required=True)
+    members_role = members_sub.add_parser("role", help="Change a member's role (mobile token)")
+    members_role.add_argument("membership_id")
+    members_role.add_argument("--role", required=True)
+    members_remove = members_sub.add_parser("remove", help="Remove a member (mobile token)")
+    members_remove.add_argument("membership_id")
+    members_revoke = members_sub.add_parser("revoke", help="Revoke a pending invitation (mobile token)")
+    members_revoke.add_argument("invitation")
     members.set_defaults(func=cmd_members)
 
     tools = sub.add_parser("tools", help="Custom bot tools")

@@ -160,18 +160,28 @@ class ManagementCommandsTest(unittest.TestCase):
 
         client.publish_doc.assert_called_once_with("ws1", "d1", published=False)
 
-    def test_member_management_is_not_a_cli_command(self):
-        for argv in (
-            ["members", "ws1", "invite", "a@b.test", "admin"],
-            ["members", "ws1", "role", "7", "admin"],
-            ["members", "ws1", "remove", "7"],
-            ["members", "ws1", "revoke", "inv1"],
-        ):
-            with mock.patch("sys.stderr", StringIO()):
-                with self.assertRaises(SystemExit, msg=argv):
-                    main(argv)
-        for name in ("invite_member", "set_member_role", "remove_member", "revoke_invitation"):
-            self.assertFalse(hasattr(Client, name), name)
+    def test_member_management_commands_call_the_client(self):
+        _, client = self.run_cli(["members", "ws1", "invite", "a@b.test", "--role", "operator"])
+        client.invite_member.assert_called_once_with("ws1", "a@b.test", "operator")
+
+        _, client = self.run_cli(["members", "ws1", "role", "7", "--role", "admin"])
+        client.update_member.assert_called_once_with("ws1", "7", "admin")
+
+        _, client = self.run_cli(["members", "ws1", "remove", "7"])
+        client.remove_member.assert_called_once_with("ws1", "7")
+
+        _, client = self.run_cli(["members", "ws1", "revoke", "inv1"])
+        client.revoke_invite.assert_called_once_with("ws1", "inv1")
+
+    def test_workspace_and_room_creation_call_the_client(self):
+        _, client = self.run_cli(["workspaces", "create", "Acme"])
+        client.create_workspace.assert_called_once_with("Acme")
+
+        _, client = self.run_cli(["workspaces", "rename", "ws1", "--name", "New", "--slug", "new"])
+        client.rename_workspace.assert_called_once_with("ws1", name="New", slug="new")
+
+        _, client = self.run_cli(["rooms", "ws1", "create", "general", "--topic", "Stuff"])
+        client.create_room.assert_called_once_with("ws1", "general", topic="Stuff")
 
     def test_members_list_still_works(self):
         _, client = self.run_cli(["members", "ws1", "list"])
@@ -339,7 +349,7 @@ class SessionCommandsTest(unittest.TestCase):
         with patched, mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
             main(["logout"])
 
-        self.assertIn("the token is revoked", out.getvalue())
+        self.assertIn("token(s) are revoked", out.getvalue())
         self.assertEqual("", err.getvalue())
 
     def test_logout_with_nothing_saved_calls_nothing(self):
@@ -405,6 +415,36 @@ class ReadClientTest(unittest.TestCase):
         self.assertEqual(seen["url"], "https://x.test/api/mobile/v1/login")
         self.assertEqual(seen["body"]["client"], "cli")
         self.assertEqual(seen["body"]["device_model"], "laptop")
+
+    def test_mobile_login_omits_the_cli_client_marker(self):
+        seen = self.capture(lambda c: c.login("a@b.co", "pw", mobile=True))
+
+        self.assertEqual(seen["url"], "https://x.test/api/mobile/v1/login")
+        self.assertNotIn("client", seen["body"])
+
+    def test_write_endpoints_use_the_mobile_token(self):
+        seen = {}
+
+        def fake(req, timeout=None):
+            seen["auth"] = req.get_header("Authorization")
+            seen["url"] = req.full_url
+            seen["body"] = json.loads(req.data) if req.data else None
+            return _response({})
+
+        client = Client(host="https://x.test", token="agent", mobile_token="mobile")
+        with mock.patch("urllib.request.urlopen", side_effect=fake):
+            client.create_workspace("Acme")
+
+        self.assertEqual(seen["auth"], "Bearer mobile")
+        self.assertEqual(seen["url"], "https://x.test/api/mobile/v1/workspaces")
+        self.assertEqual(seen["body"], {"name": "Acme"})
+
+    def test_a_mobile_write_without_a_mobile_token_says_to_login_mobile(self):
+        client = Client(host="https://x.test", token="agent")
+        with self.assertRaises(VroxyError) as ctx:
+            client.create_workspace("Acme")
+
+        self.assertIn("vroxy login --mobile", str(ctx.exception))
 
     def test_read_endpoints_hit_the_workspace_paths(self):
         cases = [

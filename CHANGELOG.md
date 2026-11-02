@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.56.0
+
+### Added
+- A `mobile`-scoped token path for workspace/room/member management:
+  `vroxy login --mobile` mints a mobile token (no `client: cli`, so it
+  clears the agent allow-list) and stores it beside the agent token.
+  `vroxy workspaces create` / `rename`, `vroxy rooms <ws> create`, and
+  `vroxy members <ws> invite` / `role` / `remove` / `revoke` use it.
+  Without a mobile token they say `vroxy login --mobile` rather than
+  falling back to the agent token, so the agent-token wall stays intact
+  — the mobile token is minted by a person, never by an agent.
+
 ## 0.55.1
 
 ### Added

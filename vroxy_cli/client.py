@@ -38,11 +38,12 @@ class VroxyError(Exception):
 
 
 class Client:
-    def __init__(self, host=None, token=None):
+    def __init__(self, host=None, token=None, mobile_token=None):
         self.host = (host or os.environ.get("VROXY_HOST") or DEFAULT_HOST).rstrip("/")
         self.token = token
+        self.mobile_token = mobile_token
 
-    def _request(self, method, path, body=None, authed=True):
+    def _request(self, method, path, body=None, authed=True, mobile=False):
         url = f"{self.host}{API_BASE}{path}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
@@ -51,9 +52,11 @@ class Client:
         req.add_header("User-Agent", USER_AGENT)
         req.add_header("X-Vroxy-Client", CLIENT_ID)
         if authed:
-            if not self.token:
-                raise VroxyError("Not signed in. Run: vroxy login")
-            req.add_header("Authorization", f"Bearer {self.token}")
+            use = self.mobile_token if mobile else self.token
+            if not use:
+                hint = "vroxy login --mobile" if mobile else "vroxy login"
+                raise VroxyError(f"Not signed in. Run: {hint}")
+            req.add_header("Authorization", f"Bearer {use}")
 
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
@@ -72,8 +75,10 @@ class Client:
 
         return _safe_json(raw)
 
-    def login(self, email, password, device=None):
-        body = {"email": email, "password": password, "client": "cli"}
+    def login(self, email, password, device=None, mobile=False):
+        body = {"email": email, "password": password}
+        if not mobile:
+            body["client"] = "cli"
         if device:
             body["device_model"] = device
         return self._request("POST", "/login", body, authed=False)
@@ -191,6 +196,48 @@ class Client:
     def targets(self, workspace, page=None):
         query = _query({"page": page})
         return self._request("GET", f"/workspaces/{workspace}/dispatch_targets{query}")
+
+    # The writes below need a `mobile`-scoped token — one a person
+    # mints with `vroxy login --mobile` — because the agent token is
+    # refused for workspace/room/member management by design.
+
+    def create_workspace(self, name):
+        return self._request("POST", "/workspaces", {"name": name}, mobile=True)
+
+    def rename_workspace(self, workspace, name=None, slug=None):
+        return self._request(
+            "PATCH", f"/workspaces/{workspace}", _compact({"name": name, "slug": slug}),
+            mobile=True
+        )
+
+    def create_room(self, workspace, name, topic=None):
+        return self._request(
+            "POST", f"/workspaces/{workspace}/rooms",
+            _compact({"name": name, "topic": topic}), mobile=True
+        )
+
+    def invite_member(self, workspace, email, role):
+        return self._request(
+            "POST", f"/workspaces/{workspace}/members", {"email": email, "role": role},
+            mobile=True
+        )
+
+    def update_member(self, workspace, membership_id, role):
+        return self._request(
+            "PATCH", f"/workspaces/{workspace}/members/{membership_id}", {"role": role},
+            mobile=True
+        )
+
+    def remove_member(self, workspace, membership_id):
+        return self._request(
+            "DELETE", f"/workspaces/{workspace}/members/{membership_id}", mobile=True
+        )
+
+    def revoke_invite(self, workspace, invitation_hashid):
+        return self._request(
+            "DELETE", f"/workspaces/{workspace}/members/invitations/{invitation_hashid}",
+            mobile=True
+        )
 
 
 def _header(response, name):

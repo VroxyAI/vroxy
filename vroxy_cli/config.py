@@ -21,15 +21,21 @@ def load():
         return {}
 
 
-def save(host, token, email=None):
+def save(host, token=None, email=None, mobile_token=None):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     # Create empty and restrict BEFORE writing: a token written first
     # and chmod'd second is world-readable for the gap between.
     CREDENTIALS.touch(mode=0o600, exist_ok=True)
     os.chmod(CREDENTIALS, stat.S_IRUSR | stat.S_IWUSR)
-    CREDENTIALS.write_text(
-        json.dumps({"host": host, "token": token, "email": email}, indent=2) + "\n"
-    )
+    data = load()
+    data["host"] = host
+    if token is not None:
+        data["token"] = token
+    if email is not None:
+        data["email"] = email
+    if mobile_token is not None:
+        data["mobile_token"] = mobile_token
+    CREDENTIALS.write_text(json.dumps(data, indent=2) + "\n")
     return CREDENTIALS
 
 
@@ -62,8 +68,8 @@ def clear():
         return False
 
 
-def token_for(host=None):
+def token_for(host=None, mobile=False):
     saved = load()
     if host and saved.get("host") and saved["host"].rstrip("/") != host.rstrip("/"):
         return None
-    return saved.get("token")
+    return saved.get("mobile_token" if mobile else "token")
