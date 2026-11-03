@@ -172,6 +172,42 @@ def cmd_dispatch(args):
     _emit(args, payload, plain)
 
 
+def cmd_agents(args):
+    payload = _client(args).agents(args.workspace)
+    rows = payload.get("agents", [])
+
+    def problem_for(agent):
+        for h in agent.get("harnesses") or []:
+            if h.get("problem"):
+                return h["problem"]
+            if h.get("active") and h.get("healthy") is False:
+                return f"{h.get('id')} unhealthy"
+        return None
+
+    def plain():
+        if not rows:
+            print("No dispatch agents.")
+            return
+        for a in rows:
+            state = "online" if a.get("online") else "offline"
+            harness = a.get("harness") or "-"
+            version = a.get("version") or "-"
+            line = f"{a.get('name')} ({a.get('kind')})  [{state}]  v{version}  {harness}"
+            if a.get("default"):
+                line += "  (default)"
+            print(line)
+            root = a.get("code_root")
+            if root:
+                print(f"  code_root: {root}")
+            problem = problem_for(a)
+            if problem:
+                print(f"  problem: {problem}")
+            if a.get("status"):
+                print(f"  status: {a['status']}")
+
+    _emit(args, payload, plain)
+
+
 def _body_from(args):
     if args.body == "-":
         return sys.stdin.read()
@@ -527,6 +563,10 @@ def build_parser():
     disp = sub.add_parser("dispatch", help="Is the workspace's agent up")
     disp.add_argument("workspace")
     disp.set_defaults(func=cmd_dispatch)
+
+    agents = sub.add_parser("agents", help="Every dispatch agent and its status")
+    agents.add_argument("workspace")
+    agents.set_defaults(func=cmd_agents)
 
     docs = sub.add_parser("docs", help="Knowledge-base docs the bot answers from")
     docs.add_argument("workspace")

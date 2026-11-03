@@ -290,6 +290,27 @@ class ReadCommandsTest(unittest.TestCase):
         for part in ("vroxy_web", "acme/web", "master", "always_pr", "Claude Code", "online"):
             self.assertIn(part, line)
 
+    def test_agents_prints_status_and_surfaces_a_harness_problem(self):
+        payload = {"agents": [{
+            "name": "Brevitas", "kind": "vroxy_dispatch", "online": True, "default": True,
+            "version": "2.1.0", "harness": "Claude Code 2.1.0", "code_root": "/home/ubuntu/code/brevitas",
+            "harnesses": [{"id": "claude", "active": True, "healthy": False,
+                           "problem": "project directory is missing"}],
+        }]}
+        code, client, printed = self.run_cli(["agents", "ws1"], agents=payload)
+
+        self.assertEqual(code, 0)
+        client.agents.assert_called_once_with("ws1")
+        lines = [c[0][0] for c in printed.call_args_list]
+        self.assertIn("Brevitas (vroxy_dispatch)  [online]  v2.1.0  Claude Code 2.1.0  (default)", lines)
+        self.assertIn("  code_root: /home/ubuntu/code/brevitas", lines)
+        self.assertIn("  problem: project directory is missing", lines)
+
+    def test_agents_with_none_prints_an_empty_note(self):
+        code, client, printed = self.run_cli(["agents", "ws1"], agents={"agents": []})
+        self.assertEqual(code, 0)
+        self.assertIn("No dispatch agents.", [c[0][0] for c in printed.call_args_list])
+
     def test_json_flag_returns_the_raw_payload(self):
         payload = {"targets": [], "meta": {"total_pages": 1}}
         _, _, printed = self.run_cli(["--json", "targets", "ws1"], targets=payload)
@@ -454,6 +475,7 @@ class ReadClientTest(unittest.TestCase):
             (lambda c: c.visitors("ws1", active=True), "/workspaces/ws1/visitors?active=yes"),
             (lambda c: c.visitor("ws1", "vst1"), "/workspaces/ws1/visitors/vst1"),
             (lambda c: c.targets("ws1"), "/workspaces/ws1/dispatch_targets"),
+            (lambda c: c.agents("ws1"), "/workspaces/ws1/dispatch"),
         ]
         for call, path in cases:
             self.assertEqual(self.capture(call)["url"], f"https://x.test/api/mobile/v1{path}")
@@ -698,6 +720,7 @@ class RequestShapeTest(unittest.TestCase):
              "/workspaces/ws1/visitors?identity=anonymous", None),
             (lambda c: c.targets("ws1", page=2), "GET",
              "/workspaces/ws1/dispatch_targets?page=2", None),
+            (lambda c: c.agents("ws1"), "GET", "/workspaces/ws1/dispatch", None),
         ]
         for call, method, path, body in cases:
             with self.subTest(path=path, method=method):

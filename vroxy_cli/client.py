@@ -109,6 +109,9 @@ class Client:
     def dispatch_status(self, workspace):
         return self._request("GET", f"/workspaces/{workspace}/dispatch_status")
 
+    def agents(self, workspace):
+        return self._request("GET", f"/workspaces/{workspace}/dispatch")
+
     def docs(self, workspace, status=None, q=None):
         query = _query({"status": status, "q": q})
         return self._request("GET", f"/workspaces/{workspace}/docs{query}").get("docs", [])

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.56.1
+
+### Added
+- `vroxy agents <workspace>` lists every dispatch agent and its status
+  in one call — online/offline, version, active harness, `code_root`,
+  and any harness `problem` (a broken CLI reads as broken, not blank),
+  with the workspace default marked. Reads the new
+  `/workspaces/:id/dispatch` endpoint, gated on `dispatch.read`.
+
 ## 0.56.0
 
 ### Added
