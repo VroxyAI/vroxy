@@ -75,13 +75,15 @@ class Client:
 
         return _safe_json(raw)
 
-    def login(self, email, password, device=None, mobile=False):
-        body = {"email": email, "password": password}
-        if not mobile:
-            body["client"] = "cli"
+    def device_authorize(self, mobile=False, device=None):
+        body = {"client": "mobile" if mobile else "cli"}
         if device:
             body["device_model"] = device
-        return self._request("POST", "/login", body, authed=False)
+        return self._request("POST", "/device/authorize", body, authed=False)
+
+    def device_token(self, device_code, code):
+        body = {"device_code": device_code, "code": code}
+        return self._request("POST", "/device/token", body, authed=False)
 
     def logout(self):
         return self._request("POST", "/logout")

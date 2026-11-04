@@ -325,9 +325,6 @@ class SessionCommandsTest(unittest.TestCase):
             patcher = mock.patch.object(config, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        env = mock.patch.dict(os.environ, {"VROXY_PASSWORD": "pw"})
-        env.start()
-        self.addCleanup(env.stop)
 
     def route(self, responses):
         calls = []
@@ -382,35 +379,44 @@ class SessionCommandsTest(unittest.TestCase):
     def test_login_revokes_the_previously_saved_token(self):
         config.save("https://x.test", "old-token")
         calls, patched = self.route({
-            "/login": {"token": "new-token", "user": {"email": "a@b.co"}},
+            "/device/authorize": {"device_code": "dc", "verification_uri": "https://x.test/device?code=ABCD-1234"},
+            "/device/token": {"token": "new-token", "user": {"email": "a@b.co"}},
             "/logout": {"ok": True},
         })
-        with patched, mock.patch("builtins.print"):
-            code = main(["--host", "https://x.test", "login", "--email", "a@b.co"])
+        with patched, mock.patch("builtins.input", return_value="ABCD-1234"), mock.patch("builtins.print"):
+            code = main(["--host", "https://x.test", "login"])
 
         self.assertEqual(code, 0)
-        self.assertEqual(calls, [("/login", None), ("/logout", "Bearer old-token")])
+        self.assertEqual(
+            calls,
+            [("/device/authorize", None), ("/device/token", None), ("/logout", "Bearer old-token")],
+        )
         self.assertEqual(config.token_for("https://x.test"), "new-token")
 
     def test_a_failed_login_leaves_the_previous_token_alone(self):
         config.save("https://x.test", "old-token")
-        calls, patched = self.route({"/login": _http_error(401, {"error": "Invalid email or password"})})
-        with patched, mock.patch("sys.stderr", StringIO()):
-            code = main(["--host", "https://x.test", "login", "--email", "a@b.co"])
+        calls, patched = self.route({
+            "/device/authorize": {"device_code": "dc", "verification_uri": "https://x.test/device"},
+            "/device/token": _http_error(400, {"error": "Sign-in not approved yet.", "code": "authorization_pending"}),
+        })
+        with patched, mock.patch("builtins.input", return_value="ABCD-1234"), mock.patch("sys.stderr", StringIO()):
+            code = main(["--host", "https://x.test", "login"])
 
         self.assertEqual(code, 1)
-        self.assertEqual([path for path, _ in calls], ["/login"])
+        self.assertEqual([path for path, _ in calls], ["/device/authorize", "/device/token"])
         self.assertEqual(config.token_for("https://x.test"), "old-token")
 
     def test_login_still_succeeds_when_the_old_token_cannot_be_revoked(self):
         config.save("https://x.test", "old-token")
         _, patched = self.route({
-            "/login": {"token": "new-token", "user": {"email": "a@b.co"}},
+            "/device/authorize": {"device_code": "dc", "verification_uri": "https://x.test/device"},
+            "/device/token": {"token": "new-token", "user": {"email": "a@b.co"}},
             "/logout": urllib.error.URLError("down"),
         })
         err = StringIO()
-        with patched, mock.patch("sys.stdout", StringIO()), mock.patch("sys.stderr", err):
-            code = main(["--host", "https://x.test", "login", "--email", "a@b.co"])
+        with patched, mock.patch("builtins.input", return_value="ABCD-1234"), \
+                mock.patch("sys.stdout", StringIO()), mock.patch("sys.stderr", err):
+            code = main(["--host", "https://x.test", "login"])
 
         self.assertEqual(code, 0)
         self.assertEqual(config.token_for("https://x.test"), "new-token")
@@ -430,18 +436,19 @@ class ReadClientTest(unittest.TestCase):
             call(Client(host="https://x.test", token="t"))
         return seen
 
-    def test_login_asks_for_an_agent_token_not_a_phone_one(self):
-        seen = self.capture(lambda c: c.login("a@b.co", "pw", device="laptop"))
+    def test_device_authorize_asks_for_an_agent_token_not_a_phone_one(self):
+        seen = self.capture(lambda c: c.device_authorize(device="laptop"))
 
-        self.assertEqual(seen["url"], "https://x.test/api/mobile/v1/login")
+        self.assertEqual(seen["url"], "https://x.test/api/mobile/v1/device/authorize")
         self.assertEqual(seen["body"]["client"], "cli")
         self.assertEqual(seen["body"]["device_model"], "laptop")
 
-    def test_mobile_login_omits_the_cli_client_marker(self):
-        seen = self.capture(lambda c: c.login("a@b.co", "pw", mobile=True))
+    def test_mobile_device_authorize_asks_for_a_mobile_token(self):
+        seen = self.capture(lambda c: c.device_authorize(mobile=True))
 
-        self.assertEqual(seen["url"], "https://x.test/api/mobile/v1/login")
-        self.assertNotIn("client", seen["body"])
+        self.assertEqual(seen["url"], "https://x.test/api/mobile/v1/device/authorize")
+        self.assertEqual(seen["body"]["client"], "mobile")
+        self.assertNotIn("device_model", seen["body"])
 
     def test_write_endpoints_use_the_mobile_token(self):
         seen = {}
@@ -527,7 +534,7 @@ class VersionHeaderTest(unittest.TestCase):
 
     def test_the_header_rides_unauthenticated_calls_too(self):
         with self.serve(None):
-            Client(host="https://x.test").login("a@b.co", "pw")
+            Client(host="https://x.test").device_authorize()
         self.assertTrue(self.seen[0].get_header("X-vroxy-client").startswith("vroxy-cli/"))
 
     def test_a_newer_release_is_announced_once_on_stderr_never_stdout(self):
@@ -739,10 +746,10 @@ class RequestShapeTest(unittest.TestCase):
                 Client(host="https://x.test", token="t").messages("ws1", "rm1", limit="5; drop")
         urlopen.assert_not_called()
 
-    def test_login_is_the_one_call_that_carries_no_bearer(self):
-        seen = self.capture(lambda c: c.login("a@b.co", "pw"))
+    def test_device_authorize_is_the_one_call_that_carries_no_bearer(self):
+        seen = self.capture(lambda c: c.device_authorize())
         self.assertIsNone(seen["auth"])
-        self.assertEqual({"email": "a@b.co", "password": "pw", "client": "cli"}, seen["body"])
+        self.assertEqual({"client": "cli"}, seen["body"])
 
     def test_an_unreachable_host_is_named_in_the_error(self):
         with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
@@ -823,51 +830,90 @@ class ConfigFileModeTest(_IsolatedConfig):
 
 
 class LoginSafetyTest(_IsolatedConfig):
+    def run_login(self, argv, authorize=None, token=None, token_error=None, code="ABCD-1234"):
+        authorize = authorize or {"device_code": "dc123", "verification_uri": "https://x.test/device?code=ABCD-1234"}
+        routes = {
+            "/device/authorize": authorize,
+            "/device/token": token if token is not None else _http_error(400, token_error or {"error": "nope"}),
+        }
+
+        def fake(req, timeout=None):
+            self.requests.append(req)
+            path = req.full_url.split("/api/mobile/v1", 1)[1]
+            outcome = routes.get(path)
+            if outcome is None:
+                return _response({"ok": True})
+            if isinstance(outcome, Exception):
+                raise outcome
+            return _response(outcome)
+
+        out, err = StringIO(), StringIO()
+        with mock.patch("urllib.request.urlopen", side_effect=fake), \
+                mock.patch("builtins.input", return_value=code), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            code_ = main(argv)
+        return code_, out.getvalue(), err.getvalue()
+
+    def test_an_email_flag_does_not_exist(self):
+        with mock.patch("sys.stderr", StringIO()):
+            with self.assertRaises(SystemExit):
+                main(["login", "--email", "a@b.co"])
+
     def test_a_password_flag_does_not_exist(self):
         with mock.patch("sys.stderr", StringIO()):
             with self.assertRaises(SystemExit):
-                main(["login", "--email", "a@b.co", "--password", "hunter2"])
+                main(["login", "--password", "hunter2"])
 
-    def test_the_password_is_read_from_the_prompt_not_argv(self):
-        with mock.patch("getpass.getpass", return_value="pw-from-prompt") as prompt:
-            self.run_main(["--host", "https://x.test", "login", "--email", "a@b.co"],
-                          payload={"token": "t", "user": {"email": "a@b.co"}})
-        prompt.assert_called_once()
-        self.assertEqual("pw-from-prompt", json.loads(self.requests[0].data)["password"])
+    def test_the_code_is_read_from_the_prompt_not_argv(self):
+        code_, _, _ = self.run_login(
+            ["--host", "https://x.test", "login"],
+            token={"token": "t", "user": {"email": "a@b.co"}}, code="PASTED-CODE",
+        )
+        self.assertEqual(0, code_)
+        token_req = self.requests[-1]
+        self.assertEqual("PASTED-CODE", json.loads(token_req.data)["code"])
 
     def test_a_login_that_returns_no_token_keeps_the_old_one_and_revokes_nothing(self):
         config.save("https://x.test", "old-tok")
-        os.environ["VROXY_PASSWORD"] = "pw"
-        code, _, err = self.run_main(["--host", "https://x.test", "login", "--email", "a@b.co"],
-                                     payload={"user": {"email": "a@b.co"}})
-        self.assertEqual(1, code)
+        code_, _, err = self.run_login(
+            ["--host", "https://x.test", "login"],
+            token={"user": {"email": "a@b.co"}},
+        )
+        self.assertEqual(1, code_)
         self.assertIn("no token", err)
-        self.assertEqual(1, len(self.requests))
         self.assertEqual("old-tok", config.token_for("https://x.test"))
 
     def test_logging_in_again_with_the_same_token_does_not_revoke_it(self):
         config.save("https://x.test", "same-tok")
-        os.environ["VROXY_PASSWORD"] = "pw"
-        code, _, _ = self.run_main(["--host", "https://x.test", "login", "--email", "a@b.co"],
-                                   payload={"token": "same-tok", "user": {"email": "a@b.co"}})
-        self.assertEqual(0, code)
-        self.assertEqual(["/login"], [r.full_url.split("/api/mobile/v1")[1] for r in self.requests])
+        code_, _, _ = self.run_login(
+            ["--host", "https://x.test", "login"],
+            token={"token": "same-tok", "user": {"email": "a@b.co"}},
+        )
+        self.assertEqual(0, code_)
+        self.assertEqual(
+            ["/device/authorize", "/device/token"],
+            [r.full_url.split("/api/mobile/v1")[1] for r in self.requests],
+        )
 
     def test_the_old_token_is_revoked_on_the_host_that_minted_it(self):
         config.save("https://old.test", "old-tok")
-        os.environ["VROXY_PASSWORD"] = "pw"
-        self.run_main(["--host", "https://new.test", "login", "--email", "a@b.co"],
-                      payload={"token": "new-tok", "user": {"email": "a@b.co"}})
-        revoke = self.requests[1]
+        self.run_login(
+            ["--host", "https://new.test", "login"],
+            token={"token": "new-tok", "user": {"email": "a@b.co"}},
+        )
+        revoke = self.requests[-1]
         self.assertTrue(revoke.full_url.startswith("https://old.test/"))
         self.assertEqual("Bearer old-tok", revoke.get_header("Authorization"))
         self.assertEqual("new-tok", config.token_for("https://new.test"))
 
-    def test_the_saved_file_never_holds_the_password(self):
-        os.environ["VROXY_PASSWORD"] = "hunter2-secret"
-        self.run_main(["--host", "https://x.test", "login", "--email", "a@b.co"],
-                      payload={"token": "t", "user": {"email": "a@b.co"}})
-        self.assertNotIn("hunter2-secret", config.CREDENTIALS.read_text())
+    def test_the_saved_file_never_holds_the_device_or_user_code(self):
+        self.run_login(
+            ["--host", "https://x.test", "login"],
+            token={"token": "t", "user": {"email": "a@b.co"}}, code="PASTED-CODE",
+        )
+        saved = config.CREDENTIALS.read_text()
+        self.assertNotIn("dc123", saved)
+        self.assertNotIn("PASTED-CODE", saved)
 
     def test_logout_revokes_on_the_saved_host_even_when_another_is_given(self):
         config.save("https://saved.test", "tok")

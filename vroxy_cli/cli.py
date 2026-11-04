@@ -1,5 +1,4 @@
 import argparse
-import getpass
 import json
 import os
 import socket
@@ -26,25 +25,32 @@ def _emit(args, rows, plain):
 
 def cmd_login(args):
     host = args.host or os.environ.get("VROXY_HOST") or "https://vroxy.ai"
-    email = args.email or input("Email: ").strip()
-    # Never accepted as an argument: argv is world-readable via /proc
-    # and lands in shell history.
-    password = os.environ.get("VROXY_PASSWORD") or getpass.getpass("Password: ")
     mobile = args.mobile
 
     previous = config.load()
-    result = Client(host=host).login(email, password, device=socket.gethostname() or None, mobile=mobile)
+    client = Client(host=host)
+    auth = client.device_authorize(mobile=mobile, device=socket.gethostname() or None)
+    uri = auth.get("verification_uri")
+    if not uri:
+        raise VroxyError("Sign-in failed: no verification URL returned.")
+    print(f"Open this URL in your browser to sign in:\n  {uri}\n")
+
+    code = input("Paste the code shown on the page, then press Enter: ").strip()
+    if not code:
+        raise VroxyError("No code entered.")
+
+    result = client.device_token(auth.get("device_code"), code)
     token = result.get("token")
     if not token:
-        raise VroxyError("Login succeeded but returned no token.")
-    save_kwargs = {"email": result.get("user", {}).get("email") or email}
+        raise VroxyError("Sign-in succeeded but returned no token.")
+    email = result.get("user", {}).get("email") or "?"
     if mobile:
-        save_kwargs["mobile_token"] = token
+        save_kwargs = {"mobile_token": token, "email": email}
     else:
-        save_kwargs["token"] = token
+        save_kwargs = {"token": token, "email": email}
     path = config.save(host, **save_kwargs)
     scope = "mobile" if mobile else "agent"
-    print(f"Signed in as {save_kwargs['email']} ({scope} token) — saved to {path}")
+    print(f"Signed in as {email} ({scope} token) — saved to {path}")
 
     prev_key = "mobile_token" if mobile else "token"
     if previous.get(prev_key) and previous[prev_key] != token:
@@ -520,7 +526,6 @@ def build_parser():
     sub = p.add_subparsers(dest="command", required=True)
 
     login = sub.add_parser("login", help="Sign in and save a token")
-    login.add_argument("--email")
     login.add_argument("--mobile", action="store_true",
                        help="Mint a mobile-scoped token for workspace/room/member writes")
     login.set_defaults(func=cmd_login)

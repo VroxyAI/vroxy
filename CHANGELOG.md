@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.57.0
+
+### Changed
+- `vroxy login` no longer prompts for an email or password (and the
+  `--email` flag and `VROXY_PASSWORD` env are gone). It now runs a
+  device-authorization flow: the CLI POSTs `/device/authorize`, prints
+  the `/device?code=…` verification link, and then waits for the code
+  the web approval page shows — the person signs in and approves in the
+  browser, pastes the code back, and the CLI exchanges `device_code` +
+  the pasted code for the token. `--mobile` still mints a mobile-scoped
+  token the same way.
+
 ## 0.56.1
 
 ### Added
