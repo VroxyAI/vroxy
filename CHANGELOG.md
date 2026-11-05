@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.57.2
+
+### Changed
+- The skills repo moved to `VroxyAI/vroxy_skills` and is now public; the
+  installer clones it over HTTPS with no auth.
+
 ## 0.57.1
 
 ### Added

@@ -260,9 +260,9 @@ SKILL_HARNESSES=(
 # The vroxy agent skills (`vroxy`, `vroxy-docs`, …) live in their own
 # repo, which ships an installer that drops them into whichever harnesses
 # are present.  Reuse a sibling checkout if there is one, else clone the
-# shared copy — the repo is private, so a box with no key for it just
+# shared copy.  Public, so no auth — but a box that can't reach it just
 # skips skills rather than failing the install.
-SKILLS_REPO_URL="${VROXY_SKILLS_REPO_URL:-git@github.com:wartron/vroxy_skills.git}"
+SKILLS_REPO_URL="${VROXY_SKILLS_REPO_URL:-https://github.com/VroxyAI/vroxy_skills.git}"
 SKILLS_CHECKOUT="${VROXY_HOME:-$HOME/.local/share}/vroxy_skills"
 
 # Which of the skill-capable harnesses are on this box — one label per
