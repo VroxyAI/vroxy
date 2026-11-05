@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.57.1
+
+### Added
+- The installer is now self-aware on a rerun: `install.sh` tells you
+  the CLI is already installed and asks to update it (default yes), then
+  detects which coding harnesses are on the box and offers to install
+  the vroxy skills into each (default yes, via the `vroxy_skills`
+  installer — a sibling checkout is reused, else the shared clone under
+  `~/.local/share`), and finally reports any dispatch agents already set
+  up before offering to add another.
+
 ## 0.57.0
 
 ### Changed

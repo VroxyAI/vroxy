@@ -2,7 +2,7 @@
 #
 # vroxy installer — the CLI, and optionally a dispatch agent.
 #
-#   ./install.sh              install the CLI, then offer a dispatch agent
+#   ./install.sh              install the CLI, offer skills + a dispatch agent
 #   ./install.sh --cli        install just the `vroxy` CLI
 #   ./install.sh --dispatch   add a dispatch workspace (no CLI prompt)
 #   ./install.sh --unattended add a workspace from the environment
@@ -241,6 +241,80 @@ suggest_harnesses() {
   else
     say "  systemctl --user restart vroxy-dispatch@${id}.service"
   fi
+}
+
+# The harnesses the skills installer can reach — mirrors the HARNESS_ROOTS
+# table in vroxy_skills/install_skills.py (bin → skill-root).  A harness
+# whose root is unknown is deliberately absent until its convention is
+# confirmed, same as that file.
+SKILL_HARNESSES=(
+  "claude|Claude Code"
+  "cursor-agent|Cursor Agent"
+  "codex|OpenAI Codex"
+  "copilot|GitHub Copilot CLI"
+  "opencode|OpenCode"
+  "gemini|Gemini CLI"
+  "amp|Amp"
+)
+
+# The vroxy agent skills (`vroxy`, `vroxy-docs`, …) live in their own
+# repo, which ships an installer that drops them into whichever harnesses
+# are present.  Reuse a sibling checkout if there is one, else clone the
+# shared copy — the repo is private, so a box with no key for it just
+# skips skills rather than failing the install.
+SKILLS_REPO_URL="${VROXY_SKILLS_REPO_URL:-git@github.com:wartron/vroxy_skills.git}"
+SKILLS_CHECKOUT="${VROXY_HOME:-$HOME/.local/share}/vroxy_skills"
+
+# Which of the skill-capable harnesses are on this box — one label per
+# line, nothing when none.
+detect_skill_harnesses() {
+  local line bin label
+  for line in "${SKILL_HARNESSES[@]}"; do
+    IFS='|' read -r bin label <<<"$line"
+    harness_bin_installed "$bin" && printf '%s\n' "$label"
+  done
+  return 0
+}
+
+skills_checkout() {
+  if [[ -f "$SKILLS_CHECKOUT/install_skills.py" ]]; then
+    printf '%s\n' "$SKILLS_CHECKOUT"; return 0
+  fi
+  local sibling="${HERE%/}/../vroxy_skills"
+  if [[ -f "$sibling/install_skills.py" ]]; then
+    printf '%s\n' "$sibling"; return 0
+  fi
+  command -v git >/dev/null 2>&1 || return 1
+  git clone --quiet "$SKILLS_REPO_URL" "$SKILLS_CHECKOUT" 2>/dev/null &&
+    printf '%s\n' "$SKILLS_CHECKOUT"
+}
+
+# Detect the harnesses and offer to install the vroxy skills into each.
+# Defaults to yes, like the update prompt — the whole point of running
+# the installer is to get the box usable.
+offer_skills() {
+  [[ -t 0 ]] || return 0
+  local found=() label checkout labels
+  while IFS= read -r label; do
+    [[ -n "$label" ]] && found+=("$label")
+  done < <(detect_skill_harnesses)
+  if [[ ${#found[@]} -eq 0 ]]; then
+    say "No coding harnesses found — skipping the vroxy skills."
+    return 0
+  fi
+  printf -v labels '%s, ' "${found[@]}"
+  labels="${labels%, }"
+  checkout="$(skills_checkout)" || {
+    say "Found ${#found[@]} harness(es) (${labels}), but couldn't fetch the skills repo — skipping."
+    return 0
+  }
+  say "Found ${#found[@]} harness(es): ${labels}"
+  local answer
+  read_prompt answer "Install the vroxy skills into each? [Y/n] " || answer=""
+  case "$answer" in
+    [nN]*) say "Skipped skills.  Install later: python3 ${checkout}/install_skills.py" ;;
+    *)     python3 "$checkout/install_skills.py" || warn "skill install reported a problem" ;;
+  esac
 }
 
 python_setup_hint() {
@@ -920,6 +994,15 @@ remove_instance() {
 # ordinary command and has no business needing root.  pipx when it is
 # there (its own venv, no clashes), pip --user otherwise.
 install_cli() {
+  if command -v vroxy >/dev/null 2>&1; then
+    local current answer
+    current="$(vroxy --version 2>/dev/null || echo unknown)"
+    say "The vroxy CLI is already installed (${current})."
+    read_prompt answer "Update it from this checkout? [Y/n] " || answer=""
+    case "$answer" in
+      [nN]*) say "Keeping the installed CLI."; return 0 ;;
+    esac
+  fi
   ensure_python_toolchain
   if command -v pipx >/dev/null 2>&1; then
     pipx install --force "$HERE" >/dev/null || die "pipx install failed"
@@ -952,9 +1035,20 @@ install_cli() {
 # typed `curl | bash` for a command expects.
 default_install() {
   install_cli
+  offer_skills
   if [[ ! -t 0 ]]; then
     say "Not a terminal — skipping the dispatch agent.  Run ./install.sh --dispatch to add one."
     return
+  fi
+  local existing=0 id
+  while read -r id; do
+    [[ -n "$id" ]] && existing=$((existing + 1))
+  done < <(instances)
+  if [[ $existing -gt 0 ]]; then
+    say ""
+    say "${existing} dispatch agent(s) already on this box:"
+    list_instances
+    say ""
   fi
   local answer
   read_prompt answer $'\nAlso run a dispatch agent on this machine? It connects to one\nworkspace and installs a systemd unit. [y/N] ' || answer=""

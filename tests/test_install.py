@@ -291,6 +291,51 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual("no", result.stdout.strip())
 
+    def test_detect_skill_harnesses_names_only_installed_harnesses(self):
+        result = run_sourced(
+            "harness_bin_installed() { case \"$1\" in claude|codex) return 0;; *) return 1;; esac; }\n"
+            "detect_skill_harnesses")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Claude Code", result.stdout)
+        self.assertIn("OpenAI Codex", result.stdout)
+        self.assertNotIn("Amp", result.stdout)
+        self.assertNotIn("Gemini CLI", result.stdout)
+
+    def test_detect_skill_harnesses_is_empty_when_none_are_present(self):
+        result = run_sourced(
+            "harness_bin_installed() { return 1; }\n"
+            "detect_skill_harnesses")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stdout.strip())
+
+    def test_skills_checkout_uses_an_existing_checkout(self):
+        skills = self.tmp / "vroxy_skills"
+        skills.mkdir()
+        (skills / "install_skills.py").write_text("")
+        result = run_sourced("skills_checkout", env_extra={"VROXY_HOME": str(self.tmp)})
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(str(skills), result.stdout.strip())
+
+    def test_install_cli_declines_an_update(self):
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        (bindir / "vroxy").write_text(
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 'vroxy 1.2.3' && exit 0\nexit 0\n")
+        (bindir / "vroxy").chmod(0o755)
+        result = run_sourced(
+            "read_prompt() { local v=$1; printf -v \"$v\" '%s' n; }\n"
+            "install_cli",
+            path_dirs=[bindir])
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("already installed", result.stdout)
+        self.assertIn("Keeping the installed CLI", result.stdout)
+        self.assertNotIn("pipx", result.stdout)
+
+    def test_offer_skills_is_a_no_op_without_a_tty(self):
+        result = run_sourced("offer_skills")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stdout.strip())
+
 
 if __name__ == "__main__":
     unittest.main()
