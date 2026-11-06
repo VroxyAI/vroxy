@@ -140,6 +140,10 @@ class Client:
         workspace = self._resolve_workspace(workspace)
         return self._request("GET", f"/workspaces/{workspace}/dispatch")
 
+    def remove_agent(self, workspace, agent):
+        workspace = self._resolve_workspace(workspace, mobile=True)
+        return self._request("DELETE", f"/workspaces/{workspace}/dispatch/{agent}", mobile=True)
+
     def docs(self, workspace, status=None, q=None):
         workspace = self._resolve_workspace(workspace)
         query = _query({"status": status, "q": q})

@@ -214,6 +214,75 @@ def cmd_agents(args):
     _emit(args, payload, plain)
 
 
+def _doctor_issues(agent, latest):
+    issues = []
+    if not agent.get("online"):
+        issues.append("offline")
+    for h in agent.get("harnesses") or []:
+        if h.get("problem"):
+            issues.append(h["problem"])
+        elif h.get("active") and h.get("healthy") is False:
+            issues.append(f"{h.get('id')} unhealthy")
+    severity = agent.get("release_severity")
+    if severity and severity != "none":
+        target = f" → {latest}" if latest else ""
+        issues.append(f"behind release{target}")
+    return issues
+
+
+def cmd_doctor(args):
+    client = _client(args)
+    payload = client.agents(args.workspace)
+    agents = payload.get("agents", [])
+    latest = payload.get("latest_version")
+
+    diagnosis = [
+        {
+            "name": a.get("name"),
+            "id": a.get("id"),
+            "kind": a.get("kind"),
+            "online": a.get("online"),
+            "version": a.get("version"),
+            "issues": _doctor_issues(a, latest),
+        }
+        for a in agents
+    ]
+
+    if getattr(args, "json", False):
+        print(json.dumps({"latest_version": latest, "agents": diagnosis}, indent=2))
+        return
+
+    if not agents:
+        print("No dispatch agents.")
+        return
+
+    removable = [d for d in diagnosis if d["issues"]]
+    if not removable:
+        release = f" (release {latest})" if latest else ""
+        print(f"{len(agents)} agent(s), no problems.{release}")
+        return
+
+    release = f" (release {latest})" if latest else ""
+    print(f"{len(removable)} of {len(agents)} agent(s) have problems:{release}")
+    for d in removable:
+        print(f"  {d['name']} ({d['kind']}): " + "; ".join(d["issues"]))
+
+    print()
+    for d in removable:
+        name = d["name"]
+        try:
+            answer = input(f"Remove {name}? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            continue
+        try:
+            client.remove_agent(args.workspace, d["id"])
+            print(f"  Removed {name}.")
+        except VroxyError as e:
+            print(f"  Couldn't remove {name}: {e}", file=sys.stderr)
+
+
 def _body_from(args):
     if args.body == "-":
         return sys.stdin.read()
@@ -519,7 +588,7 @@ def _tool_params(raw):
 
 
 _WORKSPACE_COMMANDS = (
-    "rooms", "read", "post", "dispatch", "agents", "docs",
+    "rooms", "read", "post", "dispatch", "agents", "doctor", "docs",
     "members", "tools", "search", "chats", "errors", "usage",
     "visitors", "targets",
 )
@@ -635,6 +704,10 @@ def build_parser():
     agents = sub.add_parser("agents", help="Every dispatch agent and its status")
     agents.add_argument("workspace")
     agents.set_defaults(func=cmd_agents)
+
+    doctor = sub.add_parser("doctor", help="Diagnose the workspace's dispatch agents")
+    doctor.add_argument("workspace")
+    doctor.set_defaults(func=cmd_doctor)
 
     docs = sub.add_parser("docs", help="Knowledge-base docs the bot answers from")
     docs.add_argument("workspace")

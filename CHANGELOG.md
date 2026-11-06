@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.58.0
+
+### Added
+- `vroxy doctor <workspace>` diagnoses the workspace's dispatch agents in
+  one pass — offline, an unhealthy harness (`problem`), or behind the
+  pinned release — and asks whether to remove each one (default no).
+  Removal uses a `mobile`-scoped token and the new
+  `DELETE /api/mobile/v1/workspaces/:id/dispatch/:id` endpoint; `--json`
+  prints the diagnosis without prompting.
+
 ## 0.57.3
 
 ### Added

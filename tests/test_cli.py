@@ -511,6 +511,23 @@ class ReadClientTest(unittest.TestCase):
 
         self.assertIn("vroxy login --mobile", str(ctx.exception))
 
+    def test_remove_agent_hits_the_destroy_route_with_the_mobile_token(self):
+        seen = {}
+
+        def fake(req, timeout=None):
+            seen["method"] = req.get_method()
+            seen["url"] = req.full_url
+            seen["auth"] = req.get_header("Authorization")
+            return _response({})
+
+        client = Client(host="https://x.test", token="agent", mobile_token="mobile")
+        with mock.patch("urllib.request.urlopen", side_effect=fake):
+            client.remove_agent("ws1", "a1")
+
+        self.assertEqual("DELETE", seen["method"])
+        self.assertEqual("https://x.test/api/mobile/v1/workspaces/ws1/dispatch/a1", seen["url"])
+        self.assertEqual("Bearer mobile", seen["auth"])
+
     def test_read_endpoints_hit_the_workspace_paths(self):
         cases = [
             (lambda c: c.errors("ws1", source="js", page=2), "/workspaces/ws1/errors?source=js&page=2"),
@@ -1100,6 +1117,90 @@ class CompletionTest(unittest.TestCase):
             if any(a.dest == "workspace" and not a.option_strings for a in sub._actions)
         }
         self.assertEqual(set(_WORKSPACE_COMMANDS), expected)
+
+
+class DoctorCommandTest(_IsolatedConfig):
+    def serve_routes(self, routes):
+        def fake(req, timeout=None):
+            self.requests.append(req)
+            path = req.full_url.split("/api/mobile/v1", 1)[1]
+            outcome = routes.get(path)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return _response(outcome if outcome is not None else {})
+
+        return mock.patch("urllib.request.urlopen", side_effect=fake)
+
+    def run_doctor(self, agents, argv=None, stdin=None):
+        config.save("https://x.test", "tok")
+        config.save("https://x.test", token="tok", mobile_token="mobile")
+        routes = {
+            "/workspaces": {"workspaces": [{"hashid": "ws1", "name": "Acme", "role": "owner"}]},
+            "/workspaces/ws1/dispatch": {"agents": agents, "latest_version": "0.57.3"},
+        }
+        out, err = StringIO(), StringIO()
+        patches = [self.serve_routes(routes), mock.patch("sys.stdout", out), mock.patch("sys.stderr", err)]
+        if stdin is not None:
+            patches.append(mock.patch("sys.stdin", StringIO(stdin)))
+        for p in patches:
+            p.start()
+        try:
+            code = main(argv or ["doctor", "ws1"])
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return code, out.getvalue(), err.getvalue()
+
+    def problem_agent(self):
+        return {
+            "name": "Brevitas", "id": "a1", "kind": "vroxy_dispatch", "online": True,
+            "version": "0.55.0", "release_severity": "minor",
+            "harnesses": [{"id": "claude", "active": True, "healthy": False,
+                           "problem": "it stopped responding"}],
+        }
+
+    def test_doctor_removes_a_problem_agent_when_answered_yes(self):
+        code, out, err = self.run_doctor([self.problem_agent()], stdin="y\n")
+
+        self.assertEqual(0, code, err)
+        self.assertIn("Brevitas", out)
+        self.assertIn("behind release", out)
+        self.assertIn("it stopped responding", out)
+        self.assertIn("Removed Brevitas", out)
+        deleted = [r.full_url.split("/api/mobile/v1")[1]
+                   for r in self.requests if r.get_method() == "DELETE"]
+        self.assertEqual(["/workspaces/ws1/dispatch/a1"], deleted)
+
+    def test_doctor_leaves_the_agent_when_answered_no(self):
+        code, out, _ = self.run_doctor([self.problem_agent()], stdin="n\n")
+
+        self.assertEqual(0, code)
+        self.assertIn("Brevitas", out)
+        self.assertNotIn("Removed", out)
+        self.assertFalse([r for r in self.requests if r.get_method() == "DELETE"])
+
+    def test_doctor_json_reports_without_prompting(self):
+        code, out, err = self.run_doctor([self.problem_agent()], argv=["--json", "doctor", "ws1"])
+
+        self.assertEqual(0, code, err)
+        body = json.loads(out)
+        self.assertEqual("0.57.3", body["latest_version"])
+        self.assertIn("behind release → 0.57.3", body["agents"][0]["issues"])
+        self.assertFalse([r for r in self.requests if r.get_method() == "DELETE"])
+
+    def test_doctor_with_no_agents_says_so(self):
+        code, out, _ = self.run_doctor([])
+        self.assertEqual(0, code)
+        self.assertIn("No dispatch agents", out)
+
+    def test_doctor_with_healthy_agents_reports_no_problems(self):
+        healthy = {
+            "name": "GitHub", "id": "a2", "kind": "github", "online": True,
+            "version": "0.57.3", "release_severity": "none", "harnesses": [],
+        }
+        code, out, _ = self.run_doctor([healthy])
+        self.assertEqual(0, code)
+        self.assertIn("no problems", out)
 
 
 if __name__ == "__main__":
