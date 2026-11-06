@@ -325,11 +325,43 @@ class InstallScriptTest(unittest.TestCase):
         result = run_sourced(
             "read_prompt() { local v=$1; printf -v \"$v\" '%s' n; }\n"
             "install_cli",
-            path_dirs=[bindir])
+            path_dirs=[bindir],
+            env_extra={"HOME": str(self.tmp / "home")})
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("already installed", result.stdout)
         self.assertIn("Keeping the installed CLI", result.stdout)
         self.assertNotIn("pipx", result.stdout)
+
+    def test_install_completion_writes_the_script_and_sources_it_from_bashrc(self):
+        home = self.tmp / "home"
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        (bindir / "vroxy").write_text(
+            "#!/bin/sh\n[ \"$1\" = \"completion\" ] && echo 'complete -F _vroxy_complete vroxy' && exit 0\nexit 0\n")
+        (bindir / "vroxy").chmod(0o755)
+        result = run_sourced(
+            "install_completion",
+            path_dirs=[bindir],
+            env_extra={"HOME": str(home), "XDG_DATA_HOME": str(home / "data")})
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Installed bash completion", result.stdout)
+        bashrc = (home / ".bashrc").read_text()
+        self.assertIn("# vroxy bash completion", bashrc)
+        self.assertIn("completion.bash", bashrc)
+
+    def test_install_completion_skips_when_the_script_comes_back_empty(self):
+        home = self.tmp / "home"
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        (bindir / "vroxy").write_text("#!/bin/sh\nexit 0\n")
+        (bindir / "vroxy").chmod(0o755)
+        result = run_sourced(
+            "install_completion",
+            path_dirs=[bindir],
+            env_extra={"HOME": str(home), "XDG_DATA_HOME": str(home / "data")})
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stdout.strip())
+        self.assertFalse((home / ".bashrc").exists())
 
     def test_offer_skills_is_a_no_op_without_a_tty(self):
         result = run_sourced("offer_skills")

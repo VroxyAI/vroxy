@@ -518,6 +518,65 @@ def _tool_params(raw):
     return params or None
 
 
+_WORKSPACE_COMMANDS = (
+    "rooms", "read", "post", "dispatch", "agents", "docs",
+    "members", "tools", "search", "chats", "errors", "usage",
+    "visitors", "targets",
+)
+
+
+_BASH_COMPLETION = """\
+_vroxy_complete() {
+    local cur cmd i cmd_idx=0
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    cmd=""
+    for ((i = 1; i < COMP_CWORD; i++)); do
+        case "${COMP_WORDS[i]}" in
+            -*) ;;
+            *) cmd="${COMP_WORDS[i]}"; cmd_idx=$i; break ;;
+        esac
+    done
+
+    if [[ -z "$cmd" ]]; then
+        local cmds
+        cmds="$(vroxy --help 2>/dev/null | sed -n 's/.*{\\([^}]*\\)}.*/\\1/p' | head -n1 | tr ',' ' ')"
+        COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
+        return
+    fi
+
+    if [[ $((COMP_CWORD - cmd_idx)) -eq 1 ]] && [[ " __WS_COMMANDS__ " == *" $cmd "* ]]; then
+        local IFS=$'\\n'
+        local names
+        names="$(vroxy workspaces 2>/dev/null | awk '{ print $1; if (NF >= 3) { n=$3; for (i=4; i<=NF; i++) n=n" "$i; print n } }')"
+        COMPREPLY=( $(compgen -W "$names" -- "$cur") )
+        return
+    fi
+
+    local subacts flags
+    subacts="$(vroxy "$cmd" --help 2>/dev/null | sed -n 's/.*{\\([^}]*\\)}.*/\\1/p' | head -n1 | tr ',' ' ')"
+    flags="$(vroxy "$cmd" --help 2>/dev/null | grep -oE -- '--[a-z][a-z-]*' | sort -u | tr '\\n' ' ')"
+    if [[ " $flags " == *" --file "* ]]; then
+        COMPREPLY=( $(compgen -W "$subacts $flags" -f -- "$cur") )
+    else
+        COMPREPLY=( $(compgen -W "$subacts $flags" -- "$cur") )
+    fi
+}
+
+complete -F _vroxy_complete vroxy
+"""
+
+
+def _bash_completion():
+    return _BASH_COMPLETION.replace("__WS_COMMANDS__", " ".join(_WORKSPACE_COMMANDS))
+
+
+def cmd_completion(args):
+    if args.shell == "bash":
+        print(_bash_completion())
+    else:
+        raise VroxyError(f"unsupported shell: {args.shell}")
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="vroxy", description="Talk to a vroxy workspace.")
     p.add_argument("--version", action="version", version=f"vroxy {VERSION}")
@@ -532,6 +591,10 @@ def build_parser():
 
     sub.add_parser("logout", help="Revoke the saved tokens and forget them").set_defaults(func=cmd_logout)
     sub.add_parser("whoami", help="Who the saved token belongs to").set_defaults(func=cmd_whoami)
+
+    completion = sub.add_parser("completion", help="Print a shell completion script")
+    completion.add_argument("shell", choices=["bash"])
+    completion.set_defaults(func=cmd_completion)
 
     workspaces = sub.add_parser("workspaces", help="Workspaces you hold a seat in")
     ws_sub = workspaces.add_subparsers(dest="action")

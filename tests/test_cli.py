@@ -110,6 +110,43 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(seen["ua"], USER_AGENT)
 
 
+class WorkspaceResolutionTest(unittest.TestCase):
+    def resolve(self, rows, workspace):
+        client = Client(host="https://x.test", token="t")
+        client.workspaces = mock.MagicMock(return_value=rows)
+        return client._resolve_workspace(workspace)
+
+    def test_a_hashid_passes_through_unchanged(self):
+        rows = [{"hashid": "fudmnx3e", "name": "Brevitas"}]
+        self.assertEqual(self.resolve(rows, "fudmnx3e"), "fudmnx3e")
+
+    def test_an_exact_name_resolves_to_its_hashid(self):
+        rows = [{"hashid": "fudmnx3e", "name": "Brevitas"}]
+        self.assertEqual(self.resolve(rows, "Brevitas"), "fudmnx3e")
+
+    def test_the_name_match_is_case_insensitive(self):
+        rows = [{"hashid": "fudmnx3e", "name": "Brevitas"}]
+        self.assertEqual(self.resolve(rows, "brevitas"), "fudmnx3e")
+        self.assertEqual(self.resolve(rows, "BREVITAS"), "fudmnx3e")
+
+    def test_a_hashid_beats_a_name_spelled_the_same(self):
+        rows = [{"hashid": "abc12345", "name": "abc12345"}]
+        self.assertEqual(self.resolve(rows, "abc12345"), "abc12345")
+
+    def test_an_ambiguous_name_lists_the_candidates(self):
+        rows = [
+            {"hashid": "a", "name": "Movie Calendar"},
+            {"hashid": "b", "name": "movie calendar"},
+        ]
+        with self.assertRaises(VroxyError) as ctx:
+            self.resolve(rows, "MOVIE CALENDAR")
+        self.assertIn("2 workspaces", str(ctx.exception))
+
+    def test_an_unknown_name_passes_through_for_the_server_to_refuse(self):
+        rows = [{"hashid": "a", "name": "Vroxy"}]
+        self.assertEqual(self.resolve(rows, "nope"), "nope")
+
+
 class CliTest(unittest.TestCase):
     def test_an_error_exits_nonzero_rather_than_raising(self):
         with mock.patch("vroxy_cli.cli._client") as fake:
@@ -930,7 +967,7 @@ class PostCommandTest(_IsolatedConfig):
         code, out, _ = self.run_main(["post", "ws1", "rm1", "-"], payload={"message": {}},
                                      stdin="  multi\nline  \n")
         self.assertEqual(0, code)
-        self.assertEqual({"body": "multi\nline"}, json.loads(self.requests[0].data))
+        self.assertEqual({"body": "multi\nline"}, json.loads(self.requests[-1].data))
         self.assertEqual("Posted.\n", out)
 
     def test_empty_stdin_posts_nothing(self):
@@ -994,6 +1031,75 @@ class InterruptTest(unittest.TestCase):
         with mock.patch("vroxy_cli.cli._client") as fake:
             fake.return_value.workspaces.side_effect = KeyboardInterrupt
             self.assertEqual(130, main(["workspaces"]))
+
+
+class WorkspaceNameResolutionCliTest(_IsolatedConfig):
+    def serve_routes(self, routes):
+        def fake(req, timeout=None):
+            self.requests.append(req)
+            path = req.full_url.split("/api/mobile/v1", 1)[1]
+            outcome = routes.get(path)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return _response(outcome if outcome is not None else {})
+
+        return mock.patch("urllib.request.urlopen", side_effect=fake)
+
+    def test_agents_resolves_the_workspace_name_case_insensitively(self):
+        config.save("https://x.test", "tok")
+        routes = {
+            "/workspaces": {"workspaces": [{"hashid": "fudmnx3e", "name": "Brevitas", "role": "admin"}]},
+            "/workspaces/fudmnx3e/dispatch": {"agents": []},
+        }
+        out, err = StringIO(), StringIO()
+        with self.serve_routes(routes), mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            code = main(["agents", "brevitas"])
+
+        self.assertEqual(0, code, err.getvalue())
+        self.assertEqual(
+            [r.full_url.split("/api/mobile/v1")[1] for r in self.requests],
+            ["/workspaces", "/workspaces/fudmnx3e/dispatch"],
+        )
+
+    def test_a_hashid_argument_skips_no_requests_and_works(self):
+        config.save("https://x.test", "tok")
+        routes = {
+            "/workspaces": {"workspaces": [{"hashid": "fudmnx3e", "name": "Brevitas", "role": "admin"}]},
+            "/workspaces/fudmnx3e/dispatch": {"agents": []},
+        }
+        with self.serve_routes(routes), mock.patch("sys.stdout", StringIO()), mock.patch("sys.stderr", StringIO()):
+            code = main(["agents", "fudmnx3e"])
+
+        self.assertEqual(0, code)
+        self.assertEqual(
+            [r.full_url.split("/api/mobile/v1")[1] for r in self.requests],
+            ["/workspaces", "/workspaces/fudmnx3e/dispatch"],
+        )
+
+
+class CompletionTest(unittest.TestCase):
+    def test_completion_emits_a_bash_script(self):
+        with mock.patch("builtins.print") as printed:
+            code = main(["completion", "bash"])
+
+        self.assertEqual(code, 0)
+        script = printed.call_args[0][0]
+        self.assertIn("complete -F _vroxy_complete vroxy", script)
+        self.assertIn("agents", script)
+
+    def test_completion_workspace_commands_cover_every_workspace_parser(self):
+        import argparse
+
+        from vroxy_cli.cli import _WORKSPACE_COMMANDS, build_parser
+
+        parser = build_parser()
+        sub_action = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        expected = {
+            name
+            for name, sub in sub_action.choices.items()
+            if any(a.dest == "workspace" and not a.option_strings for a in sub._actions)
+        }
+        self.assertEqual(set(_WORKSPACE_COMMANDS), expected)
 
 
 if __name__ == "__main__":

@@ -1000,7 +1000,7 @@ install_cli() {
     say "The vroxy CLI is already installed (${current})."
     read_prompt answer "Update it from this checkout? [Y/n] " || answer=""
     case "$answer" in
-      [nN]*) say "Keeping the installed CLI."; return 0 ;;
+      [nN]*) install_completion; say "Keeping the installed CLI."; return 0 ;;
     esac
   fi
   ensure_python_toolchain
@@ -1024,9 +1024,28 @@ install_cli() {
     mkdir -p "$HOME/.local/bin"
     ln -sf "$HERE/.venv-cli/bin/vroxy" "$HOME/.local/bin/vroxy"
   fi
+  install_completion
   say "Installed the vroxy CLI.  Try: vroxy --help"
   command -v vroxy >/dev/null 2>&1 ||
     warn "vroxy is not on PATH yet — add ~/.local/bin to PATH, or restart your shell."
+}
+
+install_completion() {
+  command -v vroxy >/dev/null 2>&1 || return 0
+  local dir="${XDG_DATA_HOME:-$HOME/.local/share}/vroxy"
+  local f="$dir/completion.bash"
+  local bashrc="$HOME/.bashrc"
+  mkdir -p "$dir"
+  if ! vroxy completion bash > "$f" 2>/dev/null || [[ ! -s "$f" ]]; then
+    rm -f "$f"
+    return 0
+  fi
+  [[ -f "$bashrc" ]] || touch "$bashrc"
+  local marker="# vroxy bash completion"
+  if ! grep -Fq "$marker" "$bashrc" 2>/dev/null; then
+    printf '\n%s\n[ -f %s ] && source %s\n' "$marker" "$f" "$f" >> "$bashrc"
+    say "Installed bash completion (${f}). Open a new shell, or run: source ~/.bashrc"
+  fi
 }
 
 # The default install: everyone wants the CLI, only some people want a

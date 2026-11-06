@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.57.3
+
+### Added
+- The `workspace` argument on every command now also accepts the workspace
+  name, case-insensitively, not just the hashid — resolved against the
+  workspaces the token holds a seat in, with an ambiguity error when two
+  names differ only by case.
+- `vroxy completion bash` prints a self-contained bash completion script
+  (subcommands, `workspace` names + hashids, per-command flags and
+  subactions). `install.sh` writes it under `~/.local/share/vroxy` and
+  sources it from `~/.bashrc`.
+
 ## 0.57.2
 
 ### Changed

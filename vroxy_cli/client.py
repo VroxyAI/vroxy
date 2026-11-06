@@ -91,114 +91,162 @@ class Client:
     def me(self):
         return self._request("GET", "/me")
 
-    def workspaces(self):
-        return self._request("GET", "/workspaces").get("workspaces", [])
+    def workspaces(self, mobile=False):
+        return self._request("GET", "/workspaces", mobile=mobile).get("workspaces", [])
+
+    def _resolve_workspace(self, workspace, mobile=False):
+        if not workspace:
+            return workspace
+        key = str(workspace)
+        rows = self.workspaces(mobile=mobile)
+        for w in rows:
+            if w.get("hashid") == key:
+                return key
+        for w in rows:
+            if w.get("name") == key:
+                return w.get("hashid")
+        folded = key.casefold()
+        matches = [w for w in rows if (w.get("name") or "").casefold() == folded]
+        if len(matches) == 1:
+            return matches[0].get("hashid")
+        if len(matches) > 1:
+            names = ", ".join(sorted(w.get("name") or "?" for w in matches))
+            raise VroxyError(f"'{key}' matches {len(matches)} workspaces ({names}) — pass a hashid")
+        return key
 
     def rooms(self, workspace):
+        workspace = self._resolve_workspace(workspace)
         return self._request("GET", f"/workspaces/{workspace}/rooms").get("rooms", [])
 
     def messages(self, workspace, room, limit=20):
+        limit = int(limit)
+        workspace = self._resolve_workspace(workspace)
         payload = self._request(
-            "GET", f"/workspaces/{workspace}/rooms/{room}/messages?limit={int(limit)}"
+            "GET", f"/workspaces/{workspace}/rooms/{room}/messages?limit={limit}"
         )
         return payload.get("messages", [])
 
     def post_message(self, workspace, room, body):
+        workspace = self._resolve_workspace(workspace)
         return self._request(
             "POST", f"/workspaces/{workspace}/rooms/{room}/messages", {"body": body}
         )
 
     def dispatch_status(self, workspace):
+        workspace = self._resolve_workspace(workspace)
         return self._request("GET", f"/workspaces/{workspace}/dispatch_status")
 
     def agents(self, workspace):
+        workspace = self._resolve_workspace(workspace)
         return self._request("GET", f"/workspaces/{workspace}/dispatch")
 
     def docs(self, workspace, status=None, q=None):
+        workspace = self._resolve_workspace(workspace)
         query = _query({"status": status, "q": q})
         return self._request("GET", f"/workspaces/{workspace}/docs{query}").get("docs", [])
 
     def doc(self, workspace, doc):
+        workspace = self._resolve_workspace(workspace)
         return self._request("GET", f"/workspaces/{workspace}/docs/{doc}").get("doc", {})
 
     def create_doc(self, workspace, **fields):
+        workspace = self._resolve_workspace(workspace)
         payload = self._request("POST", f"/workspaces/{workspace}/docs", {"doc": _compact(fields)})
         return payload.get("doc", {})
 
     def update_doc(self, workspace, doc, **fields):
+        workspace = self._resolve_workspace(workspace)
         payload = self._request(
             "PATCH", f"/workspaces/{workspace}/docs/{doc}", {"doc": _compact(fields)}
         )
         return payload.get("doc", {})
 
     def publish_doc(self, workspace, doc, published=True):
+        workspace = self._resolve_workspace(workspace)
         verb = "publish" if published else "unpublish"
         payload = self._request("POST", f"/workspaces/{workspace}/docs/{doc}/{verb}")
         return payload.get("doc", {})
 
     def delete_doc(self, workspace, doc):
+        workspace = self._resolve_workspace(workspace)
         return self._request("DELETE", f"/workspaces/{workspace}/docs/{doc}")
 
     def members(self, workspace):
+        workspace = self._resolve_workspace(workspace)
         return self._request("GET", f"/workspaces/{workspace}/members")
 
     def tools(self, workspace):
+        workspace = self._resolve_workspace(workspace)
         return self._request("GET", f"/workspaces/{workspace}/tools").get("tools", [])
 
     def tool(self, workspace, tool):
+        workspace = self._resolve_workspace(workspace)
         return self._request("GET", f"/workspaces/{workspace}/tools/{tool}").get("tool", {})
 
     def create_tool(self, workspace, **fields):
+        workspace = self._resolve_workspace(workspace)
         payload = self._request("POST", f"/workspaces/{workspace}/tools", {"tool": _compact(fields)})
         return payload.get("tool", {})
 
     def update_tool(self, workspace, tool, **fields):
+        workspace = self._resolve_workspace(workspace)
         payload = self._request(
             "PATCH", f"/workspaces/{workspace}/tools/{tool}", {"tool": _compact(fields)}
         )
         return payload.get("tool", {})
 
     def toggle_tool(self, workspace, tool, enabled=None):
+        workspace = self._resolve_workspace(workspace)
         body = None if enabled is None else {"enabled": bool(enabled)}
         payload = self._request("POST", f"/workspaces/{workspace}/tools/{tool}/toggle", body)
         return payload.get("tool", {})
 
     def delete_tool(self, workspace, tool):
+        workspace = self._resolve_workspace(workspace)
         return self._request("DELETE", f"/workspaces/{workspace}/tools/{tool}")
 
     def search_rooms(self, workspace, q, limit=20):
+        workspace = self._resolve_workspace(workspace)
         query = _query({"q": q, "limit": limit})
         return self._request(
             "GET", f"/workspaces/{workspace}/rooms/search{query}"
         ).get("results", [])
 
     def chats(self, workspace, filter="open", q=None, page=None):
+        workspace = self._resolve_workspace(workspace)
         query = _query({"filter": filter, "q": q, "page": page})
         return self._request("GET", f"/workspaces/{workspace}/chats{query}")
 
     def chat(self, workspace, chat):
+        workspace = self._resolve_workspace(workspace)
         return self._request("GET", f"/workspaces/{workspace}/chats/{chat}")
 
     def errors(self, workspace, source=None, page=None):
+        workspace = self._resolve_workspace(workspace)
         query = _query({"source": source, "page": page})
         return self._request("GET", f"/workspaces/{workspace}/errors{query}")
 
     def error(self, workspace, fingerprint, page=None):
+        workspace = self._resolve_workspace(workspace)
         query = _query({"page": page})
         path = urllib.parse.quote(str(fingerprint), safe="")
         return self._request("GET", f"/workspaces/{workspace}/errors/{path}{query}")
 
     def usage(self, workspace):
+        workspace = self._resolve_workspace(workspace)
         return self._request("GET", f"/workspaces/{workspace}/usage")
 
     def visitors(self, workspace, identity=None, active=False, page=None):
+        workspace = self._resolve_workspace(workspace)
         query = _query({"identity": identity, "active": "yes" if active else None, "page": page})
         return self._request("GET", f"/workspaces/{workspace}/visitors{query}")
 
     def visitor(self, workspace, visitor):
+        workspace = self._resolve_workspace(workspace)
         return self._request("GET", f"/workspaces/{workspace}/visitors/{visitor}")
 
     def targets(self, workspace, page=None):
+        workspace = self._resolve_workspace(workspace)
         query = _query({"page": page})
         return self._request("GET", f"/workspaces/{workspace}/dispatch_targets{query}")
 
@@ -210,35 +258,41 @@ class Client:
         return self._request("POST", "/workspaces", {"name": name}, mobile=True)
 
     def rename_workspace(self, workspace, name=None, slug=None):
+        workspace = self._resolve_workspace(workspace, mobile=True)
         return self._request(
             "PATCH", f"/workspaces/{workspace}", _compact({"name": name, "slug": slug}),
             mobile=True
         )
 
     def create_room(self, workspace, name, topic=None):
+        workspace = self._resolve_workspace(workspace, mobile=True)
         return self._request(
             "POST", f"/workspaces/{workspace}/rooms",
             _compact({"name": name, "topic": topic}), mobile=True
         )
 
     def invite_member(self, workspace, email, role):
+        workspace = self._resolve_workspace(workspace, mobile=True)
         return self._request(
             "POST", f"/workspaces/{workspace}/members", {"email": email, "role": role},
             mobile=True
         )
 
     def update_member(self, workspace, membership_id, role):
+        workspace = self._resolve_workspace(workspace, mobile=True)
         return self._request(
             "PATCH", f"/workspaces/{workspace}/members/{membership_id}", {"role": role},
             mobile=True
         )
 
     def remove_member(self, workspace, membership_id):
+        workspace = self._resolve_workspace(workspace, mobile=True)
         return self._request(
             "DELETE", f"/workspaces/{workspace}/members/{membership_id}", mobile=True
         )
 
     def revoke_invite(self, workspace, invitation_hashid):
+        workspace = self._resolve_workspace(workspace, mobile=True)
         return self._request(
             "DELETE", f"/workspaces/{workspace}/members/invitations/{invitation_hashid}",
             mobile=True
