@@ -308,6 +308,50 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual("", result.stdout.strip())
 
+    def test_installed_engines_maps_bins_to_engine_slugs(self):
+        result = run_sourced(
+            "harness_bin_installed() { case \"$1\" in claude|cursor-agent|copilot) return 0;; *) return 1;; esac; }\n"
+            "installed_engines")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Claude Code|claude", result.stdout)
+        self.assertIn("Cursor Agent|cursor", result.stdout)
+        self.assertIn("GitHub Copilot CLI|copilot_cli", result.stdout)
+        self.assertNotIn("codex", result.stdout)
+        self.assertNotIn("opencode", result.stdout)
+
+    def test_installed_engines_is_empty_when_none_are_present(self):
+        result = run_sourced(
+            "harness_bin_installed() { return 1; }\n"
+            "installed_engines")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stdout.strip())
+
+    def test_seed_engine_writes_the_state_file(self):
+        cache = self.tmp / "cache"
+        result = run_sourced(
+            "seed_engine phleet cursor",
+            env_extra={"XDG_CACHE_HOME": str(cache)})
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("cursor", (cache / "vroxy-dispatch" / "engine-phleet").read_text().strip())
+
+    def test_seed_engine_writes_a_copilot_cli_slug_not_the_bin(self):
+        cache = self.tmp / "cache"
+        result = run_sourced(
+            "seed_engine phleet copilot_cli",
+            env_extra={"XDG_CACHE_HOME": str(cache)})
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("copilot_cli", (cache / "vroxy-dispatch" / "engine-phleet").read_text().strip())
+
+    def test_choose_default_harness_is_a_no_op_without_a_tty(self):
+        cache = self.tmp / "cache"
+        result = run_sourced(
+            "harness_bin_installed() { return 0; }\n"
+            "choose_default_harness phleet",
+            env_extra={"XDG_CACHE_HOME": str(cache)})
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("", result.stdout.strip())
+        self.assertFalse((cache / "vroxy-dispatch" / "engine-phleet").exists())
+
     def test_skills_checkout_uses_an_existing_checkout(self):
         skills = self.tmp / "vroxy_skills"
         skills.mkdir()

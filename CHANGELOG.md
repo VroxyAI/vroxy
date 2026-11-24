@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.58.1
+
+### Added
+- `install.sh --dispatch` now offers to pin the default harness when the
+  box has more than one coding CLI. After the env file is written and
+  before the unit starts it lists the engine-bearing harnesses actually
+  installed and seeds the chosen one into the same
+  `~/.cache/vroxy-dispatch/engine-<id>` state `/harness` owns — a single
+  harness is chosen without asking, a numbered list defaults to the
+  first, and an invalid pick leaves the default unset so the process
+  falls back to its priority order. `--unattended` keeps reading
+  `DISPATCH_ENGINE` from the environment.
+
 ## 0.58.0
 
 ### Added

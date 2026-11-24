@@ -243,6 +243,83 @@ suggest_harnesses() {
   fi
 }
 
+# The engine-bearing harnesses, bin|label|engine.  Mirrors
+# feedback_agent.py's _ENGINE_BIN_LOOKUP — the engine slug is what the
+# engine-<id> state file and /harness speak, and it is NOT always the bin
+# name (cursor-agent → cursor, copilot → copilot_cli).
+ENGINE_HARNESSES=(
+  "claude|Claude Code|claude"
+  "codex|OpenAI Codex|codex"
+  "opencode|OpenCode|opencode"
+  "gemini|Gemini CLI|gemini"
+  "copilot|GitHub Copilot CLI|copilot_cli"
+  "cursor-agent|Cursor Agent|cursor"
+  "amp|Amp|amp"
+  "cline|Cline|cline"
+  "kiro-cli|Kiro CLI|kiro"
+  "devin|Devin CLI (Windsurf)|devin"
+  "openclaw|OpenClaw|openclaw"
+)
+
+# Pin an instance's default harness.  This is the same user-writable
+# state /harness owns in the room, seeded at install time so a box with
+# several CLIs starts on the one the operator means rather than whatever
+# the priority order happens to reach first.
+seed_engine() {
+  local id="$1" engine="$2"
+  local state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/vroxy-dispatch"
+  mkdir -p "$state_dir"
+  printf '%s\n' "$engine" > "${state_dir}/engine-${id}"
+}
+
+# The `label|engine` pairs for engine-bearing harnesses installed on this
+# box, in ENGINE_HARNESSES order — the list choose_default_harness offers.
+installed_engines() {
+  local line bin label engine
+  for line in "${ENGINE_HARNESSES[@]}"; do
+    IFS='|' read -r bin label engine <<<"$line"
+    harness_bin_installed "$bin" && printf '%s|%s\n' "$label" "$engine"
+  done
+  return 0
+}
+
+# After an install finds harnesses, offer to pin the default one for this
+# agent.  Only harnesses actually on the box are listed; a single one is
+# chosen without asking (same as choose_project's single-folder path); a
+# numbered choice defaults to the first.  No TTY and no harnesses are
+# both no-ops — the process falls back to its priority order either way.
+choose_default_harness() {
+  [[ -t 0 ]] || return 0
+  local id="$1" label engine
+  local labels=() engines=() n=0 i choice
+  while IFS='|' read -r label engine; do
+    [[ -n "$label" ]] || continue
+    labels+=("$label")
+    engines+=("$engine")
+    n=$((n + 1))
+  done < <(installed_engines)
+  [[ $n -gt 0 ]] || return 0
+  if [[ $n -eq 1 ]]; then
+    say "One harness found (${labels[0]}) — setting it as this agent's default."
+    seed_engine "$id" "${engines[0]}"
+    return 0
+  fi
+  say ""
+  say "Choose the default harness for this agent (/harness in its room"
+  say "changes it later):"
+  for i in "${!labels[@]}"; do
+    say "    $((i + 1)). ${labels[$i]}"
+  done
+  read_prompt choice "Default harness [1]: "
+  choice="${choice:-1}"
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )); then
+    seed_engine "$id" "${engines[$((choice - 1))]}"
+    say "Default harness: ${labels[$((choice - 1))]}."
+  else
+    say "Leaving the default unset — dispatch auto-picks by priority."
+  fi
+}
+
 # The harnesses the skills installer can reach — mirrors the HARNESS_ROOTS
 # table in vroxy_skills/install_skills.py (bin → skill-root).  A harness
 # whose root is unknown is deliberately absent until its convention is
@@ -627,9 +704,7 @@ ENVFILE
   # Harness preference is user-writable state, not the env file —
   # /harness flips it without sudo.
   if [[ -n "${DISPATCH_ENGINE:-}" ]]; then
-    local state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/vroxy-dispatch"
-    mkdir -p "$state_dir"
-    printf '%s\n' "$DISPATCH_ENGINE" > "${state_dir}/engine-${id}"
+    seed_engine "$id" "$DISPATCH_ENGINE"
   fi
 }
 
@@ -746,6 +821,7 @@ add_workspace() {
   fi
 
   write_env_file "$id" "$name" "$host" "$token" "$agent_name" "$code_root" "$project"
+  choose_default_harness "$id"
 
   say "Starting vroxy-dispatch@${id}…"
   ctl enable --now "vroxy-dispatch@${id}.service"
