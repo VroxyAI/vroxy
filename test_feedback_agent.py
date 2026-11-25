@@ -405,6 +405,27 @@ class PostRoomReplyTest(unittest.IsolatedAsyncioTestCase):
         finally:
             fa.INSTALL_ID = saved
 
+    async def test_attachments_ride_the_last_chunk(self):
+        link = fa.CableLink()
+        feeder = asyncio.create_task(
+            ack_each_reply(link, "rm123456", ["ms000001", "ms000002"]))
+        await fa.post_room_reply(link, "rm123456", ["first half", "second half"],
+                                 upload_hashids=["up000001", "up000002"])
+        await feeder
+
+        frames = frames_of(link, "room_reply")
+        self.assertEqual(["first half", "second half"],
+                         [f["body"] for f in frames])
+        self.assertNotIn("upload_hashids", frames[0],
+                         "an attachment on the first chunk of a split reply "
+                         "renders mid-answer")
+        self.assertEqual(["up000001", "up000002"], frames[-1]["upload_hashids"])
+
+    async def test_a_reply_without_attachments_sends_no_field(self):
+        link = fa.CableLink()
+        await fa.room_reply(link, "rm123456", "plain text")
+        self.assertNotIn("upload_hashids", frames_of(link, "room_reply")[0])
+
     async def test_the_ask_lands_on_the_final_chunk(self):
         link = fa.CableLink()
         feeder = asyncio.create_task(
@@ -736,6 +757,11 @@ class AttachmentTest(unittest.TestCase):
     def test_no_attachments_omits_the_section(self):
         self.assertNotIn("## Attachments", fa.build_room_prompt(ROOM_PAYLOAD))
 
+    def test_the_prompt_tells_the_harness_how_to_attach_a_file(self):
+        prompt = fa.build_room_prompt(ROOM_PAYLOAD)
+        self.assertIn("ATTACH:", prompt)
+        self.assertIn("/absolute/path/to/file", prompt)
+
     def test_codex_gets_image_flags_and_cache_dir(self):
         shot = Path(self.tmp.name) / "shot.png"
         shot.write_bytes(b"x")
@@ -808,6 +834,109 @@ class AttachmentTest(unittest.TestCase):
         self.assertIn("-i", argv)
         self.assertIn(str(shot), argv)
         self.assertIn("--add-dir", argv)
+
+
+class SplitAttachmentsTest(unittest.TestCase):
+    """`ATTACH: <path>` lines are how a harness tells dispatch which
+    files it produced; they upload with the answer and never render."""
+
+    def test_extracts_paths_and_strips_the_lines(self):
+        body, paths = fa.split_attachments(
+            "here's the report\nATTACH: /tmp/report.pdf\nthanks!")
+        self.assertEqual("here's the report\nthanks!", body)
+        self.assertEqual(["/tmp/report.pdf"], paths)
+
+    def test_is_case_insensitive_and_trims_whitespace(self):
+        _, paths = fa.split_attachments("attach:  /tmp/a.pdf  \n")
+        self.assertEqual(["/tmp/a.pdf"], paths)
+
+    def test_no_attach_lines_returns_the_body_untouched(self):
+        body, paths = fa.split_attachments("no files here")
+        self.assertEqual("no files here", body)
+        self.assertEqual([], paths)
+
+    def test_caps_the_count_to_the_same_limit_as_inbound(self):
+        lines = "\n".join(f"ATTACH: /tmp/f{i}.pdf" for i in range(10))
+        _, paths = fa.split_attachments(lines)
+        self.assertEqual(fa.ATTACHMENT_MAX_COUNT, len(paths))
+
+
+class UploadAttachmentTest(unittest.TestCase):
+    """A generated file reaches the app over the same bearer token the
+    cable uses, and a failure never surfaces as an exception."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._token = fa.SERVICE_TOKEN
+        self._install = fa.INSTALL_ID
+        fa.SERVICE_TOKEN = "tok-123"
+        fa.INSTALL_ID = "inst-up-1"
+        self.addCleanup(lambda: setattr(fa, "SERVICE_TOKEN", self._token))
+        self.addCleanup(lambda: setattr(fa, "INSTALL_ID", self._install))
+
+    def _stub_urlopen(self, respond):
+        real = fa.urllib.request.urlopen
+
+        class _Resp:
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *a): return False
+            def read(self_inner): return respond
+
+        def urlopen(req, timeout=None):
+            return _Resp()
+
+        fa.urllib.request.urlopen = urlopen
+        self.addCleanup(lambda: setattr(fa.urllib.request, "urlopen", real))
+
+    def test_uploads_and_returns_the_hashid(self):
+        self._stub_urlopen(b'{"upload": {"hashid": "up000001"}}')
+        p = Path(self.tmp.name) / "report.pdf"
+        p.write_bytes(b"%PDF-1.4 fake")
+        self.assertEqual("up000001", fa.upload_attachment(str(p)))
+
+    def test_posts_to_the_dispatch_upload_endpoint_with_the_token(self):
+        seen = {}
+        real = fa.urllib.request.urlopen
+
+        class _Resp:
+            def __enter__(self_inner): return self_inner
+            def __exit__(self_inner, *a): return False
+            def read(self_inner): return b'{"upload": {"hashid": "x"}}'
+
+        def urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["auth"] = req.headers.get("Authorization")
+            return _Resp()
+
+        fa.urllib.request.urlopen = urlopen
+        self.addCleanup(lambda: setattr(fa.urllib.request, "urlopen", real))
+
+        p = Path(self.tmp.name) / "notes.pdf"
+        p.write_bytes(b"data")
+        fa.upload_attachment(str(p))
+
+        self.assertTrue(seen["url"].endswith("/api/v1/dispatch_uploads"), seen)
+        self.assertEqual("Bearer tok-123", seen["auth"])
+
+    def test_a_missing_file_is_none_not_raised(self):
+        self.assertIsNone(fa.upload_attachment("/no/such/file.pdf"))
+
+    def test_an_oversized_file_is_skipped(self):
+        big = Path(self.tmp.name) / "big.pdf"
+        big.write_bytes(b"x" * (fa.ATTACHMENT_MAX_BYTES + 1))
+        self.assertIsNone(fa.upload_attachment(str(big)))
+
+    def test_a_failed_upload_is_none_not_raised(self):
+        def boom(req, timeout=None):
+            raise OSError("reset")
+        real = fa.urllib.request.urlopen
+        fa.urllib.request.urlopen = boom
+        self.addCleanup(lambda: setattr(fa.urllib.request, "urlopen", real))
+
+        p = Path(self.tmp.name) / "report.pdf"
+        p.write_bytes(b"data")
+        self.assertIsNone(fa.upload_attachment(str(p)))
 
 
 class RoomProgressLineTest(unittest.TestCase):

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.59.0
+
+### Added
+- A dispatch agent can now upload a file it produced into the room it is
+  answering. A harness ends its reply with `ATTACH: <path>` lines;
+  dispatch uploads each (multipart, over the same bearer token the cable
+  uses) to the new `POST /api/v1/dispatch_uploads` endpoint and staples
+  the resulting Upload to its `room_reply`, so a generated report or
+  screenshot lands as a normal attachment chip — never as raw text. A
+  failed or missing path is skipped, never raised: a bad attachment must
+  not cost the room its answer. Server side (vroxy_web): the endpoint
+  owns the Upload under the agent's bot user, and `room_reply` now
+  accepts `upload_hashids`.
+
 ## 0.58.1
 
 ### Added

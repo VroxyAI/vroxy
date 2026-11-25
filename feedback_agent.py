@@ -55,6 +55,7 @@ import json
 import contextvars
 import functools
 import logging
+import mimetypes
 import os
 import random
 import re
@@ -174,7 +175,7 @@ WORK_SPOOL_MAX_AGE_SECONDS = 1_800
 RESTART_NOTICE_MAX_AGE_SECONDS = 900
 
 CHANNEL_IDENTIFIER = json.dumps({"channel": "AdminFeedbackChannel"})
-AGENT_VERSION      = "vroxy_dispatch 0.56.0"
+AGENT_VERSION      = "vroxy_dispatch 0.59.0"
 HEARTBEAT_INTERVAL_SECONDS = 20
 # Rails caps a RoomMessage body at RoomMessage::BODY_MAX; the server
 # truncates too, but splitting here keeps whole sentences.
@@ -1033,7 +1034,8 @@ async def reply(ws, chat_id: str, body: str, kind: str = "assistant",
     log.info("Reply sent chat=%s kind=%s body=%.80s", chat_id, kind, body)
 
 
-async def room_reply(ws, room_id: str, body: str, reply_to: str | None = None) -> None:
+async def room_reply(ws, room_id: str, body: str, reply_to: str | None = None,
+                     upload_hashids: list[str] | None = None) -> None:
     """`AdminFeedbackChannel#room_reply` — the server posts it into
     the Room through RoomMessageService, so it fans out to the room's
     cable, notifications, and webhooks exactly like a human message.
@@ -1047,6 +1049,8 @@ async def room_reply(ws, room_id: str, body: str, reply_to: str | None = None) -
     }
     if reply_to:
         payload["reply_to"] = reply_to
+    if upload_hashids:
+        payload["upload_hashids"] = upload_hashids
     await cable_send(ws, "message", payload)
     log.info("Room reply sent room=%s body=%.80s", room_id, body)
 
@@ -1067,23 +1071,28 @@ def note_posted_message(room_id: str, message_id: str) -> None:
 
 
 async def post_room_reply(ws, room_id: str, chunks: list[str],
-                          reply_to: str | None = None) -> str | None:
+                          reply_to: str | None = None,
+                          upload_hashids: list[str] | None = None) -> str | None:
     """Posts every chunk of an answer and returns the hashid of the
     LAST one, which is the only message an ask may hang off.
 
     Each chunk waits for its own acknowledgement before the next goes
     out, so the hashid returned belongs to the chunk that ends the
     reply.  A server that never answers costs one timeout, not one per
-    chunk, and costs the ask rather than the reply."""
+    chunk, and costs the ask rather than the reply.  Attachments ride
+    the last chunk, so the file lands at the end of the answer."""
     queue: asyncio.Queue = asyncio.Queue()
     _posted_message_acks[room_id] = queue
     posted: str | None = None
     expect_acks = True
+    last = len(chunks) - 1
     try:
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
             while not queue.empty():
                 queue.get_nowait()
-            await room_reply(ws, room_id, chunk, reply_to)
+            await room_reply(
+                ws, room_id, chunk, reply_to,
+                upload_hashids=upload_hashids if i == last else None)
             if not expect_acks:
                 continue
             try:
@@ -1388,6 +1397,88 @@ def download_attachments(msg: dict) -> list[dict]:
     return got
 
 
+def upload_attachment(path: str, install_id: str | None = None) -> str | None:
+    """Store a local file the harness produced so the next room_reply
+    can attach it.  Returns the Upload hashid, or None when the upload
+    failed — a bad attachment must not cost the room its answer.
+
+    Multipart POST to `/api/v1/dispatch_uploads` over the same bearer
+    token the cable uses; the server owns the Upload under this
+    agent's bot user so RoomMessageService's ownership filter accepts
+    it when the reply references it."""
+    p = Path(str(path or ""))
+    if not p.is_file():
+        log.warning("upload_attachment: not a file: %s", path)
+        return None
+    size = p.stat().st_size
+    if size > ATTACHMENT_MAX_BYTES:
+        log.warning("upload_attachment: %s — %d bytes over the cap, skipping", p.name, size)
+        return None
+
+    name = _safe_attachment_name(p.name, "attachment")
+    ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    boundary = "----vroxy" + uuid.uuid4().hex
+    data = p.read_bytes()
+
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="install_id"\r\n\r\n'
+        f"{install_id or INSTALL_ID}\r\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'
+        f"Content-Type: {ctype}\r\n\r\n"
+    ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{_app_base_url()}/api/v1/dispatch_uploads",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {SERVICE_TOKEN}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=ATTACHMENT_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        hashid = (payload.get("upload") or {}).get("hashid")
+        if not hashid:
+            log.warning("upload_attachment: server answered without a hashid: %.200s", payload)
+            return None
+        log.info("Uploaded %s (%d bytes) → %s", p.name, size, hashid)
+        return hashid
+    except Exception as e:
+        log.warning("upload_attachment failed (%s): %s: %s", p.name, type(e).__name__, e)
+        return None
+
+
+def _upload_paths(paths: list[str]) -> list[str]:
+    """Upload each path, keep the hashids that landed.  Blocking (HTTP);
+    callers wrap it in `asyncio.to_thread`."""
+    out: list[str] = []
+    for path in paths:
+        hashid = upload_attachment(path)
+        if hashid:
+            out.append(hashid)
+    return out
+
+
+ATTACH_LINE_RE = re.compile(r"^[ \t]*ATTACH:[ \t]*(.+?)[ \t]*(?:\r?\n|$)", re.IGNORECASE | re.MULTILINE)
+
+
+def split_attachments(body: str) -> tuple[str, list[str]]:
+    """Pull `ATTACH: <path>` lines out of a harness reply.  The lines
+    are how a harness tells dispatch which files it produced for the
+    person to see; they never render in the room — the attachment chip
+    does.  Returns (cleaned_body, paths), paths capped at the same
+    count as inbound attachments."""
+    paths = [m.group(1).strip() for m in ATTACH_LINE_RE.finditer(body or "")]
+    if not paths:
+        return body or "", []
+    cleaned = ATTACH_LINE_RE.sub("", body or "").strip()
+    return cleaned, paths[:ATTACHMENT_MAX_COUNT]
+
+
 def _attachment_image_paths(attachments: list[dict] | None) -> list[str]:
     """Local paths for images that a vision-capable CLI can take via `-i`."""
     out: list[str] = []
@@ -1483,6 +1574,12 @@ def build_room_prompt(payload: dict, attachments: list[dict] | None = None,
         lines.append(f"Topic: {topic}")
     lines.append(f"Repo: {project or PROJECT} "
                  f"(you are running inside its checkout)")
+    lines.append("")
+    lines.append(
+        "If you produced a file the person should see (a report, a "
+        "screenshot, a diff), end your reply with one line per file: "
+        "`ATTACH: /absolute/path/to/file`. It uploads with your answer "
+        "and never appears as raw text.")
     lines.append("")
 
     if history:
@@ -6900,11 +6997,22 @@ async def handle_room_message(ws, payload: dict) -> None:
     for ask in asks:
         body_text = ask_fallback(body_text, ask)
 
+    # A harness that produced a file for the person ends its reply with
+    # `ATTACH: <path>` lines; upload each and staple them to the answer.
+    body_text, attach_paths = split_attachments(body_text)
+    upload_hashids: list[str] = []
+    if attach_paths:
+        upload_hashids = await asyncio.to_thread(_upload_paths, attach_paths)
+
+    chunks = split_room_body(body_text)
+    if not chunks and upload_hashids:
+        chunks = [""]
+
     # Threaded under the message that asked.  A room where three
     # people are talking at once is unreadable when the answers float
     # free of their questions.
-    posted = await post_room_reply(ws, room_id, split_room_body(body_text),
-                                   msg.get("hashid"))
+    posted = await post_room_reply(ws, room_id, chunks,
+                                   msg.get("hashid"), upload_hashids=upload_hashids)
 
     for ask in asks:
         try:
